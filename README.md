@@ -191,6 +191,4 @@ python -m ray_tracing.verification.verify_gguf_native
 python -m ray_tracing.verification.profile_qwenflash --label current
 ```
 
-论文：[Ray Tracing Attention.pdf](docs/rt_attention_math/Ray%20Tracing%20Attention.pdf) · [LaTeX 源](docs/rt_attention_math/main.tex)。论文内置同一幅矢量工作流程图；图源保存在 [docs/images](docs/images/)。
-
 许可证：[Apache-2.0](LICENSE)。第三方组件的原始声明保存在 [THIRD_PARTY.md](THIRD_PARTY.md) 与 [NOTICE](NOTICE)。
