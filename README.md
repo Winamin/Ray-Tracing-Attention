@@ -44,7 +44,7 @@ $$
 原模型的 SwiGLU 变换为：
 
 $$
-z=\operatorname{SiLU}(W_g h)\odot(W_u h),\qquad y=W_dz.
+z=\mathrm{SiLU}(W_g h)\odot(W_u h),\qquad y=W_dz.
 $$
 
 权重系数作为光学传输系数参与读出。对输入分量 $x$ 与系数 $w$，正负探测通道分别累计同号与异号贡献；增强系数 $\alpha>0$ 同时作用于发射与传输尺度：
