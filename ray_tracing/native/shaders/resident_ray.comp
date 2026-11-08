@@ -1,0 +1,98 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "resident_common.glsl"
+rayQueryEXT ray;
+shared float scores[256],weights[256];
+shared float tileMaximum,tileReference,previousScale;
+layout(constant_id=1) const uint wordRayBatch=32u;
+shared vec3 wordOrigin,wordDirection;
+shared uint wordLensValid;
+void startLens(uint bank,vec3 o,vec3 d){uint mask=1u<<(bank%8u);switch(bank/8u){case 0u:rayQueryInitializeEXT(ray,lensAS[0],gl_RayFlagsOpaqueEXT,mask,o,.00001,d,8.0);break;case 1u:rayQueryInitializeEXT(ray,lensAS[1],gl_RayFlagsOpaqueEXT,mask,o,.00001,d,8.0);break;case 2u:rayQueryInitializeEXT(ray,lensAS[2],gl_RayFlagsOpaqueEXT,mask,o,.00001,d,8.0);break;default:rayQueryInitializeEXT(ray,lensAS[3],gl_RayFlagsOpaqueEXT,mask,o,.00001,d,8.0);}}
+void startHistory(uint bank,vec3 o,vec3 d,float far){uint mask=1u<<(bank%8u),flags=gl_RayFlagsNoOpaqueEXT|gl_RayFlagsCullBackFacingTrianglesEXT;switch(bank/8u){case 0u:rayQueryInitializeEXT(ray,historyAS[0],flags,mask,o,.00001,d,far);break;case 1u:rayQueryInitializeEXT(ray,historyAS[1],flags,mask,o,.00001,d,far);break;case 2u:rayQueryInitializeEXT(ray,historyAS[2],flags,mask,o,.00001,d,far);break;default:rayQueryInitializeEXT(ray,historyAS[3],flags,mask,o,.00001,d,far);}}
+void startWord(vec3 o,vec3 d){rayQueryInitializeEXT(ray,wordAS[0],gl_RayFlagsNoOpaqueEXT|gl_RayFlagsCullBackFacingTrianglesEXT,255u,o,.00001,d,8.0);}
+vec3 lensPoint(uint at){return vec3(lensVertices[at],lensVertices[at+1u],lensVertices[at+2u]);}
+bool throughLens(uint bank,uint domain,vec4 emission,out vec3 o,out vec3 d,out float total,out uvec2 receipt){
+    o=vec3(emission.xy+vec2(float(domain)*4.0,0),0);d=normalize(vec3(emission.zw,1));total=0;receipt=uvec2(0xffffffffu);
+    uint base=domain==cfg.depth?parameters[7]:parameters[32u+(domain%parameters[1])*64u+5u],instance=lensIndex(domain,bank);float eta=1.0+.02/(1.0+exp(-pf(base+bank*8u+6u)));
+    for(uint face=0u;face<2u;face++){startLens(bank,o,d);while(rayQueryProceedEXT(ray)){}
+        if(rayQueryGetIntersectionTypeEXT(ray,true)!=gl_RayQueryCommittedIntersectionTriangleEXT)return false;uint primitive=rayQueryGetIntersectionPrimitiveIndexEXT(ray,true),owner=rayQueryGetIntersectionInstanceCustomIndexEXT(ray,true);
+        if(owner!=domain*B+bank||primitive/2u!=face)return false;receipt[face]=primitive;float distance=rayQueryGetIntersectionTEXT(ray,true);uint at=(instance*12u+primitive*3u)*3u;
+        vec3 n=normalize(cross(lensPoint(at+3u)-lensPoint(at),lensPoint(at+6u)-lensPoint(at)));if(dot(n,d)>0)n=-n;
+        o+=distance*d;total+=distance;vec3 next=refract(d,n,face==0u?1.0/eta:eta);if(dot(next,next)<.5)return false;d=normalize(next);o+=.00001*d;total+=.00001;
+    }return d.z>0;
+}
+float scalarValue(uint bits){vec2 cell=2.0*vec2(bits%256u,bits/256u);rayQueryInitializeEXT(ray,scalarAS,gl_RayFlagsOpaqueEXT,255u,vec3(cell+vec2(.25),-4),.00001,vec3(0,0,1),8.0);while(rayQueryProceedEXT(ray)){}
+    if(rayQueryGetIntersectionTypeEXT(ray,true)!=gl_RayQueryCommittedIntersectionTriangleEXT||rayQueryGetIntersectionPrimitiveIndexEXT(ray,true)!=bits){atomicOr(control[3],16u);return 0;}
+    uint at=bits*9u;vec3 a=vec3(scalarVertices[at],scalarVertices[at+1u],scalarVertices[at+2u]),b=vec3(scalarVertices[at+3u],scalarVertices[at+4u],scalarVertices[at+5u]),c=vec3(scalarVertices[at+6u],scalarVertices[at+7u],scalarVertices[at+8u]);vec3 reflected=reflect(vec3(0,0,1),normalize(cross(b-a,c-a)));return -16.0*reflected.x/max(1.0-reflected.z,1e-20);
+}
+void main(){
+    if(stopped())return;uint lane=gl_LocalInvocationID.x,job=gl_WorkGroupID.x,row=gl_WorkGroupID.y,base=blockBase();
+    if(operation==0u){if(lane>=8u)return;uint segmentCount=(cfg.capacity+15u)/16u,query=(job+gl_WorkGroupID.y*65535u)*8u+lane;if(query>=cfg.rows*segmentCount)return;
+        row=query/segmentCount;uint segment=query%segmentCount,at=row*(cfg.capacity+1u),time=absolute(row),available=min(time+1u,cfg.capacity),first=segment*16u;if(first>=available)return;
+        vec4 emission=rays[row*rayStride()];vec3 o,d;float total;uvec2 lens;
+        if(!throughLens(0u,cfg.layer,emission,o,d,total,lens)){atomicOr(control[3],1u);return;}
+        o.z-=4.0*float(time)+2.0;o+=d*(4.0*float(first)/d.z);
+        startHistory(0u,o,d,4.0*float(min(16u,available-first))/d.z);uint count=0u;
+        while(rayQueryProceedEXT(ray)){
+            if(rayQueryGetIntersectionTypeEXT(ray,false)!=gl_RayQueryCandidateIntersectionTriangleEXT)continue;
+            uint primitive=rayQueryGetIntersectionPrimitiveIndexEXT(ray,false),instance=rayQueryGetIntersectionInstanceCustomIndexEXT(ray,false),slot=(instance&RT_SLOT_MASK)+primitive/2u;
+            if(primitive>=32u||slot>=cfg.capacity){atomicOr(control[3],2u);return;}
+            uint global=(parameters[base+41u])*cfg.capacity+slot,age=slots[global].x;if(age>time||time-age>=cfg.capacity){atomicOr(control[3],4u);return;}
+            hits[at+1u+time-age]=global;count++;
+            uint old=atomicOr(slots[global].y,1u);if((old&3u)==0u){uint queue=atomicAdd(control[6],1u);control[8u+queue]=global;}
+        }
+        atomicAdd(hits[at],count);return;}
+    if(operation==1u)return;
+    if(operation==2u){uint index=job*128u+lane;if(index<control[6])slots[control[8u+index]].y=2u;return;}
+    if(operation==3u){uint head=job,c=gl_SubgroupInvocationID,hd=headWidth(),at=row*(cfg.capacity+1u),count=hits[at];
+        float signal0=0,signal1=0,reference=0,maximum=-1.0/0.0;
+        for(uint first=0u;first<count;first+=256u){uint n=min(256u,count-first);
+            for(uint j=gl_SubgroupID;j<n;j+=4u){uint hit=hits[at+first+j+1u];float total=0;
+                for(uint axis=c;axis<hd;axis+=32u)total+=queries[row*A+head*hd+axis]*pathCoordinate(hit,head*hd+axis,false);
+                total=subgroupAdd(total);if(c==0u)scores[j]=total/sqrt(float(hd));}barrier();
+            float localMax=-1.0/0.0;for(uint j=lane;j<n;j+=128u)localMax=max(localMax,scores[j]);localMax=subgroupMax(localMax);
+            if(c==0u)reduction[gl_SubgroupID]=localMax;barrier();
+            if(lane==0u){tileMaximum=max(max(reduction[0],reduction[1]),max(reduction[2],reduction[3]));tileMaximum=max(maximum,tileMaximum);previousScale=exp(maximum-tileMaximum);}barrier();
+            float localRef=0;for(uint j=lane;j<n;j+=128u){weights[j]=exp(scores[j]-tileMaximum);localRef+=weights[j];}tileReference=sum128(localRef);
+            signal0*=previousScale;signal1*=previousScale;reference=reference*previousScale+tileReference;maximum=tileMaximum;barrier();
+            for(uint j=0u;j<n;j++){uint hit=hits[at+first+j+1u];if(lane<hd)signal0+=weights[j]*pathCoordinate(hit,head*hd+lane,true);if(lane+128u<hd)signal1+=weights[j]*pathCoordinate(hit,head*hd+lane+128u,true);}barrier();
+        }
+        if(lane==0u){physical[(row*max(H,uint(RT_ATTENTION_HEADS))+head)*2u]=maximum+20.0;physical[(row*max(H,uint(RT_ATTENTION_HEADS))+head)*2u+1u]=reference;}
+        if(lane<hd){uint ch=head*hd+lane;detector[row*A+ch]=signal0/max(reference,1e-30)*(RT_ATTENTION_GATE==1?detectorSigmoid(feedForward[row*W+ch]):1.0);}
+        if(lane+128u<hd){uint ch=head*hd+lane+128u;detector[row*A+ch]=signal1/max(reference,1e-30)*(RT_ATTENTION_GATE==1?detectorSigmoid(feedForward[row*W+ch]):1.0);}return;}
+    if(operation==5u){if(row>=min(256u,wordResult[4096u]))return;uint pair=job*128u+lane,word=wordResult[WORD_QUEUE+row];if(pair>=P)return;
+        vec2 value=wordTransfer(word,pair);
+        wordDecoded[row*D+pair*2u]=value.x;wordDecoded[row*D+pair*2u+1u]=value.y;return;}
+    if(operation==8u){for(uint q=lane;q<cfg.rows;q+=128u)if(hits[q*(cfg.capacity+1u)]!=min(absolute(q)+1u,cfg.capacity))atomicOr(control[3],8u);if(lane==0u){control[8u+cfg.capacity]=8u;control[9u+cfg.capacity]=control[6];control[10u+cfg.capacity]=1u;control[7]+=control[6]*SHARED_PAIRS;}return;}
+    if(operation==9u){uint bits=job*128u+lane;if(bits<65536u){uint measured=floatBitsToUint(scalarValue(bits));measured=(measured+32767u+((measured>>16u)&1u))&0xffff0000u;control[scalarCacheOffset()+bits]=measured;}return;}
+    if(operation==10u||operation==11u)return;
+    if(operation==12u){
+        uint groups=(WORD_TILES+wordRayBatch-1u)/wordRayBatch,bank=job/groups,localJob=job%groups;
+        if(lane==0u){float total;uvec2 lens;wordLensValid=throughLens(bank,cfg.depth,rays[bank],wordOrigin,wordDirection,total,lens)?1u:0u;}barrier();
+        uint tile=localJob*wordRayBatch+lane;if(lane>=wordRayBatch||tile>=WORD_TILES)return;uint instance=bank*WORD_TILES+tile;uint wordSeen[8];for(uint i=0u;i<8u;i++)wordSeen[i]=0u;
+        if(wordLensValid==0u){atomicOr(control[3],1024u);return;}vec3 o=wordOrigin,d=wordDirection;
+        o.x-=float(cfg.depth)*4.0;o.x+=float(instance)*4.0;startWord(o,d);uint count=0u;
+        while(rayQueryProceedEXT(ray)){
+            if(rayQueryGetIntersectionTypeEXT(ray,false)!=gl_RayQueryCandidateIntersectionTriangleEXT)continue;
+            uint primitive=rayQueryGetIntersectionPrimitiveIndexEXT(ray,false),owner=rayQueryGetIntersectionInstanceCustomIndexEXT(ray,false);
+            if(owner!=instance||primitive>=WORD_TILE*2u){atomicOr(control[3],1024u);return;}
+            uint local=primitive/2u,word=(owner%WORD_TILES)*WORD_TILE+local;if(word>=V)continue;uint bit=1u<<(local%32u);
+            if((wordSeen[local/32u]&bit)!=0u)continue;wordSeen[local/32u]|=bit;
+            if(cfg.padding0!=1u){wordResult[WORD_MASK+word]=1u;wordResult[WORD_QUEUE+word]=word;count++;}
+            else if(atomicOr(wordResult[WORD_MASK+word],1u)==0u){uint index=atomicAdd(wordResult[4096u],1u);wordResult[WORD_QUEUE+index]=word;}
+        }
+        if(cfg.padding0!=1u){atomicAdd(wordResult[4096u],count);if(count!=min(WORD_TILE,V-tile*WORD_TILE))atomicOr(control[3],2048u);}return;
+    }
+
+    if(operation==13u){if(lane>=32u)return;uint query=job*32u+lane;if(query>=featureBanks()*FEATURE_TILES)return;uint bank=query/FEATURE_TILES,tile=query%FEATURE_TILES,at=featureBase(row);vec4 emission=featureRays[row*featureBanks()+bank];
+        uint seen[8];for(uint k=0u;k<8u;k++)seen[k]=0u;uint count=0u;
+        rayQueryInitializeEXT(ray,featureAS[cfg.layer],gl_RayFlagsNoOpaqueEXT|gl_RayFlagsCullBackFacingTrianglesEXT,255u,vec3(emission.xy+vec2(float(query)*4.0,0),0),.00001,vec3(0,0,1),8.0);
+        while(rayQueryProceedEXT(ray)){
+            if(rayQueryGetIntersectionTypeEXT(ray,false)!=gl_RayQueryCandidateIntersectionTriangleEXT)continue;
+            uint owner=rayQueryGetIntersectionInstanceCustomIndexEXT(ray,false),primitive=rayQueryGetIntersectionPrimitiveIndexEXT(ray,false),feature=tile*FEATURE_TILE+primitive/2u;
+            if(owner!=cfg.layer*featureBanks()*FEATURE_TILES+query||primitive>=FEATURE_TILE*2u||feature>=FEATURE_WIDTH){atomicOr(control[3],4096u);return;}
+            if(cfg.padding0!=1u){uint local=primitive/2u,bit=1u<<(local%32u);if((seen[local/32u]&bit)!=0u)continue;seen[local/32u]|=bit;featureWork[at+featureQueueOffset()+feature]=feature;count++;}
+            else if(atomicOr(featureWork[at+16u+feature],1u)==0u){uint index=atomicAdd(featureWork[at],1u);featureWork[at+featureQueueOffset()+index]=feature;}
+        }if(cfg.padding0!=1u)atomicAdd(featureWork[at],count);return;}
+
+}

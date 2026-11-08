@@ -1,0 +1,6 @@
+include README.md LICENSE NOTICE THIRD_PARTY.md rt_chat.cmd rt_compile.cmd .gitignore
+recursive-include docs *.tex *.png *.svg *.pdf *.py
+exclude docs/rt_attention_math/main.pdf
+recursive-include benchmarks *.json
+recursive-include tests *.py
+recursive-include .github/workflows *.yml
