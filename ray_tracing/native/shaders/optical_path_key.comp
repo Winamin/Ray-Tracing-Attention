@@ -1,0 +1,66 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "rt_model_config.h"
+layout(local_size_x=128) in;
+layout(std430,binding=0) readonly buffer State {uint state[];};
+layout(std430,binding=1) readonly buffer Field {uint field[];};
+layout(std430,binding=2) readonly buffer History {uint history[];};
+layout(std430,binding=3) buffer Control {uint control[];};
+layout(std430,binding=4) buffer Addresses {uint addresses[];};
+layout(std430,binding=5) buffer Scratch {uint scratch[];};
+layout(push_constant) uniform Config {uint pass,position,capacity,index,epoch,validate,expected[8];} cfg;
+const uint FIELD_WORDS=RT_RECURRENT_COUNT*(RT_STATE_HEADS*128u*128u+RT_STATE_WIDTH*9u);
+const uint HISTORY_WORDS=(((RT_GQA_WIDTH+255u)/256u*(144u+210u)+7u)/8u*8u)/4u;
+shared uint partial[8][128];
+shared float squares[128];
+uint mix(uint x){x^=x>>16u;x*=0x7feb352du;x^=x>>15u;x*=0x846ca68bu;return x^(x>>16u);}
+uint inputWord(uint at){
+    if(at<RT_HIDDEN_SIZE)return state[at];
+    at-=RT_HIDDEN_SIZE;if(at<FIELD_WORDS)return field[at];
+    at-=FIELD_WORDS;
+    uint perLayer=cfg.position*HISTORY_WORDS,layer=at/perLayer,local=at%perLayer;
+    return history[layer*cfg.capacity*HISTORY_WORDS+local];
+}
+void reduce(uint lane){
+    for(uint stride=64u;stride>0u;stride>>=1u){barrier();if(lane<stride)for(uint k=0u;k<8u;k++){
+        if(k<4u)partial[k][lane]^=partial[k][lane+stride];
+        else partial[k][lane]+=partial[k][lane+stride];
+    }}barrier();
+}
+void main(){
+    uint lane=gl_LocalInvocationID.x;
+    uint words=RT_HIDDEN_SIZE+FIELD_WORDS+RT_FULL_COUNT*cfg.position*HISTORY_WORDS;
+    uint groups=(words+1023u)/1024u;
+    uint accum[8];for(uint k=0u;k<8u;k++)accum[k]=0u;
+    if(cfg.pass==0u){
+        uint group=gl_WorkGroupID.x+gl_WorkGroupID.y*65535u;if(group>=groups)return;
+        for(uint i=0u;i<8u;i++){uint at=group*1024u+lane+i*128u;if(at>=words)break;
+            uint v=inputWord(at);
+            for(uint k=0u;k<8u;k++){uint m=mix(v^mix(at+0x9e3779b9u*(k+1u)));
+                if(k<4u)accum[k]^=m;else accum[k]+=m;
+            }
+        }
+        for(uint k=0u;k<8u;k++)partial[k][lane]=accum[k];reduce(lane);
+        if(lane==0u)for(uint k=0u;k<8u;k++)scratch[group*8u+k]=partial[k][0];return;
+    }
+    for(uint group=lane;group<groups;group+=128u)for(uint k=0u;k<8u;k++){
+        uint v=scratch[group*8u+k];if(k<4u)accum[k]^=v;else accum[k]+=v;
+    }
+    for(uint k=0u;k<8u;k++)partial[k][lane]=accum[k];reduce(lane);
+    float square=0.0;for(uint at=lane;at<RT_HIDDEN_SIZE;at+=128u){float v=uintBitsToFloat(state[at]);square+=v*v;}
+    squares[lane]=square;for(uint stride=64u;stride>0u;stride>>=1u){barrier();if(lane<stride)squares[lane]+=squares[lane+stride];}barrier();
+    if(lane==0u){
+        uint at=cfg.index*10u;bool valid=true;
+        for(uint k=0u;k<8u;k++){
+            uint seed=mix(cfg.position)^mix(cfg.epoch)^mix(control[4])^mix(control[5]+0x85ebca6bu);
+            uint v=mix(partial[k][0]^seed^mix(words+k*0x9e3779b9u));addresses[at+k]=v;
+            valid=valid&&v==cfg.expected[k];
+        }
+        vec2 direction=vec2(uintBitsToFloat(state[0]),uintBitsToFloat(state[1]))*
+                       sqrt(float(RT_HIDDEN_SIZE))/max(sqrt(squares[0]),1e-20);
+        float radius=length(direction),a=log(1.0+radius);
+        vec2 chart=radius>1e-20?.7*a/(1.0+a)*direction/radius:vec2(0);
+        addresses[at+8u]=floatBitsToUint(chart.x);addresses[at+9u]=floatBitsToUint(chart.y);
+        if(cfg.validate!=0u&&!valid)atomicOr(control[3],32768u);
+    }
+}

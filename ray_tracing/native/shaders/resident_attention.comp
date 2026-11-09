@@ -1,0 +1,108 @@
+#version 460
+// Adapted from llama.cpp Vulkan kernels: https://github.com/ggml-org/llama.cpp
+// Copyright (c) 2023-2026 The ggml authors. MIT license in THIRD_PARTY.md.
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_NV_cooperative_matrix2 : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_buffer_reference : require
+#if RT_VECTOR_DECODE
+#extension GL_NV_cooperative_matrix_decode_vector : require
+#endif
+#include "resident_common.glsl"
+const uint BR=64u,BC=128u,DH=RT_ATTENTION_HEAD_DIM;
+shared float16_t queryTile[BR*DH];
+layout(buffer_reference,std430,buffer_reference_align=8) readonly buffer HistoryRecord {uint raw[HISTORY_RECORD_BYTES/4u];};
+uint historyBase(){return parameters[blockBase()+41u]*cfg.capacity;}
+float16_t decodeAddress(const in HistoryRecord record,const in uint bc[2],const in uint ci[2]){
+    return float16_t(pathCoordinate(historyBase()+bc[0],gl_WorkGroupID.x*DH+ci[1],false));
+}
+float16_t decodeContent(const in HistoryRecord record,const in uint bc[2],const in uint ci[2]){
+    return float16_t(pathCoordinate(historyBase()+bc[0],gl_WorkGroupID.x*DH+ci[1],true));
+}
+f16vec4 decodeAddressVector(const in HistoryRecord record,const in uint bc[2],const in uint ci[2]){
+    uint slot=historyBase()+bc[0],axis=gl_WorkGroupID.x*DH+ci[1];
+    return f16vec4(pathCoordinate(slot,axis,false),pathCoordinate(slot,axis+1u,false),pathCoordinate(slot,axis+2u,false),pathCoordinate(slot,axis+3u,false));
+}
+f16vec4 decodeContentVector(const in HistoryRecord record,const in uint bc[2],const in uint ci[2]){
+    uint slot=historyBase()+bc[0],axis=gl_WorkGroupID.x*DH+ci[1];
+    return f16vec4(pathCoordinate(slot,axis,true),pathCoordinate(slot,axis+1u,true),pathCoordinate(slot,axis+2u,true),pathCoordinate(slot,axis+3u,true));
+}
+#if RT_VECTOR_DECODE
+#define ADDRESS_DECODE decodeAddress,decodeAddressVector
+#define CONTENT_DECODE decodeContent,decodeContentVector
+#else
+#define ADDRESS_DECODE decodeAddress
+#define CONTENT_DECODE decodeContent
+#endif
+bool received(uint row,uint history){
+    if(row>=cfg.rows||history>=cfg.capacity)return false;
+    uint global=historyBase()+history,time=absolute(row),age=slots[global].x;
+    return age<=time&&time-age<cfg.capacity&&hits[row*(cfg.capacity+1u)+1u+time-age]==global;
+}
+float maskScore(const in uint r,const in uint c,const in float value,const in uint firstRow,const in uint firstHistory){
+    return received(firstRow+r,firstHistory+c)?value/sqrt(float(DH)):-1e30;
+}
+float maskEnergy(const in uint r,const in uint c,const in float value,const in uint firstRow,const in uint firstHistory){
+    return received(firstRow+r,firstHistory+c)?exp(value):0.0;
+}
+float maxPair(const in float a,const in float b){return max(a,b);}
+float addPair(const in float a,const in float b){return a+b;}
+float rowValue(const in float a,const in float b){return a;}
+float maximum(const in uint r,const in uint c,const in float a,const in float b){return max(a,b);}
+float exponential(const in uint r,const in uint c,const in float value){return exp(value);}
+float gatedOutput(const in uint r,const in uint c,const in float signal,const in uint firstRow){
+    uint row=firstRow+r,channel=gl_WorkGroupID.x*DH+c;
+    return row<cfg.rows?signal*(RT_ATTENTION_GATE==1?detectorSigmoid(feedForward[row*W+channel]):1.0):0.0;
+}
+float recordReference(const in uint r,const in uint c,const in float value,const in uint firstRow){
+    uint row=firstRow+r;if(c==0u&&row<cfg.rows)physical[(row*max(H,uint(RT_ATTENTION_HEADS))+gl_WorkGroupID.x)*2u+1u]=value;
+    return value;
+}
+float recordMaximum(const in uint r,const in uint c,const in float value,const in uint firstRow){
+    uint row=firstRow+r;if(c==0u&&row<cfg.rows)physical[(row*max(H,uint(RT_ATTENTION_HEADS))+gl_WorkGroupID.x)*2u]=value+20.0;
+    return value;
+}
+void main(){
+    if(stopped())return;
+    uint firstRow=gl_WorkGroupID.y*BR,lane=gl_LocalInvocationID.x;
+    for(uint i=lane;i<BR*DH;i+=gl_WorkGroupSize.x){uint row=firstRow+i/DH;queryTile[i]=row<cfg.rows?float16_t(queries[row*A+gl_WorkGroupID.x*DH+i%DH]):float16_t(0.0);}
+    barrier();
+    coopmat<float16_t,gl_ScopeWorkgroup,BR,DH,gl_MatrixUseA> q;
+    coopMatLoad(q,queryTile,0,DH,gl_CooperativeMatrixLayoutRowMajor);
+    coopmat<float,gl_ScopeWorkgroup,BR,DH,gl_MatrixUseAccumulator> signal=coopmat<float,gl_ScopeWorkgroup,BR,DH,gl_MatrixUseAccumulator>(0.0);
+    coopmat<float,gl_ScopeWorkgroup,BR,BC,gl_MatrixUseAccumulator> reference=coopmat<float,gl_ScopeWorkgroup,BR,BC,gl_MatrixUseAccumulator>(0.0);
+    coopmat<float,gl_ScopeWorkgroup,BR,BC,gl_MatrixUseAccumulator> maxSignal=coopmat<float,gl_ScopeWorkgroup,BR,BC,gl_MatrixUseAccumulator>(-1e30);
+    tensorLayoutNV<2,gl_CooperativeMatrixClampModeConstantNV> historyLayout=createTensorLayoutNV(2,gl_CooperativeMatrixClampModeConstantNV);
+    historyLayout=setTensorLayoutBlockSizeNV(historyLayout,1,DH);historyLayout=setTensorLayoutDimensionNV(historyLayout,cfg.capacity,DH);historyLayout=setTensorLayoutStrideNV(historyLayout,1,0);
+    tensorViewNV<2,false,1,0> transpose=createTensorViewNV(2,false,1,0);
+    uint available=min(absolute(min(cfg.rows-1u,firstRow+BR-1u))+1u,cfg.capacity);
+    for(uint firstHistory=0u;firstHistory<available;firstHistory+=BC){
+        coopmat<float16_t,gl_ScopeWorkgroup,DH,BC,gl_MatrixUseB> addresses;
+        coopMatLoadTensorNV(addresses,keyGeometry,historyBase()*(HISTORY_RECORD_BYTES/8u),sliceTensorLayoutNV(historyLayout,firstHistory,BC,0,DH),transpose,ADDRESS_DECODE);
+        coopmat<float,gl_ScopeWorkgroup,BR,BC,gl_MatrixUseAccumulator> scores=coopmat<float,gl_ScopeWorkgroup,BR,BC,gl_MatrixUseAccumulator>(0.0);
+        scores=coopMatMulAdd(q,addresses,scores);coopMatPerElementNV(scores,scores,maskScore,firstRow,firstHistory);
+        coopmat<float,gl_ScopeWorkgroup,BR,BC,gl_MatrixUseAccumulator> currentMax,energy,scale,energySum;
+        coopMatReduceNV(currentMax,scores,gl_CooperativeMatrixReduceRowNV,maxPair);
+        coopmat<float,gl_ScopeWorkgroup,BR,BC,gl_MatrixUseAccumulator> oldMax=maxSignal;
+        coopMatPerElementNV(maxSignal,currentMax,maximum,oldMax);
+        coopMatPerElementNV(energy,scores-maxSignal,maskEnergy,firstRow,firstHistory);
+        coopMatPerElementNV(scale,oldMax-maxSignal,exponential);
+        coopMatReduceNV(energySum,energy,gl_CooperativeMatrixReduceRowNV,addPair);
+        reference=reference*scale+energySum;
+        coopmat<float,gl_ScopeWorkgroup,BR,DH,gl_MatrixUseAccumulator> outputScale;
+        coopMatReduceNV(outputScale,scale,gl_CooperativeMatrixReduceRowNV,rowValue);signal*=outputScale;
+        coopmat<float16_t,gl_ScopeWorkgroup,BR,BC,gl_MatrixUseA> amplified=coopmat<float16_t,gl_ScopeWorkgroup,BR,BC,gl_MatrixUseA>(energy);
+        coopmat<float16_t,gl_ScopeWorkgroup,BC,DH,gl_MatrixUseB> content;
+        coopMatLoadTensorNV(content,keyGeometry,historyBase()*(HISTORY_RECORD_BYTES/8u),sliceTensorLayoutNV(historyLayout,firstHistory,BC,0,DH),CONTENT_DECODE);
+        signal=coopMatMulAdd(amplified,content,signal);
+    }
+    coopMatPerElementNV(reference,reference,recordReference,firstRow);coopMatPerElementNV(maxSignal,maxSignal,recordMaximum,firstRow);
+    coopmat<float,gl_ScopeWorkgroup,BR,DH,gl_MatrixUseAccumulator> denominator;
+    coopMatReduceNV(denominator,reference,gl_CooperativeMatrixReduceRowNV,rowValue);signal/=denominator;
+    coopMatPerElementNV(signal,signal,gatedOutput,firstRow);
+    tensorLayoutNV<2,gl_CooperativeMatrixClampModeConstantNV> outputLayout=createTensorLayoutNV(2,gl_CooperativeMatrixClampModeConstantNV);
+    outputLayout=setTensorLayoutDimensionNV(outputLayout,cfg.rows,A);outputLayout=setTensorLayoutStrideNV(outputLayout,A,1);
+    coopMatStoreTensorNV(signal,detector,0,sliceTensorLayoutNV(outputLayout,firstRow,BR,gl_WorkGroupID.x*DH,DH));
+}

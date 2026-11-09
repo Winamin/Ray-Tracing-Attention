@@ -1,0 +1,46 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_NV_cooperative_matrix2 : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_buffer_reference : require
+#if RT_VECTOR_DECODE
+#extension GL_NV_cooperative_matrix_decode_vector : require
+#endif
+#include "resident_common.glsl"
+layout(constant_id=1) const uint branch=0u;
+layout(std430,binding=22) readonly buffer MatrixInput {float16_t matrixInput[];};
+layout(std430,binding=36) readonly buffer CachedControls {float16_t cachedControls[];};
+float coefficient(uint row,uint axis){
+    uint base=blockBase(),offset=parameters[branch==0u?base+36u:base+35u];
+    uint metadata=coefficientFormat==0xffffffffu?parameters[branch==0u?base+40u:base+39u]:coefficientFormat;
+    return quantizedWeight(0u,offset,metadata,row,D,axis);
+}
+float opticalControl(const in uint channel,const in uint r,const in float signal){
+    uint head=gl_WorkGroupID.x*32u+channel,base=blockBase();
+    return branch==0u?exp(-exp(pf(parameters[base+38u]+head))*softplus(signal+pf(parameters[base+37u]+head))):detectorSigmoid(signal);
+}
+void main(){
+    uint cacheOffset=(parameters[blockBase()+42u]*2u+branch)*H*D;
+    if(operation==1u){uint pair=gl_WorkGroupID.x*128u+gl_LocalInvocationID.x;if(pair>=H*D/2u)return;uint row=(pair*2u)/D,axis=(pair*2u)%D;featureDown[cacheOffset/2u+pair]=packHalf2x16(vec2(coefficient(row,axis),coefficient(row,axis+1u)));return;}
+    uint firstHead=gl_WorkGroupID.x*32u,firstRow=gl_WorkGroupID.y*128u;
+    tensorLayoutNV<2> weightsLayout=createTensorLayoutNV(2),inputLayout=createTensorLayoutNV(2);
+    weightsLayout=setTensorLayoutDimensionNV(weightsLayout,H,D);weightsLayout=setTensorLayoutStrideNV(weightsLayout,D,1);
+    inputLayout=setTensorLayoutDimensionNV(inputLayout,((cfg.rows+127u)/128u)*128u,D);inputLayout=setTensorLayoutStrideNV(inputLayout,D,1);
+    tensorViewNV<2,false,1,0> transpose=createTensorViewNV(2,false,1,0);
+    coopmat<float,gl_ScopeWorkgroup,32,128,gl_MatrixUseAccumulator> result=coopmat<float,gl_ScopeWorkgroup,32,128,gl_MatrixUseAccumulator>(0.0);
+    for(uint k=0u;k<D;k+=32u){
+        coopmat<float16_t,gl_ScopeWorkgroup,32,32,gl_MatrixUseA> a;
+        coopmat<float16_t,gl_ScopeWorkgroup,32,128,gl_MatrixUseB> b;
+        coopMatLoadTensorNV(a,cachedControls,cacheOffset,sliceTensorLayoutNV(weightsLayout,firstHead,32,k,32));
+        coopMatLoadTensorNV(b,matrixInput,0,sliceTensorLayoutNV(inputLayout,firstRow,128,k,32),transpose);
+        result=coopMatMulAdd(a,b,result);
+    }
+    coopMatPerElementNV(result,result,opticalControl);
+    tensorLayoutNV<2,gl_CooperativeMatrixClampModeConstantNV> outputLayout=createTensorLayoutNV(2,gl_CooperativeMatrixClampModeConstantNV);
+    outputLayout=setTensorLayoutDimensionNV(outputLayout,cfg.rows,H);outputLayout=setTensorLayoutStrideNV(outputLayout,H*2u,2);
+    coopMatStoreTensorNV(result,auxiliary,branch,sliceTensorLayoutNV(outputLayout,firstRow,128,firstHead,32),transpose);
+}

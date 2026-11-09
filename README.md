@@ -1,6 +1,6 @@
 # Ray Tracing Attention
 
-![Ray Tracing Attention 工作流程](docs/images/ray_tracing_attention_workflow.png)
+![Ray Tracing Attention operator architecture](docs/images/ray_tracing_attention_workflow.png)
 
 **把大模型的注意力、MLP 与词表寻址接入原生光追管线，让命中的因果光路直接输出 token。**
 
@@ -41,7 +41,7 @@ $$
 
 ### Ray Tracing MLP 如何承载原模型权重
 
-原模型的 SwiGLU 变换为：
+如原模型的 SwiGLU 变换为：
 
 $$
 z=\mathrm{SiLU}(W_g h)\odot(W_u h),\qquad y=W_dz.
@@ -57,6 +57,10 @@ $$
 
 各通道汇合得到 gate 与 up 信号，探测响应完成 SwiGLU，再由 down 光学系数还原输出。编译器保留源模型的系数载荷，特征 Tree 返回参与读出的特征身份；同一套算子接入不同模型的维度与权重。
 
+![Ray Tracing Attention and MLP operators](docs/images/ray_tracing_attention_layer_detail.png)
+
+算子图展开完整注意力的光强探测、递推光场的衰减与校正，以及 MLP 的 gate/up、SiLU 和 down 传输。立体张量表示高维信号与场状态，嵌套包围盒表示几何查询空间；每层读出恢复完整高维状态。
+
 ### 词表与因果 Tree 直接输出 token
 
 词表几何来自模型的 LM Head。高维状态驱动词表查询，命中回执进入并行系数读出，最强信号确定输出 token。得到的答案连同当前因果地址写入 token Tree：
@@ -66,13 +70,17 @@ $$
 \quad\longmapsto\quad y_t.
 $$
 
-每个输出位置先查询一次 Tree。已有路径命中时直接返回 token，并推进下一步地址；新路径进入 RT 层计算，再把结果写入 Tree。前缀和生成终点检查点保存继续计算所需的状态，使缓存输出和新增内容顺畅衔接。
+每个输出位置先查询一次 Tree。已有路径命中时直接返回 token，并推进下一步地址；新路径进入 RT 层计算，再把结果写入 Tree。输入与生成终点保存共享块引用、高维读出行和光路地址；连续命中沿地址输出，新光路通过原生传播形成当前递归场。
+
+![Blockwise vocabulary geometry and optical readout](docs/images/ray_tracing_attention_output_detail.png)
+
+词表算子图展开完整坐标分块、局部角度与幅度、BVH 求交身份、光学系数响应和词元贡献汇合。各块保持原始通道身份，完整高维分数连接最强光信号选词。
 
 ## 核心能力
 
 - **统一模型编译。** GGUF 文件和 Hugging Face safetensors 目录共用一个入口。模型规格描述词表、头维度、GQA、层顺序、RoPE 与递推状态；同一套 Shader 根据规格生成原生管线。
 - **Ray Tracing Attention 与 Ray Tracing MLP。** 光线通过透镜查询历史 Tree、MLP 特征 Tree 和词表 Tree，探测器根据真实命中回执聚合贡献。Q4_K / Q6_K 按 256 系数块并行解码，小型参数沿用源精度。
-- **因果 token Tree。** 每个预测位置查询一次 Tree，命中直接返回 token，再沿下一步地址继续。地址包含完整输入、已生成 token、绝对位置及停止设置；批次和输出预算可自由调整。
+- **因果 token Tree。** 每个预测位置查询一次 Tree，命中直接返回 token，再沿下一步地址继续。解码地址由高维信号、递归场、有效历史光路、位置和停止设置共同验证；命中返回词元与后继地址。公共历史按内容共享，批次和输出预算可自由调整。
 - **GPU 常驻执行。** 模型中间信号留在 GPU，原生 worker 连续执行生成。共享词嵌入与 LM Head 只保存一份原始载荷。
 - **真正逐 token 流式。** 模型生成一个 token，CLI 立即接收并刷新。底部状态行展示 RT 查询计时与占时、GPU 传感器、生成速度和显存；输入 `/fx` 展开详细报告。
 
@@ -112,17 +120,23 @@ rt-chat --capacity 1024 --profile --no-cache
 
 | 工作负载 | 实测结果 |
 |---|---:|
-| 二分查找任务，128 token，普通生成 GPU | 29.70 token/s |
-| 128-token 因果 Tree 重放，CLI 逐 token 生成 | 13017 token/s |
-| 同一重放，包含前缀恢复的完整请求 | 11231 token/s |
-| 128 次 Tree 命中，生成 GPU 合计 | 1.051 ms |
-| 25-token prefill，GPU | 425.09 ms |
+| 二分查找任务，128 token，普通生成 GPU | 38.48 token/s |
+| 128-token 因果 Tree 重放，CLI 逐 token 生成 | 11960 token/s |
+| 同一重放，包含前缀恢复的完整请求 | 10014 token/s |
+| 128 次 Tree 命中，生成 GPU 合计 | 1.473 ms |
+| 25-token prefill，GPU | 70.53 ms |
+| 256-token prefill，GPU | 91.18 ms · 2808 token/s |
+| 1024-token prefill，GPU | 375.40 ms · 2728 token/s |
 
-缓存重放的 128 次查询全部命中，输出与关闭缓存逐 token 一致，MLP 和词表计算回执均为 0。首次路径由完整模型计算并写入 Tree；连续命中直接沿已计算路径输出。前缀和最新生成终点保存在两个固定检查点中，新增内容从对应状态继续；跨任务续写按需恢复历史状态。
+缓存重放的 128 次查询全部命中，输出与关闭缓存逐 token 一致，MLP 和词表计算回执均为 0。首次路径由完整模型计算并写入 Tree；连续命中直接沿已计算路径输出。输入端点、输出端点、公共前缀与中间边界进入共享历史 BVH，完整历史块复用同一 BLAS。边界保存高维读出行与查询地址；新光路通过原生传播形成当前递归状态。
 
 重构回归中，9B 逐层信号与原生基线误差为 **0**，16-token 输出完全一致。不同架构的独立数值验证覆盖 Qwen3、Llama 与 Qwen3.5 混合层图，逐层误差低于 **1.7×10⁻⁷**；参考计算采用相同的历史光路量化规则。32 层完整注意力 Tree 与 64-token 计时批次也已通过原生检查。验证还覆盖 37 词元的非整块词表、32/128 维头、不同隐藏与投影宽度、不同层顺序、混合精度以及共享词表载荷。
 
-实测记录保存在 [benchmarks](benchmarks/)；本地完整日志保存在 `.local/`。
+四轮编码任务依次分析 TTLCache、根据真实测试回执修复、补充测试并总结，四轮均输出不同内容，共生成 281 个词元。新光路的完整请求吞吐为 **22.89 token/s**；返回这四个已计算分支后，每步都经 BVH 查询，完整请求合计 **52.69 ms、5333 token/s**，逐词元输出为 **12996 token/s**，包含真实工具调用为 **1068 token/s**。281 次光路命中均与原始计算输出一致。
+
+![Shared causal BVHs and compact boundary states](docs/images/ray_tracing_attention_cache_detail.png)
+
+共享历史与因果地址树在同一模型进程中服务各对话分支。模型与几何命名空间、完整因果依赖决定复用；已计算路径返回 token 与后继地址，新路径完成光学传播。输入前缀命中、直接输出命中与实际补算词元在 `/fx` 中分别显示。
 
 ## 长上下文与显存
 
@@ -136,7 +150,18 @@ rt-chat --capacity 1024 --profile --no-cache
 | 4096 | 44.25 MiB | 128 MiB |
 | 8192 | 88.50 MiB | 256 MiB |
 
-RT 列来自历史光路包容量；BF16 列按八层共享 GQA 的对应载荷计算。权重、递推状态、BVH 和工作区通过 `/memory` 单独展示。因果回复树容纳最近 65536 个节点，地址与 token 载荷每节点 32 bytes，连同几何与更新空间合计 16.09 MiB。
+RT 列来自历史光路包容量；BF16 列按八层共享 GQA 的对应载荷计算。权重、递推状态、BVH 和工作区通过 `/memory` 单独展示。因果回复树容纳最近 65536 个节点，每节点以 96 bytes 保存当前与后继指纹、几何图表、位置和输出，载荷合计 6 MiB。
+
+共享边界按 16-token 历史块引用已有光路，一个 4096 维高维读出行占 16384 bytes。公共块只保存一份，分支记录各自引用；完整块直接接入共享 BLAS，尾块承载追加。递归场由当前原生传播更新，边界目录保存可继续查询的光路身份。
+
+| 输入长度（各轮回复结束后统计） | 边界高维行总载荷 | 共享历史块与场景 |
+|---:|---:|---:|
+| 203 token | 49,152 bytes · 3 个边界 | 3.88 MiB |
+| 472 token | 131,072 bytes · 8 个边界 | 9.32 MiB |
+| 959 token | 229,376 bytes · 14 个边界 | 19.00 MiB |
+| 1228 token | 311,296 bytes · 19 个边界 | 24.26 MiB |
+
+该任务的原生设备分配为 **6189.19 MiB**；相同配置关闭缓存为 **6173.19 MiB**。表中的边界高维行与共享光路分别统计，模型权重、当前递归场、工作区和驱动分配在 `/memory` 中展开。
 
 ## 模型与算子
 
@@ -157,38 +182,25 @@ RT 列来自历史光路包容量；BF16 列按八层共享 GQA 的对应载荷�
 
 ## 源码布局
 
-`ray_tracing` 是完整项目根目录，包含使用说明、原生源码、统一编译器、测试、实测记录与论文。安装和命令均在此目录执行。
+项目目录为 `Ray Tracing Attention`，其中 `ray_tracing/` 是共用模型编译器和原生运行包。安装和命令在项目根目录执行。
 
 ```text
-ray_tracing/                    项目根目录
-  README.md                     原理、使用方式与性能说明
-  pyproject.toml                安装配置与 CLI 入口
+Ray Tracing Attention/
+  README.md                     原理、使用方式与实测表现
+  pyproject.toml                安装配置与命令入口
   LICENSE / NOTICE              Apache-2.0 与版权声明
   THIRD_PARTY.md                第三方组件声明
-  rt_chat.cmd / rt_compile.cmd  Windows 启动与编译入口
-  ray_tracing/                  Python 包
-    compiler/                   源权重适配器、模型规格、统一转译与构建
-    runtime/                    原生协议、分词、CLI、实时状态
-    native/src/                 Vulkan 引擎、几何场景、因果缓存
+  rt_chat.cmd / rt_compile.cmd  Windows 入口
+  ray_tracing/
+    compiler/                   源权重适配器、规格、转译与构建
+    runtime/                    原生协议、分词、对话与实时状态
+    native/src/                 Vulkan 引擎、几何场景、共享因果缓存
     native/shaders/             共用 RT 与光学计算 Shader
     native/include/             Vulkan 头文件
-    verification/               真实硬件验证与性能测量
-  tests/                        编译器与规格检查
-  benchmarks/                   可复核的实测记录
-  docs/images/                  工作流程图与绘图源
-  docs/rt_attention_math/       论文源、内置图与 PDF
-  .github/workflows/            自动测试与打包
-  .local/                       本地模型、构建缓存与会话
-```
-
-```powershell
-python -m pytest -q
-python -m ray_tracing.verification.verify_portable
-python -m ray_tracing.verification.verify_rt_cache
-python -m ray_tracing.verification.verify_gguf_adapter
-python -m ray_tracing.verification.verify_deep_tree
-python -m ray_tracing.verification.verify_gguf_native
-python -m ray_tracing.verification.profile_qwenflash --label current
+  docs/images/                  英文算子图的 PNG、SVG 与 PDF
+  docs/paper/                    成品论文 PDF 与内置图片
+  .github/workflows/            源码语法与打包检查
+  .local/                       本机模型、工具、构建缓存与会话
 ```
 
 许可证：[Apache-2.0](LICENSE)。第三方组件的原始声明保存在 [THIRD_PARTY.md](THIRD_PARTY.md) 与 [NOTICE](NOTICE)。

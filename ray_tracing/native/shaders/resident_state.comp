@@ -1,0 +1,37 @@
+#version 460
+// Adapted from llama.cpp Vulkan kernels: https://github.com/ggml-org/llama.cpp
+// Copyright (c) 2023-2026 The ggml authors. MIT license in THIRD_PARTY.md.
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#include "resident_common.glsl"
+
+// Column clusters follow llama.cpp's gated_delta_net Vulkan scan. Every state
+// coefficient participates; the recurrent field stays in its optical encoding.
+void main(){
+    if(stopped())return;
+    uint head=gl_WorkGroupID.y,lane=gl_SubgroupInvocationID%4u;
+    uint value=gl_WorkGroupID.x*32u+gl_SubgroupID*8u+gl_SubgroupInvocationID/4u;
+    uint offset=recurrentOffset(head,value);
+    vec2 field[16],address[16];
+    [[unroll]] for(uint r=0u;r<16u;r++)field[r]=fieldPair(offset+(r*4u+lane)*2u);
+    for(uint t=0u;t<cfg.rows;t++){
+        float decay=auxiliary[t*H*2u+head*2u],beta=auxiliary[t*H*2u+head*2u+1u],received=0.0;
+        [[unroll]] for(uint r=0u;r<16u;r++){
+            uint axis=head*HD+(r*4u+lane)*2u;
+            address[r]=vec2(frame(t,S+axis),frame(t,S+axis+1u));
+            field[r]*=decay;received+=dot(address[r],field[r]);
+        }
+        received=subgroupClusteredAdd(received,4u);
+        float delta=(frame(t,2u*S+head*HD+value)-received)*beta,signal=0.0;
+        [[unroll]] for(uint r=0u;r<16u;r++){
+            field[r]+=address[r]*delta;
+            uint axis=head*HD+(r*4u+lane)*2u;
+            signal+=dot(vec2(frame(t,axis),frame(t,axis+1u)),field[r]);
+        }
+        signal=subgroupClusteredAdd(signal,4u)/sqrt(float(HD));
+        if(lane==0u)detector[t*A+head*HD+value]=signal;
+
+    }
+    [[unroll]] for(uint r=0u;r<16u;r++)writeField(offset+(r*4u+lane)*2u,field[r]);
+}

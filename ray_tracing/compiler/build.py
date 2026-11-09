@@ -5,6 +5,7 @@ import hashlib
 import os
 import shutil
 import subprocess
+import re
 from .spec import asset_spec
 from ..runtime.settings import LOCAL
 
@@ -15,11 +16,21 @@ def build(spec, output=None):
     files=sorted(p for p in NATIVE.rglob('*') if p.is_file())
     digest=hashlib.sha256(spec.fingerprint.encode())
     for p in files: digest.update(p.relative_to(NATIVE).as_posix().encode());digest.update(p.read_bytes())
+    local_compiler=LOCAL/'tools/glslang/bin/glslangValidator.exe'
+    if not local_compiler.exists():local_compiler=LOCAL/'tools/glslang/mingw64/bin/glslangValidator.exe'
+    shader_compiler=os.environ.get('RT_GLSLANG',str(local_compiler) if local_compiler.exists() else 'glslangValidator')
+    local_validator=local_compiler.with_name('spirv-val.exe')
+    validator=os.environ.get('RT_SPIRV_VAL',str(local_validator) if local_validator.exists() else 'spirv-val')
+    for tool in (shader_compiler,validator,os.environ.get('CXX','g++')):
+        if not shutil.which(tool): raise RuntimeError(f'Build tool {tool} is required; install the Vulkan SDK and a C++17 compiler')
+    version=subprocess.run([shader_compiler,'--version'],capture_output=True,text=True)
+    if version.returncode:raise RuntimeError(version.stderr or version.stdout)
+    match=re.search(r'Glslang Version: \d+:(\d+)\.(\d+)',version.stdout)
+    vector_decode=bool(match and tuple(map(int,match.groups()))>=(16,6))
+    digest.update(str(vector_decode).encode())
     target=Path(output) if output else LOCAL/'build'/digest.hexdigest()[:20]
     executable=target/('rt_optical_resident.exe' if os.name=='nt' else 'rt_optical_resident')
     if executable.exists() and (target/'complete').exists(): return executable
-    for tool in ('glslangValidator','spirv-val',os.environ.get('CXX','g++')):
-        if not shutil.which(tool): raise RuntimeError(f'Build tool {tool} is required; install the Vulkan SDK and a C++17 compiler')
     target.mkdir(parents=True,exist_ok=True)
     lines=[f'#define {k} {v}' for k,v in spec.defines().items()]
     (target/'rt_model_config.h').write_text('\n'.join(lines)+'\n',encoding='utf8')
@@ -29,9 +40,10 @@ def build(spec, output=None):
     cpp+='constexpr uint32_t MODEL_FULL_INDEX[]={'+','.join(map(str,mapping))+'};\n'
     (target/'rt_layer_map.hpp').write_text(cpp,encoding='utf8')
     commands=[]
-    for name in ('resident_math','resident_ray','reply_cache'):
-        commands += [['glslangValidator','-V','--target-env','vulkan1.2','-I'+str(target),'-I'+str(NATIVE/'shaders'),str(NATIVE/'shaders'/(name+'.comp')),'-o',str(target/(name+'.spv'))],
-                     ['spirv-val','--target-env','vulkan1.2',str(target/(name+'.spv'))]]
+    for name in ('resident_math','resident_batch2','resident_pack','resident_attention','resident_auxiliary','resident_state','resident_ray','reply_cache','optical_path_key','history_cache'):
+        environment='vulkan1.3' if name in ('resident_batch2','resident_attention','resident_auxiliary') else 'vulkan1.2'
+        commands += [[shader_compiler,'-V','--target-env',environment,'-DRT_VECTOR_DECODE='+str(int(vector_decode)),'-I'+str(target),'-I'+str(NATIVE/'shaders'),str(NATIVE/'shaders'/(name+'.comp')),'-o',str(target/(name+'.spv'))],
+                     [validator,'--target-env',environment,str(target/(name+'.spv'))]]
     flags=['-static-libgcc','-static-libstdc++','-Wl,-Bstatic,--whole-archive','-lwinpthread','-Wl,--no-whole-archive,-Bdynamic','-lvulkan-1'] if os.name=='nt' else ['-lvulkan','-pthread']
     commands += [[os.environ.get('CXX','g++'),'-std=c++17','-O3','-ffp-contract=off','-I'+str(target),'-I'+str(NATIVE/'include'),str(NATIVE/'src/optical_resident.cpp'),*flags,'-o',str(executable)]]
     options={'creationflags':subprocess.CREATE_NO_WINDOW} if os.name=='nt' else {}

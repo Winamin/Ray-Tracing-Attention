@@ -7,42 +7,53 @@ layout(std430,binding=2) buffer Receipt {uint receipt[];};
 layout(std430,binding=3) buffer Control {uint control[];};
 layout(std430,binding=4) buffer Tokens {uint tokens[];};
 layout(std430,binding=5) buffer Nodes {uint nodes[];};
-layout(push_constant) uniform Query {uint operation,key0,key1,key2,key3,position,count,first,index;} cfg;
-const vec2 corners[6]=vec2[6](vec2(0,0),vec2(0,1),vec2(1,1),vec2(0,0),vec2(1,1),vec2(1,0));
-uvec4 advance(uvec4 key,uint token,uint position){
-    return (key^uvec4(token,token+0x9e3779b9u,token^position,token+position*668265263u))*uvec4(16777619u,2246822519u,3266489917u,374761393u);
-}
-vec2 cell(uvec4 key){return 4.0*vec2(key.x&65535u,key.y&65535u);}
+layout(std430,binding=6) readonly buffer Addresses {uint addresses[];};
+layout(push_constant) uniform Query {uint operation,key[8],chart[2],position,count,first,index;} cfg;
+const vec2 corners[6]=vec2[6](vec2(-1,-1),vec2(-1,1),vec2(1,1),vec2(-1,-1),vec2(1,1),vec2(1,-1));
 void main(){
-    uint lane=gl_LocalInvocationID.x;uvec4 key=uvec4(cfg.key0,cfg.key1,cfg.key2,cfg.key3);
+    uint lane=gl_LocalInvocationID.x;uint key[8];for(uint k=0u;k<8u;k++)key[k]=cfg.key[k];
+    vec2 direction=vec2(uintBitsToFloat(cfg.chart[0]),uintBitsToFloat(cfg.chart[1]));
+    bool parallel=cfg.operation==2u;uint branch=gl_GlobalInvocationID.x;
+    if(parallel){
+        if(branch>=cfg.count)return;
+        for(uint k=0u;k<8u;k++)key[k]=addresses[branch*10u+k];
+        direction=vec2(uintBitsToFloat(addresses[branch*10u+8u]),uintBitsToFloat(addresses[branch*10u+9u]));
+    }
     if(cfg.operation==0u){
         uint count=control[1]-cfg.index;
         for(uint i=0u;i<min(cfg.count,count);i++){
-            uint slot=(cfg.first+i)%65536u,token=tokens[528u+cfg.index+i],at=slot*8u;
-            if(lane<4u)nodes[at+lane]=key[lane];
-            if(lane==4u)nodes[at+4u]=cfg.position+i;
-            if(lane==5u)nodes[at+5u]=token;
-            if(lane==6u)nodes[at+6u]=1u;
-            if(lane==7u)nodes[at+7u]=0u;
-            if(lane<6u){vec2 xy=cell(key)+corners[lane];uint p=(slot*6u+lane)*3u;vertices[p]=xy.x;vertices[p+1u]=xy.y;vertices[p+2u]=0;}
-            key=advance(key,token,cfg.position+i);
+            uint slot=(cfg.first+i)%65536u,token=tokens[528u+cfg.index+i],at=slot*24u,next=i*10u;
+            if(lane<8u){nodes[at+lane]=key[lane];nodes[at+8u+lane]=addresses[next+lane];}
+            if(lane<2u){nodes[at+16u+lane]=floatBitsToUint(direction[lane]);nodes[at+18u+lane]=addresses[next+8u+lane];}
+            if(lane==20u)nodes[at+20u]=cfg.position+i;
+            if(lane==21u)nodes[at+21u]=token;
+            if(lane==22u)nodes[at+22u]=1u;
+            if(lane==23u)nodes[at+23u]=0u;
+            if(lane<6u){vec2 xy=direction+corners[lane]*.00005;uint p=(slot*6u+lane)*3u;vertices[p]=xy.x;vertices[p+1u]=xy.y;vertices[p+2u]=0;}
+            for(uint k=0u;k<8u;k++)key[k]=addresses[next+k];
+            direction=vec2(uintBitsToFloat(addresses[next+8u]),uintBitsToFloat(addresses[next+9u]));
         }return;
     }
-    if(lane!=0u)return;
-    uint hits=0u,queries=0u,leaf=0xffffffffu;control[1]=0u;
-    for(uint i=0u;i<cfg.count&&control[2]!=0u;i++){
+    if(lane!=0u&&!parallel)return;
+    uint hits=0u,queries=0u,leaf=0xffffffffu,candidates=0u,rejected=0u,lastToken=0xffffffffu;if(!parallel)control[1]=0u;
+    for(uint i=0u;i<(parallel?1u:cfg.count)&&(parallel||control[2]!=0u);i++){
         rayQueryEXT query;queries++;
-        rayQueryInitializeEXT(query,cacheAS,gl_RayFlagsNoOpaqueEXT|gl_RayFlagsTerminateOnFirstHitEXT,255u,vec3(cell(key)+vec2(.25,.5),1),0,vec3(0,0,-1),2);
+        rayQueryInitializeEXT(query,cacheAS,gl_RayFlagsNoOpaqueEXT|gl_RayFlagsTerminateOnFirstHitEXT,255u,vec3(direction,1),0,vec3(0,0,-1),2);
         while(rayQueryProceedEXT(query))if(rayQueryGetIntersectionTypeEXT(query,false)==gl_RayQueryCandidateIntersectionTriangleEXT){
-            uint slot=rayQueryGetIntersectionInstanceCustomIndexEXT(query,false)*256u+rayQueryGetIntersectionPrimitiveIndexEXT(query,false)/2u,at=slot*8u;
-            if(nodes[at+6u]==1u&&nodes[at+4u]==cfg.position+i&&all(equal(uvec4(nodes[at],nodes[at+1u],nodes[at+2u],nodes[at+3u]),key)))rayQueryConfirmIntersectionEXT(query);
+            uint slot=rayQueryGetIntersectionInstanceCustomIndexEXT(query,false)*256u+rayQueryGetIntersectionPrimitiveIndexEXT(query,false)/2u,at=slot*24u,next=i*10u;
+            candidates++;bool valid=nodes[at+22u]==1u&&(parallel||nodes[at+20u]==cfg.position+i);
+            for(uint k=0u;k<8u;k++)valid=valid&&nodes[at+k]==key[k];
+            if(valid)rayQueryConfirmIntersectionEXT(query);else rejected++;
         }
         if(rayQueryGetIntersectionTypeEXT(query,true)!=gl_RayQueryCommittedIntersectionTriangleEXT)break;
         leaf=rayQueryGetIntersectionInstanceCustomIndexEXT(query,true)*256u+rayQueryGetIntersectionPrimitiveIndexEXT(query,true)/2u;
-        uint token=nodes[leaf*8u+5u];tokens[528u+hits]=token;control[0]=token;hits++;
-        if(token==control[4]||token==control[5])control[2]=0u;
-        key=advance(key,token,cfg.position+i);
+        uint at=leaf*24u,token=nodes[at+21u];lastToken=token;
+        if(!parallel){tokens[528u+hits]=token;control[0]=token;if(token==control[4]||token==control[5])control[2]=0u;}hits++;
+        for(uint k=0u;k<8u;k++)key[k]=nodes[at+8u+k];
+        direction=vec2(uintBitsToFloat(nodes[at+18u]),uintBitsToFloat(nodes[at+19u]));
     }
-    control[1]=hits;receipt[0]=hits;receipt[1]=leaf;receipt[2]=queries;receipt[3]=queries>hits?1u:0u;
-    for(uint i=0u;i<4u;i++)receipt[4u+i]=key[i];
+    if(!parallel)control[1]=hits;uint outAt=parallel?branch*16u:0u;
+    receipt[outAt]=hits;receipt[outAt+1u]=leaf;receipt[outAt+2u]=queries;receipt[outAt+3u]=parallel?lastToken:queries>hits?1u:0u;
+    for(uint k=0u;k<8u;k++)receipt[outAt+4u+k]=key[k];
+    receipt[outAt+12u]=floatBitsToUint(direction.x);receipt[outAt+13u]=floatBitsToUint(direction.y);receipt[outAt+14u]=candidates;receipt[outAt+15u]=rejected;
 }

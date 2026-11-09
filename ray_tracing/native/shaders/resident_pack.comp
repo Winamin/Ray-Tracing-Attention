@@ -1,0 +1,15 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "resident_common.glsl"
+uint originalToDetector(uint axis){uint local=axis%RT_ATTENTION_HEAD_DIM;return local<RT_ROTARY_DIM?axis-local+(local%(RT_ROTARY_DIM/2u))*2u+local/(RT_ROTARY_DIM/2u):axis;}
+void main(){
+    uint cols=cfg.index==0u?D:cfg.index==1u?(parameters[blockBase()+26u]==1u?Q:S):FEATURE_WIDTH;
+    uint pair=(gl_WorkGroupID.x+gl_WorkGroupID.y*gl_NumWorkGroups.x)*128u+gl_LocalInvocationID.x;
+    if(pair>=((cfg.rows+255u)/256u)*256u*cols/2u)return;
+    uint row=pair/(cols/2u),axis=pair%(cols/2u)*2u;vec2 value;
+    if(row>=cfg.rows){wordDecoded[pair]=0.0;return;}
+    if(cfg.index==0u)value=vec2(normalized[row*D+axis],normalized[row*D+axis+1u]);
+    else if(cfg.index==1u){uint first=axis,second=axis+1u;if(parameters[blockBase()+26u]==1u){first=originalToDetector(first);second=originalToDetector(second);}value=vec2(detector[row*A+first],detector[row*A+second]);}
+    else value=vec2(feedForward[row*W+axis],feedForward[row*W+axis+1u]);
+    wordDecoded[pair]=uintBitsToFloat(packHalf2x16(value));
+}

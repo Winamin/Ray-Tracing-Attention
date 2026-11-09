@@ -60,7 +60,7 @@ void main(){
         if(lane==0u){physical[(row*max(H,uint(RT_ATTENTION_HEADS))+head)*2u]=maximum+20.0;physical[(row*max(H,uint(RT_ATTENTION_HEADS))+head)*2u+1u]=reference;}
         if(lane<hd){uint ch=head*hd+lane;detector[row*A+ch]=signal0/max(reference,1e-30)*(RT_ATTENTION_GATE==1?detectorSigmoid(feedForward[row*W+ch]):1.0);}
         if(lane+128u<hd){uint ch=head*hd+lane+128u;detector[row*A+ch]=signal1/max(reference,1e-30)*(RT_ATTENTION_GATE==1?detectorSigmoid(feedForward[row*W+ch]):1.0);}return;}
-    if(operation==5u){if(row>=min(256u,wordResult[4096u]))return;uint pair=job*128u+lane,word=wordResult[WORD_QUEUE+row];if(pair>=P)return;
+    if(operation==5u){if(row>=min(256u,wordResult[4096u]))return;uint pair=job*128u+lane,word=wordResult[WORD_QUEUE+row];if(pair>=D/2u)return;
         vec2 value=wordTransfer(word,pair);
         wordDecoded[row*D+pair*2u]=value.x;wordDecoded[row*D+pair*2u+1u]=value.y;return;}
     if(operation==8u){for(uint q=lane;q<cfg.rows;q+=128u)if(hits[q*(cfg.capacity+1u)]!=min(absolute(q)+1u,cfg.capacity))atomicOr(control[3],8u);if(lane==0u){control[8u+cfg.capacity]=8u;control[9u+cfg.capacity]=control[6];control[10u+cfg.capacity]=1u;control[7]+=control[6]*SHARED_PAIRS;}return;}
@@ -68,20 +68,29 @@ void main(){
     if(operation==10u||operation==11u)return;
     if(operation==12u){
         uint groups=(WORD_TILES+wordRayBatch-1u)/wordRayBatch,bank=job/groups,localJob=job%groups;
-        if(lane==0u){float total;uvec2 lens;wordLensValid=throughLens(bank,cfg.depth,rays[bank],wordOrigin,wordDirection,total,lens)?1u:0u;}barrier();
+        if(lane==0u){float total;uvec2 lens;wordLensValid=throughLens(0u,cfg.depth,rays[bank],wordOrigin,wordDirection,total,lens)?1u:0u;}barrier();
         uint tile=localJob*wordRayBatch+lane;if(lane>=wordRayBatch||tile>=WORD_TILES)return;uint instance=bank*WORD_TILES+tile;uint wordSeen[8];for(uint i=0u;i<8u;i++)wordSeen[i]=0u;
         if(wordLensValid==0u){atomicOr(control[3],1024u);return;}vec3 o=wordOrigin,d=wordDirection;
         o.x-=float(cfg.depth)*4.0;o.x+=float(instance)*4.0;startWord(o,d);uint count=0u;
         while(rayQueryProceedEXT(ray)){
-            if(rayQueryGetIntersectionTypeEXT(ray,false)!=gl_RayQueryCandidateIntersectionTriangleEXT)continue;
-            uint primitive=rayQueryGetIntersectionPrimitiveIndexEXT(ray,false),owner=rayQueryGetIntersectionInstanceCustomIndexEXT(ray,false);
-            if(owner!=instance||primitive>=WORD_TILE*2u){atomicOr(control[3],1024u);return;}
-            uint local=primitive/2u,word=(owner%WORD_TILES)*WORD_TILE+local;if(word>=V)continue;uint bit=1u<<(local%32u);
+            if(rayQueryGetIntersectionTypeEXT(ray,false)!=gl_RayQueryCandidateIntersectionAABBEXT)continue;
+            uint primitive=rayQueryGetIntersectionPrimitiveIndexEXT(ray,false),word=primitive%V;
+            uint bound=primitive*6u;float z=.5*(wordBounds[bound+2u]+wordBounds[bound+5u]);
+            float distance=(z-o.z)/d.z;vec3 point=o+distance*d;
+            if(distance<=.00001||distance>8.0||point.x<wordBounds[bound]||point.x>wordBounds[bound+3u]||
+               point.y<wordBounds[bound+1u]||point.y>wordBounds[bound+4u])continue;
+            // Procedural candidates may use conservatively expanded bounds.
+            // Validate the exact plane and its identity before recording a hit.
+            if(primitive/V!=bank||word/WORD_TILE!=tile)continue;
+            uint local=word%WORD_TILE,bit=1u<<(local%32u);
             if((wordSeen[local/32u]&bit)!=0u)continue;wordSeen[local/32u]|=bit;
-            if(cfg.padding0!=1u){wordResult[WORD_MASK+word]=1u;wordResult[WORD_QUEUE+word]=word;count++;}
-            else if(atomicOr(wordResult[WORD_MASK+word],1u)==0u){uint index=atomicAdd(wordResult[4096u],1u);wordResult[WORD_QUEUE+index]=word;}
+            atomicOr(wordResult[wordBlockMask(word,bank)],1u<<(bank%32u));
+            if(bank==0u)wordResult[WORD_QUEUE+word]=word;
+            count++;
         }
-        if(cfg.padding0!=1u){atomicAdd(wordResult[4096u],count);if(count!=min(WORD_TILE,V-tile*WORD_TILE))atomicOr(control[3],2048u);}return;
+        atomicAdd(wordResult[4097u],count);
+        if(bank==0u)atomicAdd(wordResult[4096u],count);
+        if(count!=min(WORD_TILE,V-tile*WORD_TILE))atomicOr(control[3],2048u);return;
     }
 
     if(operation==13u){if(lane>=32u)return;uint query=job*32u+lane;if(query>=featureBanks()*FEATURE_TILES)return;uint bank=query/FEATURE_TILES,tile=query%FEATURE_TILES,at=featureBase(row);vec4 emission=featureRays[row*featureBanks()+bank];
@@ -93,6 +102,6 @@ void main(){
             if(owner!=cfg.layer*featureBanks()*FEATURE_TILES+query||primitive>=FEATURE_TILE*2u||feature>=FEATURE_WIDTH){atomicOr(control[3],4096u);return;}
             if(cfg.padding0!=1u){uint local=primitive/2u,bit=1u<<(local%32u);if((seen[local/32u]&bit)!=0u)continue;seen[local/32u]|=bit;featureWork[at+featureQueueOffset()+feature]=feature;count++;}
             else if(atomicOr(featureWork[at+16u+feature],1u)==0u){uint index=atomicAdd(featureWork[at],1u);featureWork[at+featureQueueOffset()+index]=feature;}
-        }if(cfg.padding0!=1u)atomicAdd(featureWork[at],count);return;}
+        }if(cfg.padding0!=1u){uint total=subgroupAdd(count);if(gl_SubgroupInvocationID==0u)atomicAdd(featureWork[at],total);}return;}
 
 }

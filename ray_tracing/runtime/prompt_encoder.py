@@ -33,8 +33,44 @@ class LocalPromptEncoder:
         self.template = environment.from_string(
             (self.model_dir / 'chat_template.jinja').read_text(encoding='utf8'))
 
-    def encode(self, messages):
-        text = self.template.render(messages=messages, add_generation_prompt=True,
+    def _render(self, messages, add_generation_prompt):
+        return self.template.render(messages=messages, add_generation_prompt=add_generation_prompt,
                                     enable_thinking=False, tools=None, add_vision_id=False,
                                     bos_token=self.bos_token or '',eos_token=self.eos_token or '')
-        return self.tokenizer.encode(text, add_special_tokens=False).ids
+
+    def encode(self, messages):
+        return self.tokenizer.encode(self._render(messages, True), add_special_tokens=False).ids
+
+    def encode_with_checkpoint(self, messages):
+        """Keep the source prompt intact and checkpoint before its mutable suffix."""
+        ids = self.encode(messages)
+        history = self.tokenizer.encode(self._render(messages, False), add_special_tokens=False).ids
+        boundary = 0
+        for token, previous in zip(ids, history):
+            if token != previous:
+                break
+            boundary += 1
+        return ids, boundary or len(ids)
+
+    def encode_with_boundaries(self, messages):
+        """Mark canonical input/output ends without changing source rendering."""
+        ids = self.encode(messages)
+        boundaries = {}
+        for end, message in enumerate(messages, 1):
+            try:
+                rendered = self._render(messages[:end], False)
+            except ValueError:
+                # Some source templates require a user turn even for rendering.
+                # The complete prompt above has already passed their validation.
+                continue
+            prefix = self.tokenizer.encode(rendered, add_special_tokens=False).ids
+            shared = 0
+            for current, previous in zip(ids, prefix):
+                if current != previous:
+                    break
+                shared += 1
+            if shared:
+                kind = 2 if message.get('role') == 'assistant' else 1
+                boundaries[shared] = boundaries.get(shared, 0) | kind
+        boundaries[len(ids)] = boundaries.get(len(ids), 0) | 1
+        return ids, sorted(boundaries.items())

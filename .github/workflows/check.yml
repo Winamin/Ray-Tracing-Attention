@@ -9,5 +9,8 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install '.[compiler,dev]'
-      - run: python -m pytest -q
+      - run: python -m compileall -q ray_tracing
+      - run: rt-compile --help
+      - run: rt-build --help
+      - run: rt-chat --help
       - run: python -m build

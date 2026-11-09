@@ -27,7 +27,7 @@ else:
 
 ROOT = Path(__file__).resolve().parents[2]
 ACTIVE_OUTPUT = default_model()
-DEFAULT_MODEL = DEFAULT_OUTPUT = ACTIVE_OUTPUT
+DEFAULT_MODEL = ACTIVE_OUTPUT
 MAX_TOKENS = 65536
 STAGES = {"projection_geometry": "投影 / 几何", "bvh_update": "BVH 增量更新",
           "lens_history_trace": "透镜 / 历史 RT 查询", "coordinate_restore": "高维坐标恢复",
@@ -147,11 +147,22 @@ class Console:
         if report.get('rt_query_gpu_ms') is not None:
             rows.append(f"RT 查询 GPU {report['rt_query_gpu_ms']:.3f} ms · 查询占时 "
                         f"{report['rt_query_gpu_ms']/report['generation_gpu_ms']*100:.2f}%")
+        if 'mlp_route_cached_rows' in report['rt']:
+            rows.append(f"MLP 层求交结果：缓存复用 {report['rt']['mlp_route_cached_rows']:,} 次 · "
+                        f"新计算 {report['rt']['mlp_route_rt_rows']:,} 次")
         if (cache := report.get('cache')) and cache['capacity']:
             rows.append(f"光路缓存 {cache['nodes']:,}/{cache['capacity']:,} 节点 · 命中后每 token 一条查询光线")
             if cache['state_recovery_tokens']:
                 rows.append(f"缓存状态恢复 {cache['state_recovery_gpu_ms']:.3f} ms · "
                             f"检查点 {cache['checkpoint_restores']} 次 · {cache['state_recovery_tokens']} token")
+        if 'history_cache_boundaries' in report['resources']:
+            history = report['prefill']
+            rows.append(f"共享历史 BVH {report['resources']['history_cache_boundaries']} 个边界 · "
+                        f"接入 {history.get('history_shared_blocks', 0)} 个历史块 · "
+                        f"新增计算 {history.get('prefill_computed_tokens', 0)} token · "
+                        f"查询 {history.get('history_lookup_rays', 0)} 条光线")
+            rows.append(f"共享边界状态 {mib(report['resources']['history_boundary_state_bytes'])} · "
+                        f"共享光路块 {mib(report['resources']['history_shared_block_bytes'])}")
         self.panel("本轮性能", rows)
         if report["profile_gpu_ms"]:
             self.panel("GPU 阶段计时（词表子项包含在词表总计内）", [
@@ -209,9 +220,10 @@ class ChatSession:
         if context is not None:
             self.can_continue = False
             self.monitor.progress("prefill")
-            encoded = self.encoder.encode(context)
+            encoded, checkpoint_boundaries = self.encoder.encode_with_boundaries(context)
             input_tokens = len(encoded)
-            prefill = self.native.prefill(encoded, self.encoder.stop_ids)
+            prefill = self.native.prefill(encoded, self.encoder.stop_ids,profile=self.args.profile,
+                                         checkpoint_boundaries=checkpoint_boundaries)
             used = min(input_tokens, self.native.capacity)
             self.coordinate_pairs_total = int(prefill['control'][7])
         self.log.write("request_start", input_tokens=input_tokens, input_used_tokens=used,
@@ -224,7 +236,9 @@ class ChatSession:
         cache_state_ms = 0.
         cache_state_tokens = checkpoint_restores = 0
         rt = dict(mlp_feature_hits=0, mlp_possible_features=0, vocabulary_hits=0,
-                  tree_cache_hits=0, tree_cache_queries=0, context_coordinate_decoded_pairs=0)
+                  tree_cache_hits=0, tree_cache_queries=0, context_coordinate_decoded_pairs=0,
+                  cache_candidates=0, cache_rejected_candidates=0,
+                  mlp_route_rt_rows=0, mlp_route_cached_rows=0)
         first_batch = first_text = None
         rt_query_ms = 0.
         rt_query_measured = False
@@ -297,6 +311,7 @@ class ChatSession:
                 elif self.messages and self.messages[-1]['role'] == 'assistant':
                     self.messages[-1]['content'] += partial
             raise
+        history_output = self.native.finish_history()
         generation_ms = (time.perf_counter()-generation_start)*1000
         request_ms = (time.perf_counter()-start)*1000
         full_text = self.encoder.tokenizer.decode(ids, skip_special_tokens=True)
@@ -331,6 +346,7 @@ class ChatSession:
                   "gpu": self.monitor.snapshot(), "sampled_peaks": self.monitor.since(start),
                   "metadata": self.native.metadata}
         report['tree_growth'] = self.native.growth_events[growth_start:]
+        report['history_output'] = history_output
         report['cache'] = {'nodes': result.get('cache_nodes', 0) if result else 0,
                            'capacity': result.get('cache_capacity', 0) if result else 0,
                            'state_recovery_gpu_ms': cache_state_ms,
@@ -418,6 +434,7 @@ class ChatSession:
             rows.append("GPU 传感器：" + data["gpu"].get("reason", "无数据"))
         r = self.resources
         rows.extend([f"RT 状态：{'硬件查询 + 命中回执' if self.native.metadata['routing'] == 'rt_full' else self.native.metadata['routing']}",
+                     f"Prefill 并行位置 {self.native.metadata['prefill_batch']} · 权重共享 {self.native.metadata['matrix_token_tile']} token",
                      f"历史 BVH {r['history_blas_count']} BLAS / {r['history_tlas_count']} TLAS · "
                      f"词表查询 {r['word_rays']:,} 条 · 每块词 / 特征 {r['word_tile']}/{r['feature_tile']}",
                      f"累计 {self.stats['requests']} 次请求 / {self.stats['tokens']} token · "
@@ -437,7 +454,7 @@ class ChatSession:
             fields = {"device_allocation_bytes": "原生设备分配", "vulkan_allocation_bytes": "Vulkan 总分配",
                       "packed_coefficient_bytes": "固定传输系数", "history_path_packet_bytes": "历史光路包",
                       "history_scene_bytes": "历史 BVH 场景", "word_scene_bytes": "词表场景",
-                      "optical_field_bytes": "递推光场", "cache_snapshot_bytes": "回复 / 前缀检查点",
+                      "optical_field_bytes": "递推光场", "cache_snapshot_bytes": "缓存高维状态行",
                       "reply_tree_bytes": "缓存树", "hit_receipt_bytes": "历史命中回执",
                       "feature_receipt_bytes": "特征回执 / 工作区", "upload_staging_bytes": "上传暂存",
                       "host_readback_bytes": "主机回读", "debug_audit_bytes": "诊断快照"}
@@ -448,13 +465,7 @@ class ChatSession:
         return data
 
     def rt_status(self):
-        path = DEFAULT_OUTPUT.parent / "rt_ray_sweep_summary.json"
-        fixtures = json.loads(path.read_text(encoding="utf8")) if path.exists() else []
         data = {"metadata": self.native.metadata, "resources": self.native.resources(),
-                "historical_microbenchmark_path": str(path) if fixtures else None,
-                "historical_microbenchmark": [{"cells": f["cells"], "depth": f["depth"],
-                    "modes": [{"mode": m["mode"], "peak": m["peak"], "knee_90_percent": m["knee_90_percent"]}
-                              for m in f["modes"]]} for f in fixtures],
                 "latest_profile_gpu_ms": self.last["profile_gpu_ms"] if self.last else {}}
         if self.console.machine:
             if self.args.jsonl:
@@ -463,15 +474,6 @@ class ChatSession:
                 print(json.dumps(data, ensure_ascii=False, allow_nan=False), flush=True)
         else:
             self.status()
-            rows = []
-            for f in data["historical_microbenchmark"]:
-                for mode in f["modes"]:
-                    p, knee = mode["peak"], mode["knee_90_percent"]
-                    rows.append(f"{f['cells']:,} 格 / 深度 {f['depth']} · {mode['mode']} · "
-                                f"峰值 {p['rays_per_second']/1e9:.3f} G ray/s · "
-                                f"{p['rays']:,} 射线 / {p['gpu_ms']*1000:.3f} μs · "
-                                f"90% 甜点 {knee['rays']:,} 射线")
-            self.console.panel("历史独立射线基准 · 单次 GPU dispatch，包含回执", rows or ["尚无基准记录"])
             if data['latest_profile_gpu_ms']:
                 self.console.panel("最近请求 RT 阶段", [
                     f"{STAGES[key]} {value:.3f} ms" for key, value in data['latest_profile_gpu_ms'].items()
@@ -581,6 +583,10 @@ def parser():
     p.add_argument("--batch", type=lambda v: bounded_int(v, 1, 64), default=32, help="每次原生请求预算；流式模式逐 token 推送")
     p.add_argument("--capacity", type=lambda v: bounded_int(v, 1, 1048576), default=512,
                    help="历史 Tree 初始槽位；按需扩容并保留完整历史")
+    p.add_argument("--prefill-batch", type=int, choices=(32,64,128,256,512,1024), default=512,
+                   help="Prefill 并行位置数；按绝对位置批量写入和查询 Tree")
+    p.add_argument("--prefill-matrix-rows", type=int, choices=(4,8,16), default=8,
+                   help="共享一组量化权重的 token 数")
     p.add_argument("--cache", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--profile", action="store_true", help="启用阶段 GPU 时间戳；执行计算路径")
     p.set_defaults(routing="rt_full",aperture=.08)
@@ -630,7 +636,8 @@ def main(argv=None):
         console.start_status(monitor)
         native = ResidentRuntime(args.asset, capacity=args.capacity, cache=args.cache, routing=args.routing,
                                  aperture=args.aperture, word_tile=args.word_tile, feature_tile=args.feature_tile,
-                                 readout_unroll=args.readout_unroll, readout_words=args.readout_words)
+                                 readout_unroll=args.readout_unroll, readout_words=args.readout_words,
+                                 prefill_batch=args.prefill_batch,matrix_rows=args.prefill_matrix_rows)
         session = ChatSession(native, encoder, args, console, monitor, log)
         monitor.progress("idle")
         monitor.sample()

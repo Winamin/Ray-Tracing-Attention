@@ -30,7 +30,7 @@ layout(std430,binding=22) buffer WordDecoded {float wordDecoded[];};
 layout(std430,binding=23) buffer ScalarVertices {float scalarVertices[];};
 layout(std430,binding=24) buffer WordResult {uint wordResult[];};
 layout(std430,binding=25) buffer LensVertices {float lensVertices[];};
-layout(std430,binding=26) buffer BaseChart {vec2 baseChart[];};
+layout(std430,binding=26) buffer BaseChart {uvec2 baseChart[];};
 layout(std430,binding=27) buffer FeedForward {float feedForward[];};
 layout(std430,binding=28) buffer Auxiliary {float auxiliary[];};
 layout(std430,binding=29) readonly buffer Prompt {uint prompt[];};
@@ -42,12 +42,16 @@ layout(std430,binding=34) buffer FeatureWork {uint featureWork[];};
 layout(std430,binding=35) buffer FeatureRays {vec4 featureRays[];};
 layout(std430,binding=36) buffer FeatureDown {uint featureDown[];};
 layout(std430,binding=37) buffer DownPartial {float partialDown[];};
-layout(push_constant) uniform Config {uint stage,rows,layer,position,step,mode,index,capacity,depth,debug,padding0,padding1;} cfg;
+layout(std430,binding=38) buffer WordBounds {float wordBounds[];};
+layout(push_constant) uniform Config {uint stage,rows,layer,position,step,mode,index,capacity,depth,debug,padding0,padding1,checkpoint;} cfg;
 const uint D=RT_HIDDEN_SIZE,A=RT_WORKING_WIDTH,S=RT_STATE_WIDTH,Q=RT_QUERY_WIDTH,W=RT_FF_STRIDE,P=RT_QUERY_WIDTH/2u,B=32u,H=RT_STATE_HEADS,HD=128u,WP=256u;
 layout(constant_id=3) const uint WORD_TILE=256u;
 layout(constant_id=5) const uint FEATURE_TILE=8u;
 layout(constant_id=8) const uint coefficientFormat=0xffffffffu;
-const uint V=RT_VOCABULARY_SIZE,WORD_TILES=(V+WORD_TILE-1u)/WORD_TILE,WORD_MASK=8192u+V,WORD_QUEUE=8192u+2u*V;
+const uint V=RT_VOCABULARY_SIZE,WORD_TILES=(V+WORD_TILE-1u)/WORD_TILE;
+const uint WORD_BLOCK_WIDTH=256u,WORD_BLOCKS=RT_HIDDEN_SIZE/WORD_BLOCK_WIDTH;
+const uint WORD_MASK_WORDS=(WORD_BLOCKS+31u)/32u,WORD_MASK=8192u+V;
+const uint WORD_QUEUE=WORD_MASK+V*WORD_MASK_WORDS;
 const uint ROUTE_BANKS=4u,FEATURE_WIDTH=RT_MIDDLE_SIZE,FEATURE_ROW=16u+FEATURE_WIDTH*2u,FEATURE_TILES=(FEATURE_WIDTH+FEATURE_TILE-1u)/FEATURE_TILE;
 shared float reduction[4];
 float angularSign(uint bank,uint axis,uint coordinate){return (bitCount(coordinate&(1u<<(bank*2u+axis)))&1)==0?1.0:-1.0;}
@@ -55,7 +59,7 @@ uint featureBanks(){return cfg.padding0==1u?ROUTE_BANKS:1u;}
 uint featureRow(){return 16u+FEATURE_WIDTH*(cfg.padding0==1u?2u:1u);}
 uint featureQueueOffset(){return 16u+(cfg.padding0==1u?FEATURE_WIDTH:0u);}
 uint featureBase(uint row){return row*featureRow();}
-uint featureGlobal(){return min(cfg.capacity,32u)*featureRow();}
+uint featureGlobal(){return uint(featureWork.length())-16u;}
 float pf(uint at){return uintBitsToFloat(parameters[at]);}
 uint blockBase(){return 32u+(cfg.layer%parameters[1])*64u;}
 uint absolute(uint row){return cfg.mode==0u?row:cfg.mode==1u?cfg.position:cfg.position+row;}
@@ -98,6 +102,9 @@ vec2 restorePair(uvec4 geometry){return vec2(restoreCoordinate(geometry.xyz&uvec
 // BF16 path references; the validated inverse is a bit-exact direct decode.
 uvec2 encodePathPair(vec2 value){return floatBitsToUint(value);}
 vec2 restorePathPair(uvec2 packet){return uintBitsToFloat(packet);}
+float restoredWordCoordinate(uint axis){return uintBitsToFloat(baseChart[axis/2u][axis%2u]);}
+uint wordBlockMask(uint word,uint block){return WORD_MASK+word*WORD_MASK_WORDS+block/32u;}
+bool wordBlockHit(uint word,uint block){return (wordResult[wordBlockMask(word,block)]&(1u<<(block%32u)))!=0u;}
 const uint SHARED_WIDTH=RT_GQA_WIDTH,SHARED_PAIRS=RT_GQA_WIDTH/2u;
 uint sharedAxis(uint axis){return (axis/(RT_ATTENTION_HEAD_DIM*(RT_QUERY_WIDTH/RT_GQA_WIDTH)))*RT_ATTENTION_HEAD_DIM+axis%RT_ATTENTION_HEAD_DIM;}
 float quantizedPath(uint slot,uint axis,bool content);

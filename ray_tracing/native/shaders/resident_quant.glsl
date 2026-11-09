@@ -60,10 +60,17 @@ QuantizedOctet quantizedOctet(uint kind,uint offset,uint metadata,uint row,uint 
     const uvec4 shifts=uvec4(0u,8u,16u,24u);
     if(type==12u){
         vec2 header=unpackHalf2x16(coefficientWord(kind,at));
-        uvec2 s0=q4ScaleMin(kind,at,first/32u),s1=q4ScaleMin(kind,at,second/32u);
+        // Decode both scale/minimum pairs from the same three packed words.
+        // Adjacent groups share their metadata, with no per-byte rereads.
+        uint group=first/32u;uvec2 shift=uvec2(group&3u,(group&3u)+1u)*8u;
+        uvec2 sc=(uvec2(coefficientWord(kind,at+4u))>>shift)&255u;
+        uvec2 mn=(uvec2(coefficientWord(kind,at+8u))>>shift)&255u;
+        uvec2 extra=(uvec2(coefficientWord(kind,at+12u))>>shift)&255u;
+        sc=mix(sc&63u,(extra&15u)|((sc>>6u)<<4u),bvec2(group>=4u));
+        mn=mix(mn&63u,(extra>>4u)|((mn>>6u)<<4u),bvec2(group>=4u));
         uvec4 packed=(uvec4(coefficientWord(kind,at+16u+(first/64u)*32u+first%32u))>>shifts);
-        result.low=(header.x*float(s0.x))*vec4(packed&15u)-(header.y*float(s0.y));
-        result.high=(header.x*float(s1.x))*vec4((packed>>4u)&15u)-(header.y*float(s1.y));
+        result.low=(header.x*float(sc.x))*vec4(packed&15u)-(header.y*float(mn.x));
+        result.high=(header.x*float(sc.y))*vec4((packed>>4u)&15u)-(header.y*float(mn.y));
     }else{
         uint local=first%128u,part=first/128u;
         uvec4 low=uvec4(coefficientWord(kind,at+part*64u+local))>>shifts;

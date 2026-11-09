@@ -43,13 +43,13 @@ public:
         }
         auto c=e.command();e.begin(c);build(c,count,true);check(vkEndCommandBuffer(c),"end optical shape initialization");e.submit(c);vkFreeCommandBuffers(e.device,e.pool,1,&c);
     }
-    void build(VkCommandBuffer command,uint32_t active,bool initial=false,bool onlyTop=false,uint32_t first=0) {
+    void build(VkCommandBuffer command,uint32_t active,bool initial=false,bool onlyTop=false,uint32_t first=0,uint32_t topGroup=~0u) {
         std::vector<VkAccelerationStructureBuildGeometryInfoKHR> infos;std::vector<VkAccelerationStructureBuildRangeInfoKHR> ranges;
-        if(!onlyTop)for(uint32_t i=initial?0:first;i<(initial?count:active);i++) {
+        if(!onlyTop)for(uint32_t i=initial&&topGroup==~0u?0u:first;i<(initial&&topGroup==~0u?count:active);i++) {
             auto& leaf=leaves[i];VkAccelerationStructureBuildGeometryInfoKHR bi{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};bi.type=VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;bi.flags=VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR|VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;bi.mode=initial?VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR:VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR;bi.srcAccelerationStructure=initial?VK_NULL_HANDLE:leaf.handle;bi.dstAccelerationStructure=leaf.handle;bi.geometryCount=1;bi.pGeometries=&leaf.geometry;bi.scratchData.deviceAddress=(leaf.scratch->address+e.alignment-1)&~VkDeviceAddress(e.alignment-1);infos.push_back(bi);ranges.push_back({perInstance/3,0,0,0});
         }
         if(!infos.empty()){std::vector<const VkAccelerationStructureBuildRangeInfoKHR*> rp;for(auto& r:ranges)rp.push_back(&r);e.buildAS(command,uint32_t(infos.size()),infos.data(),rp.data());Engine::barrier(command,VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);}
-        for(uint32_t group=0;group<groups;group++) {
+        for(uint32_t group=topGroup==~0u?0u:topGroup;group<(topGroup==~0u?groups:topGroup+1u);group++) {
             VkAccelerationStructureBuildGeometryInfoKHR bi{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};bi.type=VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;bi.flags=VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR|VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;bi.mode=initial?VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR:VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR;bi.srcAccelerationStructure=initial?VK_NULL_HANDLE:tops[group];bi.dstAccelerationStructure=tops[group];bi.geometryCount=1;bi.pGeometries=&topGeometry[group];bi.scratchData.deviceAddress=(topScratch[group]->address+e.alignment-1)&~VkDeviceAddress(e.alignment-1);VkAccelerationStructureBuildRangeInfoKHR range{count/groups,0,0,0};const auto* rp=&range;e.buildAS(command,1,&bi,&rp);
         }
         Engine::barrier(command,VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);

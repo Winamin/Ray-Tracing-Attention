@@ -6,6 +6,7 @@ import shutil
 import struct
 import numpy as np
 from .sources import GGUFSource, open_source
+from .partition import CoordinatePartition
 
 STRIDE=64
 FORMATS={0:4,1:2,30:2,12:144/256,14:210/256}
@@ -135,12 +136,15 @@ def export(source,destination):
     params=np.concatenate((header,*parts));asset=destination/'optical_model.bin'
     with asset.open('wb') as stream:
         stream.write(b'RTRES004');stream.write(struct.pack('<9I',d,depth,depth,middle,spec.vocabulary_size,4,len(params),matrix_words,0));params.tofile(stream)
+    partition=CoordinatePartition(d)
+    partition.write(destination)
     metadata={'source_model':str(src.path),'architecture':spec.architecture,'model_spec':spec.to_dict(),
         'depth':depth,'hidden_size':d,'middle':middle,'vocabulary':spec.vocabulary_size,
         'precision':'original coefficient formats','quantization':' + '.join(sorted({r['type'] for r in records})),
         'full_contribution_layers':len(spec.full_layers),'optical_recurrent_layers':len(spec.recurrent_layers),
         'state_heads':spec.state_heads,'step':0,'parameter_bytes':int(params.nbytes+(matrix_words+basis_words)*4),
         'history_quantization':{'address':'Q4_K','content':'Q6_K','bytes_per_token':len(spec.full_layers)*spec.history_bytes},
-        'tensor_payloads':records,'tokenizer_ids_verified':spec.vocabulary_size}
+        'tensor_payloads':records,'tokenizer_ids_verified':spec.vocabulary_size,
+        'coordinate_partition':partition.descriptor(spec.vocabulary_size)}
     (destination/'model.json').write_text(json.dumps(metadata,ensure_ascii=False,indent=2),encoding='utf8')
     return asset,metadata

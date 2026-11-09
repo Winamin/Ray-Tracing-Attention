@@ -1,5 +1,6 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : require
 #include "resident_common.glsl"
 layout(constant_id=1) const uint matrixRows=1u;
 layout(constant_id=2) const uint projectionKind=0xffffffffu;
@@ -31,17 +32,17 @@ return;}
         uint currentWidth=full?Q:S,gateWidth=full?(RT_ATTENTION_GATE==1?Q:0u):S,sharedWidth=full?RT_GQA_WIDTH:S;
         uint cols=requested==4u?width:requested==2u?currentWidth:D;
         bool repeatedProjection=!full,sharedProjection=full;
-        uint outWidth=requested==5u?queryWidth+keyWidth+gateWidth+sharedWidth:requested==3u?width:D;
+        uint outWidth=requested==5u?queryWidth+keyWidth+gateWidth+sharedWidth:requested==0u?queryWidth:requested==1u?keyWidth:requested==6u?gateWidth:requested==8u?sharedWidth:requested==3u?width:D;
         if(channel>=outWidth)return;if(matrixIndex==5u){if(channel<queryWidth)matrixIndex=0u;else if(channel<queryWidth+keyWidth){matrixIndex=1u;channel-=queryWidth;}else if(channel<queryWidth+keyWidth+gateWidth){matrixIndex=6u;channel-=queryWidth+keyWidth;}else{matrixIndex=8u;channel-=queryWidth+keyWidth+gateWidth;}}
         uint weightChannel=channel,coefficientChannel=channel;
         uint metadata=parameters[matrixIndex==8u?base+33u:base+10u+matrixIndex*2u];
         uint weight=matrixIndex==8u?parameters[base+32u]:parameters[base+9u+matrixIndex*2u];row*=matrixRows;
         vec4 received[matrixRows*2u],upReceived[matrixRows*2u];
-        for(uint r=0u;r<matrixRows*2u;r++){received[r]=vec4(0);upReceived[r]=vec4(0);}
+        [[unroll]] for(uint r=0u;r<matrixRows*2u;r++){received[r]=vec4(0);upReceived[r]=vec4(0);}
         for(uint block=0u;block<cols/256u;block++){
             QuantizedOctet transfer=quantizedOctet(0u,weight,metadata,coefficientChannel,cols,block,thread),up;
             if(matrixIndex==3u)up=quantizedOctet(0u,parameters[base+19u],parameters[base+20u],channel,cols,block,thread);
-            for(uint r=0u;r<matrixRows;r++)if(row+r<cfg.rows)for(uint i=0u;i<4u;i++){
+            [[unroll]] for(uint r=0u;r<matrixRows;r++)if(row+r<cfg.rows)[[unroll]] for(uint i=0u;i<4u;i++){
                 uint a=(row+r)*(matrixIndex==2u?A:D)+transfer.axis.x+i,b=(row+r)*(matrixIndex==2u?A:D)+transfer.axis.y+i;float x,y;
                 if(matrixIndex==2u){x=detector[a];y=detector[b];}
                 else if(matrixIndex==4u){x=feedForward[(row+r)*W+transfer.axis.x+i];y=feedForward[(row+r)*W+transfer.axis.y+i];}
@@ -50,7 +51,7 @@ return;}
                 if(matrixIndex==3u){upReceived[r*2u][i]+=x*up.low[i];upReceived[r*2u+1u][i]+=y*up.high[i];}
             }
         }
-        for(uint r=0u;r<matrixRows;r++){if(row+r>=cfg.rows)continue;
+        [[unroll]] for(uint r=0u;r<matrixRows;r++){if(row+r>=cfg.rows)continue;
             float signal=subgroupAdd(dot(received[r*2u]+received[r*2u+1u],vec4(1))),upSignal=subgroupAdd(dot(upReceived[r*2u]+upReceived[r*2u+1u],vec4(1)));
             if(thread==0u){uint at=(row+r)*D+channel;
                 if(matrixIndex==0u){for(uint copy=0u;copy<(full?1u:RT_STATE_HEADS/RT_STATE_KEY_HEADS);copy++)queries[(row+r)*A+channel+copy*queryWidth]=signal;}
@@ -75,18 +76,23 @@ return;}
         vec2 xy=center+2.0*corners[lane%6u];uint v=(instance*12u+lane)*3u;lensVertices[v]=xy.x;lensVertices[v+1u]=xy.y;lensVertices[v+2u]=z-dot(a,xy-center);return;}
     if(operation==8u){uint value=job*128u+lane;if(value>=65536u)return;float scalar=uintBitsToFloat(value<<16u);if(isnan(scalar)||isinf(scalar)||abs(scalar)>32.0)scalar=0;vec2 cell=2.0*vec2(value%256u,value/256u);uint at=value*9u;
         scalarVertices[at]=cell.x;scalarVertices[at+1u]=cell.y;scalarVertices[at+2u]=0;scalarVertices[at+3u]=cell.x+1;scalarVertices[at+4u]=cell.y;scalarVertices[at+5u]=-scalar/16.0;scalarVertices[at+6u]=cell.x;scalarVertices[at+7u]=cell.y+1;scalarVertices[at+8u]=0;return;}
-    if(operation==9u){uint word=job+gl_WorkGroupID.y*32768u,bank=gl_WorkGroupID.z;if(word>=V){if(word<WORD_TILES*WORD_TILE&&lane<6u){uint p=(word*6u+lane)*3u;historyVertices[p]=0;historyVertices[p+1u]=0;historyVertices[p+2u]=-100;}return;}float square=0,px=0,py=0;
-        for(uint c=lane;c<D;c+=128u){float v=wordGeometryValue(word,c);square+=v*v;if(cfg.padding0==1u){px+=v*angularSign(bank,0u,c);py+=v*angularSign(bank,1u,c);}}
-        float norm=sqrt(sum128(square));px=sum128(px);py=sum128(py);
-        vec2 coordinates=cfg.padding0!=1u?vec2(wordGeometryValue(word,0u),wordGeometryValue(word,1u)):vec2(px,py)/sqrt(float(D));
-        vec2 center=chart(coordinates,sqrt(float(D))/max(norm,1e-20));uint instance=bank*WORD_TILES+word/WORD_TILE;center.x+=4.0*float(instance);
-        float aperture=cfg.padding0!=1u?2.0:uintBitsToFloat(cfg.padding1);
-        if(lane<6u){vec2 xy=center+aperture*corners[lane];uint p=((bank*V+word)*6u+lane)*3u;historyVertices[p]=xy.x;historyVertices[p+1u]=xy.y;historyVertices[p+2u]=2.0-.04*log(1.0+norm);}return;}
-    if(operation==11u){uint target=cfg.rows-1u,bank=job;float square=0,px=0,py=0;
-        for(uint c=lane;c<D;c+=128u){float v=state[target*D+c];square+=v*v;if(cfg.padding0==1u){px+=v*angularSign(bank,0u,c);py+=v*angularSign(bank,1u,c);}}
-        float inv=inversesqrt(sum128(square)/float(D)+float(RT_NORM_EPSILON));px=sum128(px);py=sum128(py);
-        vec2 coordinates=cfg.padding0!=1u?vec2(state[target*D],state[target*D+1u]):vec2(px,py)/sqrt(float(D));
-        if(lane==0u)rays[bank]=vec4(chart(coordinates,inv),0,0);return;}
+    if(operation==9u){uint word=job+gl_WorkGroupID.y*32768u,block=gl_WorkGroupID.z;if(word>=V)return;
+        uint first=block*WORD_BLOCK_WIDTH;vec2 pair=wordTransfer(word,(first+lane*2u)/2u);
+        float norm=sqrt(sum128(dot(pair,pair)));
+        vec2 coordinates=vec2(wordGeometryValue(word,first),wordGeometryValue(word,first+1u));
+        vec2 center=chart(coordinates,sqrt(float(WORD_BLOCK_WIDTH))/max(norm,1e-20));
+        uint primitive=block*V+word,tile=block*WORD_TILES+word/WORD_TILE;
+        if(lane==0u){uint at=primitive*6u;float x=center.x+4.0*float(tile),z=2.0-.04*log(1.0+norm);
+            wordBounds[at]=x-2.0;wordBounds[at+1u]=center.y-2.0;wordBounds[at+2u]=z-.00001;
+            wordBounds[at+3u]=x+2.0;wordBounds[at+4u]=center.y+2.0;wordBounds[at+5u]=z+.00001;}
+        return;}
+    if(operation==11u){uint target=cfg.rows-1u,block=job,first=block*WORD_BLOCK_WIDTH;
+        vec2 value=vec2(state[target*D+first+lane*2u],state[target*D+first+lane*2u+1u]);
+        baseChart[first/2u+lane]=encodePathPair(value);
+        float norm=sqrt(sum128(dot(value,value)));
+        if(lane==0u){vec2 coordinates=vec2(state[target*D+first],state[target*D+first+1u]);
+            rays[block]=vec4(chart(coordinates,sqrt(float(WORD_BLOCK_WIDTH))/max(norm,1e-20)),0,0);}
+        return;}
     if(operation==12u){uint c=job*128u+lane;if(c<D)for(uint r=0u;r<cfg.rows;r++)audit[(cfg.layer*cfg.capacity+absolute(r))*D+c]=state[r*D+c];return;}
     if(operation==13u){uint pair=job*128u+lane;if(pair*2u>=cfg.rows)return;vec2 value=vec2(state[pair*2u],state[pair*2u+1u]);uvec4 encoded=encodePair(value);keyGeometry[pair]=encodePathPair(value);vec2 restored=restorePair(encoded);detector[pair*2u]=restored.x;detector[pair*2u+1u]=restored.y;return;}
     if(operation==14u){uint head=job,hd=headWidth();float qs=0,ks=0;for(uint c=lane;c<hd;c+=128u){float q=queries[row*A+head*hd+c],k=keys[row*A+head*hd+c];qs+=q*q;ks+=k*k;}qs=sum128(qs);ks=sum128(ks);float factor=parameters[base+30u]==1u?float(hd):1.0;qs=inversesqrt(qs/factor+float(RT_NORM_EPSILON));ks=inversesqrt(ks/factor+float(RT_NORM_EPSILON));
@@ -95,9 +101,10 @@ return;}
 
     if(operation==16u){uint index=job*readoutWords+gl_SubgroupID,count=wordResult[4096u],word=index<count?wordResult[WORD_QUEUE+index]:0xffffffffu,c=gl_SubgroupInvocationID,target=cfg.rows-1u;
         float value=-1.0/0.0;
-        if(word<V){vec4 low=vec4(0),high=vec4(0);for(uint block=0u;block<D/256u;block++){
+        if(word<V){vec4 low=vec4(0),high=vec4(0);for(uint block=0u;block<WORD_BLOCKS;block++){
+            if(!wordBlockHit(word,block)){if(c==0u)atomicOr(control[3],2048u);}
             QuantizedOctet transfer=quantizedOctet(1u,parameters[16u],parameters[15u],word,D,block,c);
-            for(uint i=0u;i<4u;i++){low[i]+=state[target*D+transfer.axis.x+i]*transfer.low[i];high[i]+=state[target*D+transfer.axis.y+i]*transfer.high[i];}}
+            [[unroll]] for(uint i=0u;i<4u;i++){low[i]+=restoredWordCoordinate(transfer.axis.x+i)*transfer.low[i];high[i]+=restoredWordCoordinate(transfer.axis.y+i)*transfer.high[i];}}
             value=subgroupAdd(dot(low+high,vec4(1)));}
         if(c==0u){strongestSignals[gl_SubgroupID]=value;strongestTokens[gl_SubgroupID]=word;}barrier();
         if(lane==0u){uint best=0u;for(uint i=1u;i<readoutWords;i++)if(strongestSignals[i]>strongestSignals[best]||(strongestSignals[i]==strongestSignals[best]&&strongestTokens[i]<strongestTokens[best]))best=i;wordResult[8192u+job]=floatBitsToUint(strongestSignals[best]);wordResult[8192u+(V+3u)/4u+job]=strongestTokens[best];}return;}
@@ -111,16 +118,18 @@ a+=x*quantizedWeight(0u,parameters[base+36u],parameters[base+40u],head,D,c);
 b+=x*quantizedWeight(0u,parameters[base+35u],parameters[base+39u],head,D,c);
 }a=sum128(a);b=sum128(b);
         if(lane==0u){auxiliary[row*H*2u+head*2u]=exp(-exp(pf(parameters[base+38u]+head))*softplus(a+pf(parameters[base+37u]+head)));auxiliary[row*H*2u+head*2u+1u]=detectorSigmoid(b);}return;}
-    if(operation==19u){uint coord=job*128u+lane;if(coord>=S*3u)return;uint past=convolutionOffset()+coord*3u,weights=parameters[base+34u]+coord*4u;float previous[3];for(uint j=0u;j<3u;j++)previous[j]=cfg.mode!=0u?uintBitsToFloat(opticalMemory[past+j]):0;
-        for(uint t=0u;t<cfg.rows;t++){float signal=0;for(uint j=0u;j<4u;j++){int at=int(t)+int(j)-3;float x=at>=0?rawProjection(uint(at),coord):previous[uint(at+3)];vec2 transfer=vec2(pf(weights+j),0);signal+=signedEnergy(vec2(x,0),transfer,true).x-signedEnergy(vec2(x,0),transfer,false).x;}
-            opticalMemory[frameOffset(t)+coord]=floatBitsToUint(signal*detectorSigmoid(signal));}
-        for(uint j=0u;j<3u;j++){int t=int(cfg.rows)+int(j)-3;opticalMemory[past+j]=floatBitsToUint(t>=0?rawProjection(uint(t),coord):previous[uint(t+3)]);}return;}
+    if(operation==19u){uint coord=job*128u+lane;if(coord>=S*3u)return;uint past=convolutionOffset()+coord*3u,weights=parameters[base+34u]+coord*4u;
+        float signal=0;for(uint j=0u;j<4u;j++){int at=int(row)+int(j)-3;float x=at>=0?rawProjection(uint(at),coord):cfg.mode!=0u?uintBitsToFloat(opticalMemory[past+uint(at+3)]):0;vec2 transfer=vec2(pf(weights+j),0);signal+=signedEnergy(vec2(x,0),transfer,true).x-signedEnergy(vec2(x,0),transfer,false).x;}
+        opticalMemory[frameOffset(row)+coord]=floatBitsToUint(signal*detectorSigmoid(signal));return;}
     if(operation==20u){uint head=job;float qs=0,ks=0;for(uint c=lane;c<HD;c+=128u){float q=frame(row,head*HD+c),k=frame(row,S+head*HD+c);qs+=q*q;ks+=k*k;}qs=inversesqrt(sum128(qs)+float(RT_NORM_EPSILON));ks=inversesqrt(sum128(ks)+float(RT_NORM_EPSILON));
-        for(uint c=lane;c<HD;c+=128u){uint at=frameOffset(row)+head*HD+c;opticalMemory[at]=floatBitsToUint(frame(row,head*HD+c)*qs);opticalMemory[at+S]=floatBitsToUint(frame(row,S+head*HD+c)*ks);}return;}
+        for(uint c=lane;c<HD;c+=128u){uint at=frameOffset(row)+head*HD+c;opticalMemory[at]=floatBitsToUint(frame(row,head*HD+c)*qs);opticalMemory[at+S]=floatBitsToUint(frame(row,S+head*HD+c)*ks);
+            if(row+1u==cfg.rows)for(uint part=0u;part<3u;part++){uint coord=part*S+head*HD+c,past=convolutionOffset()+coord*3u;
+                for(uint j=0u;j<3u;j++){int t=int(cfg.rows)+int(j)-3;float value=t>=0?rawProjection(uint(t),coord):cfg.mode!=0u?uintBitsToFloat(opticalMemory[past+uint(t+3)]):0;opticalMemory[past+j]=floatBitsToUint(value);}}}return;}
     if(operation==21u){uint value=job*4u+gl_SubgroupID,head=row,c=gl_SubgroupInvocationID;if(value>=HD)return;uint offset=recurrentOffset(head,value);vec2 s0=fieldPair(offset+c*2u),s1=fieldPair(offset+(c+32u)*2u);
         for(uint t=0u;t<cfg.rows;t++){float decay=auxiliary[t*H*2u+head*2u],beta=auxiliary[t*H*2u+head*2u+1u];s0*=decay;s1*=decay;uint axis=head*HD+c*2u;vec2 k0=vec2(frame(t,S+axis),frame(t,S+axis+1u)),k1=vec2(frame(t,S+axis+64u),frame(t,S+axis+65u));
             vec2 p0=signedEnergy(k0,s0,true),p1=signedEnergy(k1,s1,true),m0=signedEnergy(k0,s0,false),m1=signedEnergy(k1,s1,false);float received=subgroupAdd(p0.x+p0.y+p1.x+p1.y)-subgroupAdd(m0.x+m0.y+m1.x+m1.y);float delta=(frame(t,2u*S+head*HD+value)-received)*beta;s0+=k0*delta;s1+=k1*delta;
-            vec2 q0=vec2(frame(t,axis),frame(t,axis+1u))/sqrt(float(HD)),q1=vec2(frame(t,axis+64u),frame(t,axis+65u))/sqrt(float(HD));p0=signedEnergy(q0,s0,true);p1=signedEnergy(q1,s1,true);m0=signedEnergy(q0,s0,false);m1=signedEnergy(q1,s1,false);float signal=subgroupAdd(p0.x+p0.y+p1.x+p1.y)-subgroupAdd(m0.x+m0.y+m1.x+m1.y);if(c==0u)detector[t*A+head*HD+value]=signal;}
+            vec2 q0=vec2(frame(t,axis),frame(t,axis+1u))/sqrt(float(HD)),q1=vec2(frame(t,axis+64u),frame(t,axis+65u))/sqrt(float(HD));p0=signedEnergy(q0,s0,true);p1=signedEnergy(q1,s1,true);m0=signedEnergy(q0,s0,false);m1=signedEnergy(q1,s1,false);float signal=subgroupAdd(p0.x+p0.y+p1.x+p1.y)-subgroupAdd(m0.x+m0.y+m1.x+m1.y);if(c==0u)detector[t*A+head*HD+value]=signal;
+        }
         writeField(offset+c*2u,s0);writeField(offset+(c+32u)*2u,s1);return;}
 
     if(operation==22u){
@@ -140,23 +149,23 @@ return;}
         if(lane==0u){uint global=featureGlobal();featureWork[global]=max(1u,(maximum+3u)/4u);featureWork[global+1u]=cfg.rows;featureWork[global+2u]=1u;featureWork[global+4u]=8u;featureWork[global+5u]=cfg.rows;featureWork[global+6u]=max(1u,(maximum+63u)/64u);
             featureWork[global+8u]+=total;featureWork[global+9u]+=cfg.rows*FEATURE_WIDTH;}return;}
     if(operation==28u){row*=matrixRows;uint index=job*4u+gl_SubgroupID,c=gl_SubgroupInvocationID,at=featureBase(row),count=featureWork[at];
-        if(cfg.padding0!=1u){for(uint r=0u;r<matrixRows;r++)if(row+r<cfg.rows&&featureWork[featureBase(row+r)]!=FEATURE_WIDTH){if(c==0u)atomicOr(control[3],4096u);return;}
+        if(cfg.padding0!=1u){[[unroll]] for(uint r=0u;r<matrixRows;r++)if(row+r<cfg.rows&&featureWork[featureBase(row+r)]!=FEATURE_WIDTH){if(c==0u)atomicOr(control[3],4096u);return;}
             if(job==0u&&gl_SubgroupID==0u&&c==0u){atomicAdd(featureWork[featureGlobal()+8u],count*min(matrixRows,cfg.rows-row));atomicAdd(featureWork[featureGlobal()+9u],FEATURE_WIDTH*min(matrixRows,cfg.rows-row));}}
         if(index>=count)return;uint feature=featureWork[at+featureQueueOffset()+index];
         vec4 low[matrixRows],high[matrixRows],upLow[matrixRows],upHigh[matrixRows];
-        for(uint r=0u;r<matrixRows;r++){low[r]=vec4(0);high[r]=vec4(0);upLow[r]=vec4(0);upHigh[r]=vec4(0);}
+        [[unroll]] for(uint r=0u;r<matrixRows;r++){low[r]=vec4(0);high[r]=vec4(0);upLow[r]=vec4(0);upHigh[r]=vec4(0);}
         for(uint block=0u;block<D/256u;block++){
             QuantizedOctet gate=quantizedOctet(0u,parameters[base+15u],parameters[base+16u],feature,D,block,c),up=quantizedOctet(0u,parameters[base+19u],parameters[base+20u],feature,D,block,c);
-            for(uint r=0u;r<matrixRows;r++)if(row+r<cfg.rows)for(uint i=0u;i<4u;i++){
+            [[unroll]] for(uint r=0u;r<matrixRows;r++)if(row+r<cfg.rows)[[unroll]] for(uint i=0u;i<4u;i++){
                 float x=normalized[(row+r)*D+gate.axis.x+i],y=normalized[(row+r)*D+gate.axis.y+i];
                 low[r][i]+=x*gate.low[i];high[r][i]+=y*gate.high[i];upLow[r][i]+=x*up.low[i];upHigh[r][i]+=y*up.high[i];}}
-        for(uint r=0u;r<matrixRows;r++)if(row+r<cfg.rows){float gate=subgroupAdd(dot(low[r]+high[r],vec4(1))),up=subgroupAdd(dot(upLow[r]+upHigh[r],vec4(1)));
+        [[unroll]] for(uint r=0u;r<matrixRows;r++)if(row+r<cfg.rows){float gate=subgroupAdd(dot(low[r]+high[r],vec4(1))),up=subgroupAdd(dot(upLow[r]+upHigh[r],vec4(1)));
             if(c==0u)feedForward[(row+r)*W+feature]=sign(gate)*sign(up)*abs(gate)*abs(up)*detectorSigmoid(gate);}return;
     }
-    if(operation==29u){row*=matrixRows;uint pair=job*128u+lane,part=gl_WorkGroupID.z,at=featureBase(row),count=featureWork[at],first=part*64u;if(first>=count)return;vec2 signal[matrixRows];for(uint r=0u;r<matrixRows;r++)signal[r]=vec2(0);
+    if(operation==29u){row*=matrixRows;uint pair=job*128u+lane,part=gl_WorkGroupID.z,at=featureBase(row),count=featureWork[at],first=part*64u;if(first>=count)return;vec2 signal[matrixRows];[[unroll]] for(uint r=0u;r<matrixRows;r++)signal[r]=vec2(0);
         for(uint index=first;index<min(first+64u,count);index++){uint feature=featureWork[at+featureQueueOffset()+index];vec2 transfer=opticalTransfer(featureDown[(cfg.layer*FEATURE_WIDTH+feature)*(D/2u)+pair]);
-            for(uint r=0u;r<matrixRows;r++){if(row+r>=cfg.rows)continue;signal[r]+=feedForward[(row+r)*W+feature]*transfer;}}
-        for(uint r=0u;r<matrixRows;r++){if(row+r>=cfg.rows)continue;uint target=((row+r)*96u+part)*D+pair*2u;partialDown[target]=signal[r].x;partialDown[target+1u]=signal[r].y;}return;}
+            [[unroll]] for(uint r=0u;r<matrixRows;r++){if(row+r>=cfg.rows)continue;signal[r]+=feedForward[(row+r)*W+feature]*transfer;}}
+        [[unroll]] for(uint r=0u;r<matrixRows;r++){if(row+r>=cfg.rows)continue;uint target=((row+r)*96u+part)*D+pair*2u;partialDown[target]=signal[r].x;partialDown[target+1u]=signal[r].y;}return;}
     if(operation==30u){uint target=job+gl_WorkGroupID.y*32768u,count=cfg.index==0u?V*ROUTE_BANKS:cfg.depth*ROUTE_BANKS*FEATURE_WIDTH;if(target>=count)return;uint base=target*18u;
         if(cfg.index==0u){vec2 center=.5*(vec2(historyVertices[base],historyVertices[base+1u])+vec2(historyVertices[base+6u],historyVertices[base+7u]));barrier();if(lane<6u){vec2 point=center+uintBitsToFloat(cfg.padding1)*corners[lane];historyVertices[base+lane*3u]=point.x;historyVertices[base+lane*3u+1u]=point.y;}}
         else{vec2 center=.5*(vec2(featureVertices[base],featureVertices[base+1u])+vec2(featureVertices[base+6u],featureVertices[base+7u]));barrier();if(lane<6u){vec2 point=center+uintBitsToFloat(cfg.padding1)*corners[lane];featureVertices[base+lane*3u]=point.x;featureVertices[base+lane*3u+1u]=point.y;}}return;}
@@ -171,13 +180,13 @@ return;}
 
     if(operation==33u){row*=matrixRows;uint channel=job*4u+gl_SubgroupID,c=gl_SubgroupInvocationID,at=featureBase(row),count=featureWork[at];
         if(count!=FEATURE_WIDTH){if(c==0u)atomicOr(control[3],4096u);return;}
-        vec4 low[matrixRows],high[matrixRows];for(uint r=0u;r<matrixRows;r++){low[r]=vec4(0);high[r]=vec4(0);}
+        vec4 low[matrixRows],high[matrixRows];[[unroll]] for(uint r=0u;r<matrixRows;r++){low[r]=vec4(0);high[r]=vec4(0);}
         for(uint block=0u;block<FEATURE_WIDTH/256u;block++){
             QuantizedOctet transfer=quantizedOctet(0u,parameters[base+17u],parameters[base+18u],channel,FEATURE_WIDTH,block,c);
-            for(uint i=0u;i<4u;i++){
+            [[unroll]] for(uint i=0u;i<4u;i++){
                 uint f0=featureWork[at+featureQueueOffset()+transfer.axis.x+i],f1=featureWork[at+featureQueueOffset()+transfer.axis.y+i];
-                for(uint r=0u;r<matrixRows;r++)if(row+r<cfg.rows){low[r][i]+=feedForward[(row+r)*W+f0]*transfer.low[i];high[r][i]+=feedForward[(row+r)*W+f1]*transfer.high[i];}}}
-        for(uint r=0u;r<matrixRows;r++)if(row+r<cfg.rows){float signal=subgroupAdd(dot(low[r]+high[r],vec4(1)));if(c==0u)state[(row+r)*D+channel]+=signal;}return;
+                [[unroll]] for(uint r=0u;r<matrixRows;r++)if(row+r<cfg.rows){low[r][i]+=feedForward[(row+r)*W+f0]*transfer.low[i];high[r][i]+=feedForward[(row+r)*W+f1]*transfer.high[i];}}}
+        [[unroll]] for(uint r=0u;r<matrixRows;r++)if(row+r<cfg.rows){float signal=subgroupAdd(dot(low[r]+high[r],vec4(1)));if(c==0u)state[(row+r)*D+channel]+=signal;}return;
     }
 
 }

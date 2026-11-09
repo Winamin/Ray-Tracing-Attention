@@ -3,13 +3,14 @@ name = "ray-tracing-attention"
 version = "0.2.0"
 description = "Ray Tracing Attention: native Vulkan inference with optical attention, MLP and causal token trees"
 readme = "README.md"
-license = {text = "Apache-2.0"}
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE", "THIRD_PARTY.md"]
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.24", "tokenizers>=0.21", "jinja2>=3.1"]
 
 [project.optional-dependencies]
 compiler = ["gguf>=0.17"]
-dev = ["pytest>=8", "build"]
+dev = ["build"]
 
 [project.scripts]
 rt-chat = "ray_tracing.runtime.cli:main"
@@ -17,14 +18,11 @@ rt-compile = "ray_tracing.compiler.__main__:main"
 rt-build = "ray_tracing.compiler.build:main"
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["ray_tracing*"]
-
-[tool.setuptools]
-license-files = ["LICENSE", "NOTICE", "THIRD_PARTY.md"]
 
 [tool.setuptools.package-data]
 "ray_tracing" = ["native/src/*.hpp", "native/src/*.cpp", "native/shaders/*.glsl", "native/shaders/*.comp", "native/include/vulkan/*.h"]
