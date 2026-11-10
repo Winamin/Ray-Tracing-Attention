@@ -30,26 +30,11 @@ void compactTokens(uint count,uint lane){
     barrier();
 }
 
-// Equal signatures imply equal decoding expressions. Sampled hashes shortlist;
-// every candidate column is compared across all representative history items.
+// Signatures identify restored FP32 values, including equivalent quantized
+// expressions. Sample hashes shortlist; full column checks establish equality.
 uvec3 coordinateSignature(uint slot,uint channel,bool content){
-    uint compact=sharedAxis(channel),index=compact%256u;
-    uint at=slot*HISTORY_RECORD_BYTES+(content?((RT_GQA_WIDTH+255u)/256u)*144u:0u)
-        +(compact/256u)*(content?210u:144u);
-    if(!content){
-        uvec2 sm=q4ScaleMin(2u,at,index/32u);
-        uint code=(coefficientByte(2u,at+16u+(index/64u)*32u+index%32u)>>((index%64u)/32u*4u))&15u;
-        // All integer factors are small enough that each FP16 product is exact
-        // in FP32 before the final subtraction. Keep both header bit patterns.
-        return uvec3(coefficient16(2u,at),coefficient16(2u,at+2u),sm.x*code|(sm.y<<10u));
-    }
-    uint part=index/128u,within=index%128u;
-    uint low=(coefficientByte(2u,at+part*64u+within%64u)>>(within/64u*4u))&15u;
-    uint high=(coefficientByte(2u,at+128u+part*32u+within%32u)>>(within/32u*2u))&3u;
-    int scale=int(coefficientByte(2u,at+192u+index/16u));if(scale>=128)scale-=256;
-    int code=int(low|(high<<4u))-32,product=scale*code;
-    uint signZero=product==0&&((scale<0)!=(code<0))?1u:0u;
-    return uvec3(coefficient16(2u,at+208u),uint(product),signZero);
+    precise float value=pathCoordinate(slot,channel,content);
+    return uvec3(value==0.0?0u:floatBitsToUint(value),0u,0u);
 }
 bool sameColumn(uint kv,uint a,uint b,bool content){
     uint base=kv*Q_PER_KV*DH;
