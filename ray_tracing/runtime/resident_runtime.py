@@ -8,7 +8,7 @@ import tempfile
 import numpy as np
 
 class ResidentRuntime:
-    def __init__(self,asset,capacity=300,cache=False,routing="rt_full",aperture=.08,word_tile=32,feature_tile=8,readout_unroll=1,readout_words=4,prefill_batch=512,matrix_rows=8):
+    def __init__(self,asset,capacity=300,cache=True,routing="rt_full",aperture=.08,word_tile=32,feature_tile=8,readout_unroll=1,readout_words=4,prefill_batch=512,matrix_rows=8):
         asset=Path(asset).resolve()
         from ..compiler.partition import ensure_partition
         self.partition=ensure_partition(asset.parent)

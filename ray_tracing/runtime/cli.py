@@ -152,7 +152,7 @@ class Console:
                         f"新计算 {report['rt']['mlp_route_rt_rows']:,} 次")
         if (cache := report.get('cache')) and cache['capacity']:
             rows.append(f"光路缓存 {cache['nodes']:,}/{cache['capacity']:,} 节点 · 命中后每 token 一条查询光线")
-            if cache['state_recovery_tokens']:
+            if cache['state_recovery_tokens'] or cache['checkpoint_restores']:
                 rows.append(f"缓存状态恢复 {cache['state_recovery_gpu_ms']:.3f} ms · "
                             f"检查点 {cache['checkpoint_restores']} 次 · {cache['state_recovery_tokens']} token")
         if 'history_cache_boundaries' in report['resources']:
