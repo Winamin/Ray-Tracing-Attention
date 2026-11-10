@@ -449,7 +449,7 @@ class ChatSession:
                 f"生成 {number(last['speed']['generation_wall_tps'], ' t/s')} · "
                 f"请求 {number(last['speed']['request_tps'], ' t/s')} · "
                 f"首文字 {number(last['first_text_ms'], ' ms')}",
-                f"MLP 命中覆盖 {number((last['rt']['mlp_feature_coverage'] or 0)*100, '%')} · "
+                f"MLP 通道覆盖 {number((last['rt']['mlp_feature_coverage'] or 0)*100, '%')} · "
                 f"词表回执 {last['rt']['vocabulary_hits']:,} · "
                 f"缓存 {last['cached_tokens']} token"])
         if memory:

@@ -94,7 +94,7 @@ class CoordinatePartition:
 
 
 def ensure_partition(directory):
-    """Compile only the missing indexing asset; never reopen source model weights."""
+    """Compile the missing indexing asset from the saved partition."""
     directory = Path(directory)
     metadata_path = directory / 'model.json'
     metadata = json.loads(metadata_path.read_text(encoding='utf8'))
