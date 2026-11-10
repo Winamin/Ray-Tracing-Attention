@@ -1,0 +1,381 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#include "resident_common.glsl"
+
+// Full-contribution attention with RT-local hit storage and compact summaries.
+// RT history traversal and per-head online-softmax summaries (m,Z,U).
+// A record is eight uint words, BLOCK/32 coverage words, and DH FP32 U words:
+//   0 m bits; 1 Z bits; 2 covered positions; 3 actual softmax exp evaluations;
+//   4 V runs emitted; 5 V terms before merging (=covered positions);
+//   6 actual ray initializations (head zero only); 7 flags.
+// Flags: 1 verified coverage, 2 finite arithmetic, 4 exact-score weight reuse,
+//        8 exact-full-V-vector run merging. Equality uses FP32 bit patterns.
+// Softmax exp evaluations include online rescaling, but exclude known identity
+// scales and the separate lens/gate sigmoid evaluations.
+// cfg.checkpoint is an inclusive history lower bound, zero in production.
+// cfg.index==1 forces record storage even when only one group is needed.
+layout(constant_id=1) const uint BLOCK=256u;
+// Bindings 39--41 belong to the independent MLP implementation.
+layout(std430,binding=42) buffer AttentionReceipts {uint attentionReceipts[];};
+const uint DH=RT_ATTENTION_HEAD_DIM;
+// RT history segments remain aligned to their 16-position BLAS layout.
+// A 512-thread producer has sixteen subgroups: four KV heads, each shared by
+// four Q heads. Four positions per KV head retain the same 16*DH shared tile.
+const uint HISTORY_MICRO=16u,MICRO=4u,KV_BATCH=4u,Q_BATCH=4u;
+const uint LANE_AXES=(DH+31u)/32u;
+const uint COVERAGE_WORDS=BLOCK/32u,RECORD_WORDS=8u+COVERAGE_WORDS+DH;
+const uint Q_PER_KV=RT_QUERY_WIDTH/RT_GQA_WIDTH;
+const uint ATTENTION_ERROR=65536u;
+rayQueryEXT receiptRay;
+shared uint localSlots[BLOCK],coverage[COVERAGE_WORDS];
+shared uint groupFailure,uniqueHits,rayInitializations;
+shared vec3 historyOrigin,historyDirection;
+shared float addressTile[KV_BATCH*MICRO*DH],contentTile[KV_BATCH*MICRO*DH];
+shared float scoreTile[KV_BATCH*Q_BATCH*MICRO];
+shared float mergeState[4];
+
+bool finiteValue(float value){return !isnan(value)&&!isinf(value);}
+void attentionFailure(){atomicOr(groupFailure,1u);atomicOr(control[3],ATTENTION_ERROR);}
+float finalHeadSignal(uint row,uint channel,float signal,float reference){
+    precise float result=signal/max(reference,1e-30);
+    if(RT_ATTENTION_GATE==1){
+        float gate=feedForward[row*W+channel];
+        if(!finiteValue(gate)){attentionFailure();return 0.0;}
+        result*=detectorSigmoid(gate);
+    }
+    if(!finiteValue(result)){attentionFailure();return 0.0;}
+    return result;
+}
+uint availablePositions(uint row){
+    uint time=absolute(row);
+    return time<cfg.checkpoint?0u:min(time-cfg.checkpoint+1u,cfg.capacity);
+}
+uint groupCount(uint row){return (availablePositions(row)+BLOCK-1u)/BLOCK;}
+uint partialGroupSum(uint n){
+    uint q=n/BLOCK,r=n%BLOCK;
+    return BLOCK*q*(q+1u)/2u+r*(q+1u);
+}
+uint rowGroupPrefix(uint row){
+    if(cfg.mode==1u)return row*groupCount(0u);
+    uint time0=absolute(0u),start=time0-cfg.checkpoint;
+    uint uncapped=min(row,cfg.capacity>start?cfg.capacity-start:0u);
+    uint offset=start%BLOCK;
+    return uncapped*(start/BLOCK)+partialGroupSum(offset+uncapped)-partialGroupSum(offset)
+        +(row-uncapped)*((cfg.capacity+BLOCK-1u)/BLOCK);
+}
+uint recordIndex(uint row,uint group,uint head){
+    return (rowGroupPrefix(row)+group)*headCount()+head;
+}
+bool recordFits(uint record){return record<uint(attentionReceipts.length())/RECORD_WORDS;}
+
+void startReceiptLens(vec3 origin,vec3 direction){
+    atomicAdd(rayInitializations,1u);
+    rayQueryInitializeEXT(receiptRay,lensAS[0],gl_RayFlagsOpaqueEXT,1u,origin,.00001,direction,8.0);
+}
+vec3 receiptLensPoint(uint at){return vec3(lensVertices[at],lensVertices[at+1u],lensVertices[at+2u]);}
+bool throughReceiptLens(uint row,out vec3 origin,out vec3 direction){
+    vec4 emission=rays[row*rayStride()];
+    if(any(isnan(emission))||any(isinf(emission)))return false;
+    origin=vec3(emission.xy+vec2(float(cfg.layer)*4.0,0.0),0.0);
+    direction=normalize(vec3(emission.zw,1.0));
+    if(any(isnan(direction))||any(isinf(direction)))return false;
+    uint parameterBase=parameters[blockBase()+5u],instance=lensIndex(cfg.layer,0u);
+    float eta=1.0+.02/(1.0+exp(-pf(parameterBase+6u)));
+    for(uint face=0u;face<2u;face++){
+        startReceiptLens(origin,direction);
+        while(rayQueryProceedEXT(receiptRay)){}
+        if(rayQueryGetIntersectionTypeEXT(receiptRay,true)!=gl_RayQueryCommittedIntersectionTriangleEXT)return false;
+        uint primitive=rayQueryGetIntersectionPrimitiveIndexEXT(receiptRay,true);
+        uint owner=rayQueryGetIntersectionInstanceCustomIndexEXT(receiptRay,true);
+        if(owner!=cfg.layer*B||primitive/2u!=face)return false;
+        uint at=(instance*12u+primitive*3u)*3u;
+        vec3 normal=normalize(cross(receiptLensPoint(at+3u)-receiptLensPoint(at),receiptLensPoint(at+6u)-receiptLensPoint(at)));
+        if(dot(normal,direction)>0.0)normal=-normal;
+        origin+=rayQueryGetIntersectionTEXT(receiptRay,true)*direction;
+        vec3 next=refract(direction,normal,face==0u?1.0/eta:eta);
+        if(dot(next,next)<.5)return false;
+        direction=normalize(next);origin+=.00001*direction;
+        if(any(isnan(direction))||any(isinf(direction))||any(isnan(origin))||any(isinf(origin)))return false;
+    }
+    return direction.z>0.0&&finiteValue(direction.z);
+}
+
+void traceGroup(uint row,uint group,uint count,uint lane){
+    uint first=group*BLOCK,time=absolute(row);
+    for(uint i=lane;i<BLOCK;i+=gl_WorkGroupSize.x)localSlots[i]=0xffffffffu;
+    for(uint i=lane;i<COVERAGE_WORDS;i+=gl_WorkGroupSize.x)coverage[i]=0u;
+    if(lane==0u){groupFailure=0u;uniqueHits=0u;rayInitializations=0u;}
+    barrier();
+    if(lane==0u){
+        vec3 origin,direction;
+        if(!throughReceiptLens(row,origin,direction))attentionFailure();
+        historyOrigin=origin;historyDirection=direction;
+    }
+    barrier();
+    if(groupFailure!=0u)return;
+    uint subrays=(count+HISTORY_MICRO-1u)/HISTORY_MICRO;
+    if(lane<subrays){
+        uint rayFirst=first+lane*HISTORY_MICRO,rayCount=min(HISTORY_MICRO,count-lane*HISTORY_MICRO);
+        vec3 origin=historyOrigin,direction=historyDirection;
+        origin.z-=4.0*float(time)+2.0;
+        origin+=direction*(4.0*float(rayFirst)/direction.z);
+        atomicAdd(rayInitializations,1u);
+        rayQueryInitializeEXT(receiptRay,historyAS[0],gl_RayFlagsNoOpaqueEXT|gl_RayFlagsCullBackFacingTrianglesEXT,
+            1u,origin,.00001,direction,4.0*float(rayCount)/direction.z);
+        while(rayQueryProceedEXT(receiptRay)){
+            if(rayQueryGetIntersectionTypeEXT(receiptRay,false)!=gl_RayQueryCandidateIntersectionTriangleEXT)continue;
+            uint primitive=rayQueryGetIntersectionPrimitiveIndexEXT(receiptRay,false);
+            uint owner=rayQueryGetIntersectionInstanceCustomIndexEXT(receiptRay,false);
+            uint slot=(owner&RT_SLOT_MASK)+primitive/2u;
+            if(primitive>=32u||slot>=cfg.capacity){attentionFailure();continue;}
+            // historyAS[0] is bound to this layer's fullIndex() TLAS. Only the
+            // slot identity is carried in its instanceCustomIndex.
+            uint global=parameters[blockBase()+41u]*cfg.capacity+slot;
+            if(global>=uint(slots.length())){attentionFailure();continue;}
+            uint age=slots[global].x;
+            if(age>time||age<cfg.checkpoint||time-age>=cfg.capacity||slot!=age%cfg.capacity){attentionFailure();continue;}
+            uint relative=time-age;
+            if(relative<rayFirst||relative>=rayFirst+rayCount){attentionFailure();continue;}
+            uint local=relative-first,word=local/32u,bit=1u<<(local%32u);
+            if((atomicOr(coverage[word],bit)&bit)!=0u)continue;
+            localSlots[local]=global;atomicAdd(uniqueHits,1u);
+            uint old=atomicOr(slots[global].y,1u);
+            if((old&3u)==0u){uint queue=atomicAdd(control[6],1u);control[8u+queue]=global;}
+        }
+    }
+    barrier();
+    for(uint word=lane;word<COVERAGE_WORDS;word+=gl_WorkGroupSize.x){
+        uint firstBit=word*32u,n=firstBit<count?min(32u,count-firstBit):0u;
+        uint expected=n==32u?0xffffffffu:n==0u?0u:(1u<<n)-1u;
+        if(coverage[word]!=expected)attentionFailure();
+    }
+    if(lane==0u){
+        if(uniqueHits!=count)attentionFailure();
+        atomicAdd(hits[row*(cfg.capacity+1u)],uniqueHits);
+    }
+    barrier();
+}
+
+void storeHead(uint row,uint group,uint head,uint count,uint expEvaluations,uint valueGroups,
+        bool weightReused,float maximum,float reference,float signal[LANE_AXES]){
+    uint c=gl_SubgroupInvocationID;
+    bool direct=cfg.index==0u&&groupCount(row)==1u;
+    uint record=recordIndex(row,group,head),at=record*RECORD_WORDS;
+    if(!direct&&!recordFits(record)){if(c==0u)attentionFailure();return;}
+    if(c==0u){
+        if(direct){
+            uint p=(row*max(H,uint(RT_ATTENTION_HEADS))+head)*2u;
+            physical[p]=maximum+20.0;physical[p+1u]=reference;
+        }else{
+            attentionReceipts[at]=floatBitsToUint(maximum);attentionReceipts[at+1u]=floatBitsToUint(reference);
+            attentionReceipts[at+2u]=count;attentionReceipts[at+3u]=expEvaluations;
+            attentionReceipts[at+4u]=valueGroups;attentionReceipts[at+5u]=count;
+            attentionReceipts[at+6u]=head==0u?rayInitializations:0u;
+            attentionReceipts[at+7u]=3u|(weightReused?4u:0u)|(valueGroups<count?8u:0u);
+            for(uint word=0u;word<COVERAGE_WORDS;word++)attentionReceipts[at+8u+word]=coverage[word];
+        }
+    }
+    for(uint k=0u;k<LANE_AXES;k++){
+        uint axis=c+k*32u;if(axis>=DH)continue;
+        if(!finiteValue(signal[k])){attentionFailure();continue;}
+        if(direct){
+            uint channel=head*DH+axis;
+            detector[row*A+channel]=finalHeadSignal(row,channel,signal[k],reference);
+        }else attentionReceipts[at+8u+COVERAGE_WORDS+axis]=floatBitsToUint(signal[k]);
+    }
+}
+
+void fusedAttention(uint row,uint group,uint lane){
+    uint available=availablePositions(row),first=group*BLOCK;
+    if(first>=available)return;
+    uint count=min(BLOCK,available-first);
+    traceGroup(row,group,count,lane);
+    if(groupFailure!=0u)return;
+    uint c=gl_SubgroupInvocationID,subgroup=gl_SubgroupID,heads=headCount();
+    uint kvHeads=(heads+Q_PER_KV-1u)/Q_PER_KV,kvLane=subgroup/Q_BATCH,qLane=subgroup%Q_BATCH;
+    for(uint kvBase=0u;kvBase<kvHeads;kvBase+=KV_BATCH){
+        for(uint headOffset=0u;headOffset<Q_PER_KV;headOffset+=Q_BATCH){
+            uint head=(kvBase+kvLane)*Q_PER_KV+headOffset+qLane;
+            bool headActive=kvBase+kvLane<kvHeads&&head<heads&&headOffset+qLane<Q_PER_KV;
+            precise float signal[LANE_AXES],pendingValue[LANE_AXES];
+            for(uint k=0u;k<LANE_AXES;k++){signal[k]=0.0;pendingValue[k]=0.0;}
+            precise float reference=0.0,pendingWeight=0.0;
+            float maximum=-1.0/0.0,previousWeight=0.0;
+            uint previousScore=0u,previousMaximum=0u,expEvaluations=0u,valueGroups=0u;
+            bool pending=false,havePreviousWeight=false,weightReused=false;
+            for(uint microFirst=0u;microFirst<count;microFirst+=MICRO){
+                uint n=min(MICRO,count-microFirst);
+                // Decode four independent KV heads together, with each FP32
+                // tile shared by its four Q subgroups. Short/tail KV batches
+                // are explicitly zero-filled; inactive heads still rendezvous.
+                for(uint i=lane;i<KV_BATCH*n*DH;i+=gl_WorkGroupSize.x){
+                    uint kv=i/(n*DH),within=i%(n*DH),j=within/DH,axis=within%DH;
+                    uint tile=(kv*MICRO+j)*DH+axis;
+                    addressTile[tile]=0.0;contentTile[tile]=0.0;
+                    if(kvBase+kv<kvHeads){
+                        uint slot=localSlots[microFirst+j],channel=(kvBase+kv)*Q_PER_KV*DH+axis;
+                        addressTile[tile]=pathCoordinate(slot,channel,false);
+                        contentTile[tile]=pathCoordinate(slot,channel,true);
+                        if(!finiteValue(addressTile[tile])||!finiteValue(contentTile[tile]))attentionFailure();
+                    }
+                }
+                barrier();
+                if(groupFailure!=0u)return;
+                for(uint j=0u;j<n;j++){
+                    precise float total=0.0;
+                    if(headActive)for(uint axis=c;axis<DH;axis+=32u){
+                        float q=queries[row*A+head*DH+axis];
+                        if(!finiteValue(q))attentionFailure();
+                        precise float product=q*addressTile[(kvLane*MICRO+j)*DH+axis];total+=product;
+                    }
+                    total=subgroupAdd(total);
+                    if(c==0u){
+                        float score=headActive?total/sqrt(float(DH)):-1.0/0.0;
+                        if(headActive&&!finiteValue(score))attentionFailure();
+                        scoreTile[subgroup*MICRO+j]=score;
+                    }
+                }
+                barrier();
+                if(groupFailure!=0u)return;
+                if(headActive){
+                    float localMax=-1.0/0.0;
+                    for(uint j=c;j<n;j+=32u)localMax=max(localMax,scoreTile[subgroup*MICRO+j]);
+                    float nextMaximum=max(maximum,subgroupMax(localMax)),scale=0.0;
+                    if(c==0u){
+                        if(reference>0.0){
+                            if(floatBitsToUint(nextMaximum)==floatBitsToUint(maximum))scale=1.0;
+                            else{scale=exp(maximum-nextMaximum);expEvaluations++;}
+                        }
+                    }
+                    scale=subgroupBroadcastFirst(scale);
+                    reference*=scale;pendingWeight*=scale;
+                    for(uint k=0u;k<LANE_AXES;k++)signal[k]*=scale;
+                    maximum=nextMaximum;
+                    for(uint j=0u;j<n;j++){
+                        float score=scoreTile[subgroup*MICRO+j],weight=0.0;
+                        if(c==0u){
+                            uint scoreBits=floatBitsToUint(score),maximumBits=floatBitsToUint(maximum);
+                            if(havePreviousWeight&&scoreBits==previousScore&&maximumBits==previousMaximum){weight=previousWeight;weightReused=true;}
+                            else{weight=exp(score-maximum);expEvaluations++;}
+                            previousScore=scoreBits;previousMaximum=maximumBits;previousWeight=weight;havePreviousWeight=true;
+                        }
+                        weight=subgroupBroadcastFirst(weight);
+                        reference+=weight;
+                        bool equalValue=pending;
+                        for(uint k=0u;k<LANE_AXES;k++){
+                            uint axis=c+k*32u;
+                            if(axis<DH&&floatBitsToUint(pendingValue[k])!=floatBitsToUint(contentTile[(kvLane*MICRO+j)*DH+axis]))equalValue=false;
+                        }
+                        equalValue=subgroupAll(equalValue);
+                        if(equalValue)pendingWeight+=weight;
+                        else{
+                            if(pending){
+                                for(uint k=0u;k<LANE_AXES;k++){precise float contribution=pendingWeight*pendingValue[k];signal[k]+=contribution;}
+                                if(c==0u)valueGroups++;
+                            }
+                            for(uint k=0u;k<LANE_AXES;k++){uint axis=c+k*32u;pendingValue[k]=axis<DH?contentTile[(kvLane*MICRO+j)*DH+axis]:0.0;}
+                            pendingWeight=weight;pending=true;
+                        }
+                    }
+                }
+                barrier();
+            }
+            if(headActive){
+                if(pending){
+                    for(uint k=0u;k<LANE_AXES;k++){precise float contribution=pendingWeight*pendingValue[k];signal[k]+=contribution;}
+                    if(c==0u)valueGroups++;
+                }
+                if(!finiteValue(reference)||reference<=0.0||!finiteValue(maximum))attentionFailure();
+                storeHead(row,group,head,count,expEvaluations,valueGroups,weightReused,maximum,reference,signal);
+            }
+            barrier();
+            if(groupFailure!=0u)return;
+        }
+    }
+}
+
+void mergeAttention(uint row,uint head,uint lane){
+    uint groups=groupCount(row);
+    if(cfg.index==0u&&groups==1u)return;
+    if(lane==0u){groupFailure=0u;mergeState[0]=-1.0/0.0;mergeState[1]=0.0;}
+    barrier();
+    precise float signal0=0.0,signal1=0.0;
+    for(uint group=0u;group<groups;group++){
+        uint record=recordIndex(row,group,head),at=record*RECORD_WORDS;
+        if(!recordFits(record)){if(lane==0u)attentionFailure();barrier();return;}
+        uint count=attentionReceipts[at+2u],expectedCount=min(BLOCK,availablePositions(row)-group*BLOCK);
+        if(lane==0u){
+            float m=uintBitsToFloat(attentionReceipts[at]),z=uintBitsToFloat(attentionReceipts[at+1u]);
+            // Every nonempty locally normalized group includes a max-score
+            // weight of one, so its valid Z is positive (normally Z>=1).
+            bool empty=count==0u;
+            if(count!=expectedCount||(attentionReceipts[at+7u]&3u)!=3u||!finiteValue(z)
+                ||(!empty&&(z<=0.0||!finiteValue(m)))
+                ||(empty&&(z!=0.0||m!=-1.0/0.0))||attentionReceipts[at+5u]!=count)attentionFailure();
+        }
+        for(uint word=lane;word<COVERAGE_WORDS;word+=128u){
+            uint firstBit=word*32u,n=firstBit<count?min(32u,count-firstBit):0u;
+            uint expected=n==32u?0xffffffffu:n==0u?0u:(1u<<n)-1u;
+            if(attentionReceipts[at+8u+word]!=expected)attentionFailure();
+        }
+        barrier();
+        if(groupFailure!=0u)return;
+        if(lane==0u){
+            float m=uintBitsToFloat(attentionReceipts[at]),z=uintBitsToFloat(attentionReceipts[at+1u]);
+            float oldMaximum=mergeState[0],oldReference=mergeState[1];
+            float nextMaximum=oldReference>0.0?(z>0.0?max(oldMaximum,m):oldMaximum):m;
+            float a=oldReference>0.0?(oldMaximum==nextMaximum?1.0:exp(oldMaximum-nextMaximum)):0.0;
+            float b=z>0.0?(m==nextMaximum?1.0:exp(m-nextMaximum)):0.0;
+            precise float oldTerm=oldReference*a,newTerm=z*b,nextReference=oldTerm+newTerm;
+            mergeState[0]=nextMaximum;mergeState[1]=nextReference;mergeState[2]=a;mergeState[3]=b;
+            if(!finiteValue(nextReference))attentionFailure();
+        }
+        barrier();
+        if(groupFailure!=0u)return;
+        if(lane<DH){
+            float u=uintBitsToFloat(attentionReceipts[at+8u+COVERAGE_WORDS+lane]);
+            if(count==0u&&u!=0.0)attentionFailure();
+            precise float oldTerm=signal0*mergeState[2],newTerm=u*mergeState[3];signal0=oldTerm+newTerm;
+            if(!finiteValue(signal0))attentionFailure();
+        }
+        if(lane+128u<DH){
+            float u=uintBitsToFloat(attentionReceipts[at+8u+COVERAGE_WORDS+lane+128u]);
+            if(count==0u&&u!=0.0)attentionFailure();
+            precise float oldTerm=signal1*mergeState[2],newTerm=u*mergeState[3];signal1=oldTerm+newTerm;
+            if(!finiteValue(signal1))attentionFailure();
+        }
+        barrier();
+        if(groupFailure!=0u)return;
+    }
+    if(lane==0u){uint at=(row*max(H,uint(RT_ATTENTION_HEADS))+head)*2u;physical[at]=mergeState[0]+20.0;physical[at+1u]=mergeState[1];}
+    if(lane<DH){uint channel=head*DH+lane;detector[row*A+channel]=finalHeadSignal(row,channel,signal0,mergeState[1]);}
+    if(lane+128u<DH){uint channel=head*DH+lane+128u;detector[row*A+channel]=finalHeadSignal(row,channel,signal1,mergeState[1]);}
+}
+
+void main(){
+    if(stopped())return;
+    uint lane=gl_LocalInvocationID.x;
+    if(operation==2u){
+        uint row=gl_WorkGroupID.x*gl_WorkGroupSize.x+lane;
+        if(row<cfg.rows)hits[row*(cfg.capacity+1u)]=0u;
+        if(row==0u)control[6]=0u;
+        return;
+    }
+    uint row=gl_WorkGroupID.y;
+    if(row>=cfg.rows)return;
+    if(absolute(0u)<cfg.checkpoint||availablePositions(row)==0u){if(lane==0u)atomicOr(control[3],ATTENTION_ERROR);return;}
+    if(operation==0u){
+        // The producer's four-KV/four-Q subgroup map requires sixteen complete
+        // subgroups. Merge and count-only initialization retain local size 128.
+        if(gl_WorkGroupSize.x!=512u||gl_SubgroupSize!=32u){if(lane==0u)atomicOr(control[3],ATTENTION_ERROR);return;}
+        fusedAttention(row,gl_WorkGroupID.x,lane);
+    }
+    else if(operation==1u){
+        if((control[3]&ATTENTION_ERROR)!=0u)return;
+        uint head=gl_WorkGroupID.x;if(head>=headCount())return;
+        mergeAttention(row,head,lane);
+    }
+}

@@ -25,4 +25,4 @@ build-backend = "setuptools.build_meta"
 include = ["ray_tracing*"]
 
 [tool.setuptools.package-data]
-"ray_tracing" = ["native/src/*.hpp", "native/src/*.cpp", "native/shaders/*.glsl", "native/shaders/*.comp", "native/include/vulkan/*.h"]
+"ray_tracing" = ["native/src/*.hpp", "native/src/*.cpp", "native/src/*.inl", "native/shaders/*.glsl", "native/shaders/*.comp", "native/include/vulkan/*.h"]

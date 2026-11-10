@@ -8,7 +8,7 @@ import tempfile
 import numpy as np
 
 class ResidentRuntime:
-    def __init__(self,asset,capacity=300,cache=True,routing="rt_full",aperture=.08,word_tile=32,feature_tile=8,readout_unroll=1,readout_words=4,prefill_batch=512,matrix_rows=8):
+    def __init__(self,asset,capacity=300,cache=True,routing="rt_full",aperture=.08,word_tile=32,feature_tile=8,readout_unroll=1,readout_words=4,prefill_batch=512,matrix_rows=8,attention_backend="grouped_rt",attention_block=128,attention_stats=False):
         asset=Path(asset).resolve()
         from ..compiler.partition import ensure_partition
         self.partition=ensure_partition(asset.parent)
@@ -16,6 +16,10 @@ class ResidentRuntime:
         from ..compiler.spec import asset_spec
         from ..compiler.build import build
         spec=asset_spec(asset.parent)
+        self.model_spec=spec
+        if attention_backend not in ('standard','standard_fp32','grouped_rt','grouped_rt_dense'):
+            raise ValueError('Attention backend must be standard, standard_fp32, grouped_rt or grouped_rt_dense')
+        if attention_block not in (128,256,512):raise ValueError('Attention block must be 128, 256 or 512')
         self.hidden_size=spec.hidden_size
         self.vocabulary_size=spec.vocabulary_size
         self.growable=True
@@ -29,10 +33,13 @@ class ResidentRuntime:
         worker=build(spec)
         native=worker.parent
         options={'creationflags':subprocess.CREATE_NO_WINDOW} if os.name=='nt' else {}
+        options['env']=dict(os.environ,RT_ATTENTION_BACKEND=attention_backend,RT_ATTENTION_BLOCK=str(attention_block),RT_ATTENTION_STATS=str(int(attention_stats)))
         self.process=subprocess.Popen([str(worker),str(Path(asset).resolve()),str(Path(asset).resolve().parent/'vocabulary.bin'),str(capacity),str(int(cache)),routing,str(aperture),str(word_tile),str(feature_tile),str(readout_unroll),str(readout_words),str(prefill_batch),str(matrix_rows)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=self.stderr,cwd=native,**options)
         try:
             magic,depth,blocks,middle,mode=struct.unpack('<5I',self.read(20))
             if magic not in (0x52545239,0x5254523a):raise RuntimeError('Resident optical protocol mismatch')
+            if attention_backend in ('grouped_rt','grouped_rt_dense') and not mode&512:raise RuntimeError('Worker did not activate grouped RT attention')
+            if attention_backend=='standard_fp32' and not mode&1024:raise RuntimeError('Worker did not activate FP32 attention')
         except BaseException:
             self.close()
             raise
@@ -40,6 +47,12 @@ class ResidentRuntime:
         self.metadata.update(native_token_stream=magic==0x5254523a,rt_query_telemetry=magic==0x5254523a,worker=str(worker))
         self.metadata['prefill_batch']=prefill_batch
         self.metadata['matrix_rows']=matrix_rows
+        self.metadata.update(attention_backend=attention_backend,attention_block=attention_block,
+                             attention_compute='fused RT / FP32 grouped softmax' if mode&512 else 'original FP32' if mode&1024 else 'original',
+                             attention_rt_timing='includes score and weighted aggregation' if mode&512 else 'RT traversal only')
+        self.metadata['attention_receipt_format']='compact_columns' if mode&2048 else 'dense'
+        self.metadata['attention_stats']=bool(attention_stats)
+        if mode&2048:self.metadata['attention_compute']='RT hit classification / compact FP32 grouped softmax'
         self.metadata['prefill_compute']='cooperative_matrix2' if mode&256 else 'subgroup'
         self.metadata['matrix_channel_tile']=min(64,spec.attention_head_dim) if mode&256 else 4
         self.metadata['matrix_token_tile']=256 if mode&256 else matrix_rows
@@ -52,7 +65,7 @@ class ResidentRuntime:
         self.metadata['mlp_token_tile']=matrix_rows
         self.metadata['source_model']=config.get('source_model')
         self.metadata['coordinate_partition']=config['coordinate_partition']
-        self.position=0
+        self.position=0;self._attention_diagnostic_dirty=False
         self.growth_events=[]
 
     def ensure_capacity(self,required):
@@ -119,7 +132,7 @@ class ResidentRuntime:
         if len(payload)>=optical+104:
             result.update(zip(('history_state_rebuilt_tokens','history_address_hit'),
                               map(int,np.frombuffer(payload,'<u8',count=2,offset=optical+88))))
-        self.position=len(ids)
+        self.position=len(ids);self._attention_diagnostic_dirty=False
         return result
 
     def finish_history(self):
@@ -130,11 +143,13 @@ class ResidentRuntime:
         return result
 
     def generate(self,count=32,debug=False,profile=False,telemetry=False):
+        if self._attention_diagnostic_dirty:raise RuntimeError('Attention diagnostics replace history; prefill again before generation')
         self.ensure_capacity(self.position+count)
         mode=2 if profile else 1 if debug else 3 if telemetry and self.metadata['rt_query_telemetry'] else 0
         return self._generation_result(self.request(2,count,mode),debug,profile,telemetry)
 
     def stream_generate(self,count=32,profile=False,telemetry=True):
+        if self._attention_diagnostic_dirty:raise RuntimeError('Attention diagnostics replace history; prefill again before generation')
         if not 1<=count<=64:raise ValueError('Stream count must be 1..64')
         self.ensure_capacity(self.position+count)
         if not self.metadata['native_token_stream']:
@@ -219,8 +234,85 @@ class ResidentRuntime:
         if len(payload)>=offset+24:result['profile_gpu_ms']=dict(zip(('setup','rt_gate_up','rt_down'),map(float,np.frombuffer(payload,'<f8',count=3,offset=offset))))
         return result
 
+    def attention(self,query,keys,values,gate=None,*,layer=3,query_start=None,history_start=0):
+        """Exercise full attention without QKV or MLP; prefill again before generation."""
+        spec=self.model_spec
+        q=np.asarray(query,dtype='<f4').reshape(-1,spec.attention_heads,spec.attention_head_dim)
+        k=np.asarray(keys,dtype='<f4').reshape(-1,spec.kv_heads,spec.attention_head_dim)
+        v=np.asarray(values,dtype='<f4').reshape(-1,spec.kv_heads,spec.attention_head_dim)
+        if not 1<=len(q)<=min(self.prefill_batch,32) or not len(k) or k.shape!=v.shape:
+            raise ValueError('Invalid query rows or compact K/V shapes')
+        if layer not in spec.full_layers:raise ValueError('Attention diagnostic requires a full-attention layer')
+        if query_start is None:query_start=history_start+len(k)-len(q)
+        if history_start<0 or query_start<history_start or query_start+len(q)>history_start+len(k) or history_start+len(k)>1048576:
+            raise ValueError('Query times must lie inside the supplied causal history')
+        g=np.zeros_like(q) if gate is None else np.asarray(gate,dtype='<f4').reshape(q.shape)
+        if not all(np.isfinite(a).all() for a in (q,k,v,g)):raise ValueError('Attention values must be finite')
+        self.ensure_capacity(len(k))
+        body=struct.pack('<4I',len(k),query_start,history_start,0)+q.tobytes()+k.tobytes()+v.tobytes()+g.tobytes()
+        self._attention_diagnostic_dirty=True
+        payload=self.request(14,len(q),layer,body)
+        header=np.frombuffer(payload,'<u4',count=12)
+        magic,rows,count,heads,kv_heads,dimension,packet_bytes,block,stride,records,legacy,error=map(int,header)
+        expected_records=spec.attention_heads*sum((min(query_start-history_start+row+1,self.capacity)+self.metadata['attention_block']-1)//self.metadata['attention_block'] for row in range(len(q)))
+        if records!=expected_records or legacy!=int(history_start==0):raise RuntimeError('Full-attention diagnostic coverage protocol mismatch')
+        compact=self.metadata.get('attention_receipt_format')=='compact_columns'
+        expected_stride=spec.attention_head_dim+8+self.metadata['attention_block']//32
+        if compact:expected_stride+=8+(spec.attention_head_dim+3)//4+(spec.attention_head_dim+31)//32
+        if (magic,rows,count,heads,kv_heads,dimension,packet_bytes,block,stride)!=(0x41545231,len(q),len(k),spec.attention_heads,spec.kv_heads,spec.attention_head_dim,spec.history_bytes,self.metadata['attention_block'],expected_stride):
+            raise RuntimeError('Full-attention diagnostic protocol mismatch')
+        if error:raise RuntimeError(f'Full-attention diagnostic error {error}')
+        timing=np.frombuffer(payload,'<f8',count=4,offset=48);offset=80
+        def take(dtype,shape):
+            nonlocal offset
+            a=np.frombuffer(payload,dtype,count=int(np.prod(shape)),offset=offset).copy().reshape(shape)
+            offset+=a.nbytes;return a
+        result=dict(output=take('<f4',(rows,heads,dimension)),physical=take('<f4',(rows,heads,2)),
+                    legacy_output=take('<f4',(rows,heads,dimension)),legacy_physical=take('<f4',(rows,heads,2)),
+                    history_packets=take('u1',(count,packet_bytes)),receipts=take('<u4',(records,stride)),
+                    legacy_available=bool(legacy),block=block,stride=stride,query_start=query_start,history_start=history_start,
+                    fused_gpu_ms=float(timing[0]),merge_gpu_ms=float(timing[1]),gpu_ms=float(timing[0]+timing[1]),
+                    legacy_gpu_ms=float(timing[2]),submit_wait_ms=float(timing[3]))
+        if offset!=len(payload):raise RuntimeError('Unexpected full-attention diagnostic payload size')
+        if compact:
+            raw=result['receipts'];coverage=block//32;map_offset=16+coverage
+            mask_offset=map_offset+(dimension+3)//4;u_offset=mask_offset+(dimension+31)//32
+            axis=np.arange(dimension,dtype=np.uint32)
+            mapping=(raw[:,map_offset+axis//4]>>((axis%4)*8))&255
+            row_index=np.arange(records)[:,None]
+            if np.any(mapping>axis) or np.any(mapping[row_index,mapping]!=mapping):raise RuntimeError('Invalid compact coordinate mapping')
+            representatives=mapping==axis
+            dimensions=representatives.sum(axis=1)
+            if not np.array_equal(dimensions,raw[:,9+coverage]):raise RuntimeError('Invalid compact coordinate count')
+            expected_masks=np.zeros((records,(dimension+31)//32),dtype=np.uint32)
+            for bit in range(dimension):expected_masks[:,bit//32]|=representatives[:,bit].astype(np.uint32)<<(bit%32)
+            if not np.array_equal(expected_masks,raw[:,mask_offset:u_offset]):raise RuntimeError('Invalid compact coordinate mask')
+            ranks=np.cumsum(representatives,axis=1)-1
+            dense=np.empty((records,dimension+8+coverage),dtype=np.uint32)
+            dense[:,:8+coverage]=raw[:,:8+coverage];dense[:,7]&=15
+            dense[:,8+coverage:]=raw[row_index,u_offset+ranks[row_index,mapping]]
+            result.update(compact_receipts=raw,receipts=dense,receipt_format='compact_columns',
+                          receipt_written_bytes=int((u_offset+dimensions).sum()*4),
+                          shader_work=dict(key_dimensions=int(raw[:,8+coverage].sum()),value_dimensions=int(dimensions.sum()),
+                                           unique_history_terms=int(raw[:,10+coverage].sum()),qk_products=int(raw[:,11+coverage].astype(np.uint64).sum()),
+                                           key_decodes=int(raw[:,12+coverage].astype(np.uint64).sum()),value_decodes=int(raw[:,13+coverage].astype(np.uint64).sum()),
+                                           value_products=int(raw[:,14+coverage].astype(np.uint64).sum()),returned_value_dimensions=int(raw[:,15+coverage].sum())))
+        else:result.update(receipt_format='dense',receipt_written_bytes=int(result['receipts'].nbytes))
+        return result
+
+    def attention_statistics(self,reset=False):
+        names=('covered_head_positions','unique_head_positions','qk_products','value_products',
+               'full_return_dimensions','returned_dimensions','key_dimensions','value_groups',
+               'exp_evaluations','rt_initializations','records','q_dimensions','q_zeros','q_below_1e3','q_below_1e6','merged_dimensions')
+        payload=self.request(15,int(reset));magic,count,layers,block=struct.unpack_from('<4I',payload)
+        if (magic,count,layers,block)!=(0x41545331,len(names),len(self.model_spec.full_layers),self.metadata['attention_block']) or len(payload)!=16+layers*count*8:
+            raise RuntimeError('Attention statistics protocol mismatch')
+        values=np.frombuffer(payload,'<u8',offset=16).reshape(layers,count)
+        return dict(total={name:int(values[:,i].sum()) for i,name in enumerate(names)},
+                    layers=[dict(layer=layer,**{name:int(value) for name,value in zip(names,row)}) for layer,row in zip(self.model_spec.full_layers,values)])
+
     def resources(self):
-        return dict(zip(('vulkan_allocation_bytes','device_allocation_bytes','word_scene_bytes','word_vertex_bytes','word_rays','word_tile','feature_tile','reply_tree_bytes','cache_snapshot_bytes','packed_coefficient_bytes','recurrent_control_cache_bytes','logical_device_buffer_bytes','device_memory_pools','history_path_packet_bytes','history_decoded_copy_bytes','optical_field_bytes','debug_audit_bytes','mlp_partial_bytes','upload_staging_bytes','host_readback_bytes','history_scene_bytes','history_blas_count','history_tlas_count','static_scene_scratch_bytes','hit_receipt_bytes','feature_receipt_bytes','workspace_rows','detector_key_storage_shared','inactive_auxiliary_bytes','stable_snapshot_bytes','history_boundary_state_bytes','history_shared_block_bytes','history_directory_bytes','history_cache_boundaries','history_cache_evictions','mlp_transmission_scene_bytes','mlp_transmission_surfaces'),map(int,np.frombuffer(self.request(8,0),'<u8'))))
+        return dict(zip(('vulkan_allocation_bytes','device_allocation_bytes','word_scene_bytes','word_vertex_bytes','word_rays','word_tile','feature_tile','reply_tree_bytes','cache_snapshot_bytes','packed_coefficient_bytes','recurrent_control_cache_bytes','logical_device_buffer_bytes','device_memory_pools','history_path_packet_bytes','history_decoded_copy_bytes','optical_field_bytes','debug_audit_bytes','mlp_partial_bytes','upload_staging_bytes','host_readback_bytes','history_scene_bytes','history_blas_count','history_tlas_count','static_scene_scratch_bytes','hit_receipt_bytes','feature_receipt_bytes','workspace_rows','detector_key_storage_shared','inactive_auxiliary_bytes','stable_snapshot_bytes','history_boundary_state_bytes','history_shared_block_bytes','history_directory_bytes','history_cache_boundaries','history_cache_evictions','mlp_transmission_scene_bytes','mlp_transmission_surfaces','attention_backend_code','attention_block','attention_receipt_bytes','attention_fused_dispatches','attention_merge_dispatches','attention_planned_rays','attention_covered_terms','attention_reported_records'),map(int,np.frombuffer(self.request(8,0),'<u8'))))
 
     def set_aperture(self,aperture):
         if self.metadata['routing']!='sparse' or not 0<aperture<=2:raise ValueError('Expected sparse routing and aperture in (0,2]')

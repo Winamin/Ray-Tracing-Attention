@@ -40,7 +40,7 @@ def build(spec, output=None):
     cpp+='constexpr uint32_t MODEL_FULL_INDEX[]={'+','.join(map(str,mapping))+'};\n'
     (target/'rt_layer_map.hpp').write_text(cpp,encoding='utf8')
     commands=[]
-    for name in ('resident_math','resident_mlp','resident_batch2','resident_pack','resident_attention','resident_auxiliary','resident_state','resident_ray','reply_cache','optical_path_key','history_cache'):
+    for name in ('resident_math','resident_mlp','resident_batch2','resident_pack','resident_attention','resident_attention_receipt','resident_attention_dense','resident_auxiliary','resident_state','resident_ray','reply_cache','optical_path_key','history_cache'):
         environment='vulkan1.3' if name in ('resident_batch2','resident_attention','resident_auxiliary') else 'vulkan1.2'
         commands += [[shader_compiler,'-V','--target-env',environment,'-DRT_VECTOR_DECODE='+str(int(vector_decode)),'-I'+str(target),'-I'+str(NATIVE/'shaders'),str(NATIVE/'shaders'/(name+'.comp')),'-o',str(target/(name+'.spv'))],
                      [validator,'--target-env',environment,str(target/(name+'.spv'))]]
