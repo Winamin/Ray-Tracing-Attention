@@ -45,7 +45,11 @@ class ResidentRuntime:
         self.metadata['matrix_token_tile']=256 if mode&256 else matrix_rows
         self.metadata['reply_cache_kind']='verified optical state path'
         self.metadata['cache_verification_bits']=256
-        self.metadata['decode_route_cache']=bool(cache)
+        self.metadata['decode_route_cache']=False
+        self.metadata['mlp_compute']='rt_core_balanced_transmission'
+        self.metadata['mlp_activation']='sigmoid_transmission'
+        self.metadata['mlp_material_receipts']='shared within token tile'
+        self.metadata['mlp_token_tile']=matrix_rows
         self.metadata['source_model']=config.get('source_model')
         self.metadata['coordinate_partition']=config['coordinate_partition']
         self.position=0
@@ -206,15 +210,17 @@ class ResidentRuntime:
 
     def mlp(self,inputs,layer=0):
         inputs=np.asarray(inputs,dtype='<f4').reshape(-1,self.hidden_size)
-        if not 1<=len(inputs)<=min(self.capacity,32):raise ValueError('MLP check supports up to 32 rows')
+        if not 1<=len(inputs)<=min(self.capacity,self.prefill_batch,32):raise ValueError('MLP check supports up to 32 rows')
+        if not np.isfinite(inputs).all():raise ValueError('MLP input must be finite')
+        if not 0<=layer<self.metadata['depth']:raise ValueError('Invalid MLP layer')
         payload=self.request(6,len(inputs),layer,inputs.tobytes());size=len(inputs)*(self.hidden_size+self.metadata['middle']);values=np.frombuffer(payload,'<f4',count=size).copy();count=len(inputs)*self.hidden_size
         result={'output':values[:count].reshape(len(inputs),self.hidden_size),'activation':values[count:].reshape(len(inputs),self.metadata['middle']),'feature_hits':np.frombuffer(payload,'<u4',count=len(inputs),offset=size*4).copy()}
         offset=size*4+len(inputs)*4
-        if len(payload)>=offset+24:result['profile_gpu_ms']=dict(zip(('rt_receipt','gate_up','down'),map(float,np.frombuffer(payload,'<f8',count=3,offset=offset))))
+        if len(payload)>=offset+24:result['profile_gpu_ms']=dict(zip(('setup','rt_gate_up','rt_down'),map(float,np.frombuffer(payload,'<f8',count=3,offset=offset))))
         return result
 
     def resources(self):
-        return dict(zip(('vulkan_allocation_bytes','device_allocation_bytes','word_scene_bytes','word_vertex_bytes','word_rays','word_tile','feature_tile','reply_tree_bytes','cache_snapshot_bytes','packed_coefficient_bytes','recurrent_control_cache_bytes','logical_device_buffer_bytes','device_memory_pools','history_path_packet_bytes','history_decoded_copy_bytes','optical_field_bytes','debug_audit_bytes','mlp_partial_bytes','upload_staging_bytes','host_readback_bytes','history_scene_bytes','history_blas_count','history_tlas_count','static_scene_scratch_bytes','hit_receipt_bytes','feature_receipt_bytes','workspace_rows','detector_key_storage_shared','inactive_auxiliary_bytes','stable_snapshot_bytes','history_boundary_state_bytes','history_shared_block_bytes','history_directory_bytes','history_cache_boundaries','history_cache_evictions'),map(int,np.frombuffer(self.request(8,0),'<u8'))))
+        return dict(zip(('vulkan_allocation_bytes','device_allocation_bytes','word_scene_bytes','word_vertex_bytes','word_rays','word_tile','feature_tile','reply_tree_bytes','cache_snapshot_bytes','packed_coefficient_bytes','recurrent_control_cache_bytes','logical_device_buffer_bytes','device_memory_pools','history_path_packet_bytes','history_decoded_copy_bytes','optical_field_bytes','debug_audit_bytes','mlp_partial_bytes','upload_staging_bytes','host_readback_bytes','history_scene_bytes','history_blas_count','history_tlas_count','static_scene_scratch_bytes','hit_receipt_bytes','feature_receipt_bytes','workspace_rows','detector_key_storage_shared','inactive_auxiliary_bytes','stable_snapshot_bytes','history_boundary_state_bytes','history_shared_block_bytes','history_directory_bytes','history_cache_boundaries','history_cache_evictions','mlp_transmission_scene_bytes','mlp_transmission_surfaces'),map(int,np.frombuffer(self.request(8,0),'<u8'))))
 
     def set_aperture(self,aperture):
         if self.metadata['routing']!='sparse' or not 0<aperture<=2:raise ValueError('Expected sparse routing and aperture in (0,2]')

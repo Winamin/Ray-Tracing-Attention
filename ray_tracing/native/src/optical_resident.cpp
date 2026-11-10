@@ -2,7 +2,7 @@
 #include <set>
 #include "resident_dimensions.hpp"
 #include "reply_cache.hpp"
-#include "vocabulary_geometry.hpp"
+#include "mlp_geometry.hpp"
 
 struct ResidentConfig {uint32_t stage,rows,layer,position,step,mode,index,capacity,depth,debug,padding0,padding1,checkpoint;};
 
@@ -12,7 +12,7 @@ return segment*16u;
 class ResidentHistory:public ShapeMesh {
 public:
     uint32_t depth,capacity,chunks;std::vector<bool> migrated;bool rebuildMoved=false;Buffer* originalInstances{};
-    ResidentHistory(Engine& e,uint32_t d,uint32_t cap):ShapeMesh(e,std::max(1u,MODEL_FULL)*((cap+15)/16),96,std::max(1u,MODEL_FULL)),depth(d),capacity(cap),chunks((cap+15)/16) {
+    ResidentHistory(Engine& e,uint32_t d,uint32_t cap):ShapeMesh(e,std::max(1u,MODEL_FULL)*((cap+15)/16),96,std::max(1u,MODEL_FULL),false,true),depth(d),capacity(cap),chunks((cap+15)/16) {
         const float corners[6][2]{{-1,-1},{-1,1},{1,1},{-1,-1},{1,1},{1,-1}};
         std::vector<float> data(size_t(count)*96*3);
         for(uint32_t l=0;l<depth;l++)if(fullLayer(l))for(uint32_t s=0;s<chunks;s++){
@@ -70,18 +70,19 @@ struct GenerationPacket {
 class Resident {
 public:
     Engine& e;uint32_t depth{},blocks{},middle{},quantization{},step{},capacity{},absolutePosition{},workRows{},matrixBatchRows{};bool initialized=false;
-    std::unique_ptr<ReplyTreeCache> replyTree;std::unique_ptr<OpticalPathKey> opticalPath;std::unique_ptr<ResidentHistory> history;std::unique_ptr<ShapeMesh> lenses,scalars,features;std::unique_ptr<VocabularyGeometry> words;
-    Buffer *parameters{},*matrices{},*basis{},*propagation{},*keyGeometry{},*state{},*normalized{},*query{},*key{},*decoded{},*geometry{},*slots{},*rays{},*hits{},*paths{},*detector{},*physical{},*wordDecoded{},*wordResult{},*baseChart{},*feedForward{},*auxiliary{},*prompt{},*control{},*audit{},*readback{},*featureWork{},*featureRays{},*featureDown{},*partialDown{},*featureCache{};std::vector<bool> featureCacheReady;uint64_t featureTraceRows{},featureReuseRows{};
-    VkDescriptorSetLayout setLayout{};VkPipelineLayout layout{};VkDescriptorPool descriptorPool{};VkDescriptorSet set{},initialSet{},boundSet{};std::vector<VkDescriptorSet> layerSets;VkPipeline math[35]{},ray[14]{},matrixProjection[4][2]{},mlpBatch[2]{},quantDown[2][2]{},quantOutput[2][2]{},boundPipeline{};
+    uint32_t captureRows{};
+    std::unique_ptr<ReplyTreeCache> replyTree;std::unique_ptr<OpticalPathKey> opticalPath;std::unique_ptr<ResidentHistory> history;std::unique_ptr<ShapeMesh> lenses,scalars,features;std::unique_ptr<VocabularyGeometry> words;std::unique_ptr<MLPTransmissionGeometry> mlpSurfaces;
+    Buffer *parameters{},*matrices{},*basis{},*propagation{},*keyGeometry{},*state{},*normalized{},*query{},*key{},*decoded{},*geometry{},*slots{},*rays{},*hits{},*paths{},*detector{},*physical{},*wordDecoded{},*wordResult{},*baseChart{},*feedForward{},*auxiliary{},*prompt{},*control{},*audit{},*readback{},*featureWork{},*featureRays{},*featureDown{},*partialDown{};uint64_t featureTraceRows{},featureReuseRows{};
+    VkDescriptorSetLayout setLayout{};VkPipelineLayout layout{};VkDescriptorPool descriptorPool{};VkDescriptorSet set{},initialSet{},boundSet{};std::vector<VkDescriptorSet> layerSets;VkPipeline math[35]{},ray[14]{},matrixProjection[4][2]{},opticalMlp[2][2]{},quantOutput[2][2]{},boundPipeline{};
     uint32_t wordTile{},wordTiles{},featureTile{};static constexpr uint32_t wordBlocks=MODEL_D/256u,wordMaskWords=(wordBlocks+31u)/32u,wordQueue=8192u+MODEL_V*(1u+wordMaskWords);uint64_t wordSceneBytes{};bool sparseRouting{},exactRT{};float routeAperture{};bool cacheEnabled{},prefixReady{},stableReady{};OpticalStateMarker liveMarker;
     std::vector<uint32_t> cachedPrefix,stablePrefix,currentGenerated;
     std::unique_ptr<SharedHistoryCache> sharedHistory;std::vector<std::shared_ptr<SharedHistoryCache::Block>> attachedBlocks;
     OpticalPathKey::Address pathAddress{};ReplyTreeCache::Key prefixPathKey{};
     uint32_t prefixTokens{},stateCursor{},cacheEpoch{};uint64_t historyRevision{};
     bool lazyField=false,gpuFieldReady=false;OpticalPathKey::Address gpuFieldAddress{};uint32_t gpuFieldPosition{};std::array<uint32_t,2> stops{};
-    std::vector<VkDescriptorBufferInfo> layerMatrices;std::vector<uint32_t> heads,downFormats;std::vector<std::array<VkPipeline,2>> outputPipelines,gatePipelines;double setupGPU{};uint64_t inboundBytes{},outboundBytes{};
+    std::vector<VkDescriptorBufferInfo> layerMatrices;std::vector<uint32_t> heads;std::vector<std::array<VkPipeline,2>> outputPipelines;double setupGPU{};uint64_t inboundBytes{},outboundBytes{};
     VkQueryPool rtTimestamps{};bool recordRT=false;std::vector<uint32_t> rtKinds;VkPipeline matrixPack{},matrixAttention{},fastState{};bool wideCooperative{};
-    std::vector<VkPipeline> cooperativeOutputs,cooperativeGates,cooperativeDowns;std::vector<std::array<VkPipeline,4>> cooperativeQKV,decodeQKV;std::vector<std::array<VkPipeline,2>> cooperativeAuxiliary,cooperativeControlPack;std::vector<VkPipeline> ownedCooperative;
+    std::vector<VkPipeline> cooperativeOutputs;std::vector<std::array<VkPipeline,4>> cooperativeQKV,decodeQKV;std::vector<std::array<VkPipeline,2>> cooperativeAuxiliary,cooperativeControlPack;std::vector<VkPipeline> ownedCooperative;
     Resident(Engine& engine,const std::filesystem::path& model,const std::filesystem::path& source,bool cache=true,bool sparse=false,float aperture=.08f,uint32_t spatialTile=32,bool forceRT=false,uint32_t featureBlock=8,uint32_t readoutUnroll=1,uint32_t readoutWords=4,uint32_t prefillBatch=512,uint32_t matrixRows=8):e(engine),capacity(e.capacity),workRows(prefillBatch),matrixBatchRows(matrixRows),wordTile(spatialTile),wordTiles((MODEL_V+spatialTile-1u)/spatialTile),featureTile(featureBlock),sparseRouting(sparse),exactRT(forceRT),routeAperture(forceRT?2.f:aperture),cacheEnabled(cache) {
         std::ifstream inputFile(model,std::ios::binary);char magic[8];uint32_t header[9];inputFile.read(magic,8);inputFile.read(reinterpret_cast<char*>(header),36);
         if(!inputFile||std::memcmp(magic,"RTRES004",8)||header[5]!=4u||header[0]!=MODEL_D||header[4]!=MODEL_V||!header[1]||header[1]!=MODEL_LAYERS||!header[2]||header[2]>header[1]||header[3]%32)throw std::runtime_error("Invalid resident optical student");
@@ -91,20 +92,19 @@ public:
 
         wideCooperative=e.cooperativeMatrix2&&RT_ATTENTION_HEAD_DIM%32u==0u&&!(std::getenv("RT_PREFILL_COOPERATIVE")&&std::string(std::getenv("RT_PREFILL_COOPERATIVE"))!="2");
         const auto usage=VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        parameters=e.buffer(p.size()*4,usage);matrices=e.buffer(m.size()*4,usage);e.upload(parameters,p.data(),parameters->size);e.upload(matrices,m.data(),matrices->size);m.clear();m.shrink_to_fit();for(uint32_t l=0;l<depth;l++){uint32_t base=32+l*64;layerMatrices.push_back({matrices->handle,size_t(p[base+27])*4,size_t(p[base+28])*4});heads.push_back(p[base+23]);downFormats.push_back(p[base+18]);}
+        parameters=e.buffer(p.size()*4,usage);matrices=e.buffer(m.size()*4,usage);e.upload(parameters,p.data(),parameters->size);e.upload(matrices,m.data(),matrices->size);m.clear();m.shrink_to_fit();for(uint32_t l=0;l<depth;l++){uint32_t base=32+l*64;layerMatrices.push_back({matrices->handle,size_t(p[base+27])*4,size_t(p[base+28])*4});heads.push_back(p[base+23]);}
         history=std::make_unique<ResidentHistory>(e,depth,capacity);keyGeometry=e.buffer(size_t(std::max(1u,MODEL_FULL))*capacity*HISTORY_BYTES,usage);
-        lenses=std::make_unique<ShapeMesh>(e,sparseRouting?(depth+1)*32:MODEL_FULL+1,12,sparseRouting?4:1);uint64_t beforeWord=e.allocated;words=std::make_unique<VocabularyGeometry>(e,MODEL_V,wordBlocks);wordSceneBytes=e.allocated-beforeWord;if(sparseRouting||exactRT)features=std::make_unique<ShapeMesh>(e,depth*(sparseRouting?4u:1u)*(middle/featureTile),featureTile*6,depth);scalars=std::make_unique<ShapeMesh>(e,1,65536*3,1);
+        lenses=std::make_unique<ShapeMesh>(e,sparseRouting?(depth+1)*32:MODEL_FULL+1,12,sparseRouting?4:1,false,true);uint64_t beforeWord=e.allocated;words=std::make_unique<VocabularyGeometry>(e,MODEL_V,wordBlocks);wordSceneBytes=e.allocated-beforeWord;mlpSurfaces=std::make_unique<MLPTransmissionGeometry>(e,MODEL_D,MODEL_FF);if(sparseRouting)features=std::make_unique<ShapeMesh>(e,depth*(sparseRouting?4u:1u)*(middle/featureTile),featureTile*6,depth,false,true);scalars=std::make_unique<ShapeMesh>(e,1,65536*3,1,false,true);
         if(sparseRouting){for(uint32_t group=0;group<4;group++)for(uint32_t domain=0;domain<=depth;domain++)for(uint32_t b=0;b<8;b++) {uint32_t i=group*(depth+1)*8+domain*8+b;lenses->hostInstances[i].mask=1u<<b;lenses->hostInstances[i].instanceCustomIndex=domain*32+group*8+b;}}else for(uint32_t i=0;i<MODEL_FULL+1;i++){uint32_t domain=i<MODEL_FULL?MODEL_FULL_LAYERS[i]:depth;lenses->hostInstances[i].mask=1u;lenses->hostInstances[i].instanceCustomIndex=domain*32;}
         e.upload(lenses->instances,lenses->hostInstances.data(),lenses->instances->size);
         std::ifstream headFile(source,std::ios::binary);char basisMagic[8];uint32_t shape[2];headFile.read(basisMagic,8);headFile.read(reinterpret_cast<char*>(shape),8);if(!headFile||std::memcmp(basisMagic,quantization==4u?"RTBASQ01":"RTBAS001",8)||shape[0]!=MODEL_V||shape[1]!=MODEL_D)throw std::runtime_error("Complete model vocabulary basis required");size_t basisBytes=std::filesystem::file_size(source)-16u;std::vector<uint32_t> basisHost(basisBytes/4u);headFile.read(reinterpret_cast<char*>(basisHost.data()),basisBytes);if(!headFile)throw std::runtime_error("Truncated original word basis");basis=e.buffer(basisHost.size()*4,usage);e.upload(basis,basisHost.data(),basis->size);basisHost.clear();basisHost.shrink_to_fit();
-        auto floats=[&](size_t n){return e.buffer(n*4,usage);};propagation=floats(size_t(MODEL_RECURRENT)*(MODEL_STATE_HEADS*128*128+MODEL_S*9)+size_t(workRows)*MODEL_S*3);state=floats(size_t(workRows)*MODEL_D);normalized=floats(size_t(workRows)*MODEL_D);query=floats(size_t(workRows)*MODEL_A);key=floats(size_t(workRows)*MODEL_A);decoded=floats(1);geometry=floats(1);slots=floats(size_t(std::max(1u,MODEL_FULL))*capacity*2);rays=floats(std::max(size_t(workRows)*(sparseRouting?4u:1u),size_t(wordBlocks))*4u);hits=floats(std::max<size_t>(size_t(workRows)*(capacity+1),256));paths=floats(1);detector=key;physical=floats(size_t(workRows)*std::max(MODEL_STATE_HEADS,uint32_t(RT_ATTENTION_HEADS))*2);wordDecoded=floats(std::max(size_t(256)*MODEL_D,size_t(std::max(256u,workRows))*std::max(MODEL_D,std::max(MODEL_A,MODEL_W))/2u));wordResult=e.buffer(size_t(wordQueue+MODEL_V)*4,usage|VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);baseChart=floats(MODEL_D);feedForward=floats(size_t(workRows)*MODEL_W);auxiliary=floats(size_t(workRows)*MODEL_STATE_HEADS*2);prompt=floats(capacity);control=e.buffer((11+capacity+65536)*4,usage|VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);audit=floats(1);featureWork=e.buffer(size_t(workRows*(16+MODEL_FF*(sparseRouting?2:1))+16)*4,usage|VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);featureRays=floats(size_t(workRows)*(sparseRouting?4u:1u)*4u);featureDown=floats(sparseRouting?size_t(depth)*MODEL_FF*1024:(wideCooperative&&MODEL_RECURRENT&&MODEL_STATE_HEADS%32u==0u?size_t(MODEL_RECURRENT)*MODEL_STATE_HEADS*MODEL_D:1));partialDown=floats(sparseRouting?size_t(workRows)*96*MODEL_D:1);
-        featureCache=e.buffer((wideCooperative||cacheEnabled)&&exactRT&&!sparseRouting?size_t(depth)*(16u+MODEL_FF)*4u:4u,usage);featureCacheReady.resize(depth,false);
+        auto floats=[&](size_t n){return e.buffer(n*4,usage);};propagation=floats(size_t(MODEL_RECURRENT)*(MODEL_STATE_HEADS*128*128+MODEL_S*9)+size_t(workRows)*MODEL_S*3);state=floats(size_t(workRows)*MODEL_D);normalized=floats(size_t(workRows)*MODEL_D);query=floats(size_t(workRows)*MODEL_A);key=floats(size_t(workRows)*MODEL_A);decoded=floats(1);geometry=floats(1);slots=floats(size_t(std::max(1u,MODEL_FULL))*capacity*2);rays=floats(std::max(size_t(workRows)*(sparseRouting?4u:1u),size_t(wordBlocks))*4u);hits=floats(std::max<size_t>(size_t(workRows)*(capacity+1),256));paths=floats(1);detector=key;physical=floats(size_t(workRows)*std::max(MODEL_STATE_HEADS,uint32_t(RT_ATTENTION_HEADS))*2);wordDecoded=floats(std::max(size_t(256)*MODEL_D,size_t(std::max(256u,workRows))*std::max(MODEL_D,std::max(MODEL_A,MODEL_W))/2u));wordResult=e.buffer(size_t(wordQueue+MODEL_V)*4,usage|VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);baseChart=floats(MODEL_D);feedForward=floats(size_t(workRows)*MODEL_W);auxiliary=floats(size_t(workRows)*MODEL_STATE_HEADS*2);prompt=floats(capacity);control=e.buffer(size_t(11u+capacity+65536u)*4u,usage|VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);audit=floats(1);featureWork=e.buffer(size_t(workRows*(16+MODEL_FF*(sparseRouting?2:1))+16)*4,usage|VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);featureRays=floats(size_t(workRows)*(sparseRouting?4u:1u)*4u);featureDown=floats(sparseRouting?size_t(depth)*MODEL_FF*1024:(wideCooperative&&MODEL_RECURRENT&&MODEL_STATE_HEADS%32u==0u?size_t(MODEL_RECURRENT)*MODEL_STATE_HEADS*MODEL_D:1));partialDown=floats(sparseRouting?size_t(workRows)*96*MODEL_D:1);
         readback=e.buffer(4*1024*1024,VK_BUFFER_USAGE_TRANSFER_DST_BIT,true);
         if(cacheEnabled){initializeMarker(liveMarker,true);}
-        VkDescriptorSetLayoutBinding bindings[39]{};for(uint32_t i=0;i<39;i++)bindings[i]={i,((i<5&&i!=2)||i==32)?VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,i==6||i==32?depth:i==0||i==1||i==3?4u:1u,VK_SHADER_STAGE_COMPUTE_BIT,nullptr};
-        VkDescriptorSetLayoutCreateInfo sl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};sl.bindingCount=39;sl.pBindings=bindings;check(vkCreateDescriptorSetLayout(e.device,&sl,nullptr,&setLayout),"resident set layout");VkPushConstantRange pc{VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(ResidentConfig)};VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};pl.setLayoutCount=1;pl.pSetLayouts=&setLayout;pl.pushConstantRangeCount=1;pl.pPushConstantRanges=&pc;check(vkCreatePipelineLayout(e.device,&pl,nullptr,&layout),"resident pipeline layout");VkDescriptorPoolSize sizes[2]{{VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,(13+depth)*(depth+1)},{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,(depth+1)*(34+depth)}};VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};pool.maxSets=depth+1;pool.poolSizeCount=2;pool.pPoolSizes=sizes;check(vkCreateDescriptorPool(e.device,&pool,nullptr,&descriptorPool),"resident descriptor pool");std::vector<VkDescriptorSetLayout> layouts(depth+1,setLayout);VkDescriptorSetAllocateInfo alloc{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};alloc.descriptorPool=descriptorPool;alloc.descriptorSetCount=depth+1;alloc.pSetLayouts=layouts.data();std::vector<VkDescriptorSet> sets(depth+1);check(vkAllocateDescriptorSets(e.device,&alloc,sets.data()),"resident descriptor sets");layerSets.assign(sets.begin(),sets.begin()+depth);set=sets[0];initialSet=sets[depth];for(uint32_t l=0;l<depth;l++)bind(layerSets[l],false,l);bind(initialSet,true);for(uint32_t i=0;i<35;i++)if(i!=2&&i!=4&&i!=5&&i!=10)math[i]=e.pipeline("resident_math",layout,i,1u,0xffffffffu,wordTile,i==16u?readoutWords*32u:128u,featureTile,readoutUnroll,readoutWords,quantization==4u?(i==16u?p[15]:0xffffffffu):0xffffffffu);for(uint32_t i=0;i<14;i++)if(i<4||i>7||i==5)ray[i]=e.pipeline("resident_ray",layout,i,32u,0xffffffffu,wordTile,i==0||i==12||i==13?32u:128u,featureTile);
-        for(uint32_t kind=2;kind<=5;kind++)for(uint32_t batch=0;batch<2;batch++)matrixProjection[kind-2][batch]=e.pipeline("resident_math",layout,2u,batch?matrixBatchRows:1u,kind,wordTile,128u,featureTile);
-        for(uint32_t kind=0;kind<2;kind++)mlpBatch[kind]=e.pipeline("resident_math",layout,kind==0u?28u:33u,matrixBatchRows,0xffffffffu,wordTile,128u,featureTile,1u,4u,0xffffffffu);
+        VkDescriptorSetLayoutBinding bindings[40]{};uint32_t bindingCount=0;for(uint32_t i=0;i<40;i++){if(i==40u||i==41u)continue;bindings[bindingCount++]={i,((i<5&&i!=2)||i==32||i==39)?VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,i==6||i==32?depth:i==0||i==1||i==3?4u:1u,VK_SHADER_STAGE_COMPUTE_BIT,nullptr};}
+        VkDescriptorSetLayoutCreateInfo sl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};sl.bindingCount=bindingCount;sl.pBindings=bindings;check(vkCreateDescriptorSetLayout(e.device,&sl,nullptr,&setLayout),"resident set layout");VkPushConstantRange pc{VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(ResidentConfig)};VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};pl.setLayoutCount=1;pl.pSetLayouts=&setLayout;pl.pushConstantRangeCount=1;pl.pPushConstantRanges=&pc;check(vkCreatePipelineLayout(e.device,&pl,nullptr,&layout),"resident pipeline layout");VkDescriptorPoolSize sizes[2]{{VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,(14+depth)*(depth+1)},{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,(depth+1)*(34+depth)}};VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};pool.maxSets=depth+1;pool.poolSizeCount=2;pool.pPoolSizes=sizes;check(vkCreateDescriptorPool(e.device,&pool,nullptr,&descriptorPool),"resident descriptor pool");std::vector<VkDescriptorSetLayout> layouts(depth+1,setLayout);VkDescriptorSetAllocateInfo alloc{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};alloc.descriptorPool=descriptorPool;alloc.descriptorSetCount=depth+1;alloc.pSetLayouts=layouts.data();std::vector<VkDescriptorSet> sets(depth+1);check(vkAllocateDescriptorSets(e.device,&alloc,sets.data()),"resident descriptor sets");layerSets.assign(sets.begin(),sets.begin()+depth);set=sets[0];initialSet=sets[depth];for(uint32_t l=0;l<depth;l++)bind(layerSets[l],false,l);bind(initialSet,true);for(uint32_t i=0;i<35;i++)if(i!=2&&i!=4&&i!=5&&i!=10)math[i]=e.pipeline("resident_math",layout,i,1u,0xffffffffu,wordTile,i==16u?readoutWords*32u:128u,featureTile,readoutUnroll,readoutWords,quantization==4u?(i==16u?p[15]:0xffffffffu):0xffffffffu);for(uint32_t i=0;i<14;i++)if(i<4||i>7||i==5)ray[i]=e.pipeline("resident_ray",layout,i,32u,0xffffffffu,wordTile,i==0||i==12||i==13?32u:128u,featureTile);
+        for(uint32_t kind: {2u,5u})for(uint32_t batch=0;batch<2;batch++)matrixProjection[kind-2][batch]=e.pipeline("resident_math",layout,2u,batch?matrixBatchRows:1u,kind,wordTile,128u,featureTile);
+        for(uint32_t kind=0;kind<2;kind++)for(uint32_t batch=0;batch<2;batch++)opticalMlp[kind][batch]=e.pipeline("resident_mlp",layout,kind,batch?matrixBatchRows:1u,0xffffffffu,wordTile,128u,featureTile);
         {
             std::map<std::pair<uint32_t,uint32_t>,VkPipeline> cached;
             const uint32_t projections[4]{0u,1u,6u,8u},formats[4]{10u,12u,22u,33u};
@@ -124,17 +124,23 @@ public:
                 matrixAttention=e.pipeline("resident_attention",layout,0u,1u,0xffffffffu,wordTile,256u,featureTile);fastState=e.pipeline("resident_state",layout,21u,1u,0xffffffffu,wordTile,128u,featureTile);
                 std::map<std::tuple<uint32_t,uint32_t,uint32_t,uint32_t,uint32_t>,VkPipeline> cache;
                 auto pipe=[&](uint32_t stage,uint32_t pass,uint32_t format,uint32_t projection=0xffffffffu,uint32_t up=0xffffffffu){auto id=std::make_tuple(stage,pass,format,projection,up);if(!cache.count(id)){auto handle=e.pipeline("resident_batch2",layout,stage,pass,projection,wordTile,256u,featureTile,1u,4u,format,up);cache[id]=handle;ownedCooperative.push_back(handle);}return cache[id];};
-                for(uint32_t l=0;l<depth;l++){uint32_t base=32u+l*64u;cooperativeOutputs.push_back(pipe(2u,1u,p[base+14u],2u));cooperativeGates.push_back(pipe(28u,1u,p[base+16u],0xffffffffu,p[base+20u]));cooperativeDowns.push_back(pipe(33u,1u,p[base+18u]));cooperativeQKV.push_back({pipe(2u,1u,p[base+10u],0u),pipe(2u,1u,p[base+12u],1u),pipe(2u,1u,p[base+22u],6u),pipe(2u,1u,p[base+33u],8u)});
+                for(uint32_t l=0;l<depth;l++){uint32_t base=32u+l*64u;cooperativeOutputs.push_back(pipe(2u,1u,p[base+14u],2u));cooperativeQKV.push_back({pipe(2u,1u,p[base+10u],0u),pipe(2u,1u,p[base+12u],1u),pipe(2u,1u,p[base+22u],6u),pipe(2u,1u,p[base+33u],8u)});
                     std::array<VkPipeline,2> auxiliaryPipes{},controlPack{};if(!fullLayer(l)&&MODEL_STATE_HEADS%32u==0u)for(uint32_t b=0;b<2;b++){
                         auxiliaryPipes[b]=e.pipeline("resident_auxiliary",layout,0u,b,0xffffffffu,wordTile,128u,featureTile,1u,4u,p[base+(b?39u:40u)]);controlPack[b]=e.pipeline("resident_auxiliary",layout,1u,b,0xffffffffu,wordTile,128u,featureTile,1u,4u,p[base+(b?39u:40u)]);ownedCooperative.push_back(auxiliaryPipes[b]);ownedCooperative.push_back(controlPack[b]);}cooperativeAuxiliary.push_back(auxiliaryPipes);cooperativeControlPack.push_back(controlPack);}
             }
         }
-        if(quantization==4u)for(uint32_t kind=0;kind<2;kind++)for(uint32_t batch=0;batch<2;batch++)quantDown[kind][batch]=e.pipeline("resident_math",layout,33u,batch?matrixBatchRows:1u,0xffffffffu,wordTile,128u,featureTile,1u,4u,kind?14u:12u);
-        if(quantization==4u){std::map<std::pair<uint32_t,uint32_t>,std::array<VkPipeline,2>> cached;
-            for(uint32_t l=0;l<depth;l++){uint32_t base=32u+l*64u;std::array<VkPipeline,2> out{},gate{};
-                for(uint32_t stage: {2u,28u}){uint32_t format=stage==2u?p[base+14u]:p[base+16u]==p[base+20u]?p[base+16u]:0xffffffffu;auto id=std::make_pair(stage,format);
-                    if(!cached.count(id)){std::array<VkPipeline,2> pipes{};for(uint32_t batch=0;batch<2;batch++)pipes[batch]=e.pipeline("resident_math",layout,stage,batch?matrixBatchRows:1u,stage==2u?2u:0xffffffffu,wordTile,128u,featureTile,1u,4u,format);cached[id]=pipes;}
-                    if(stage==2u)out=cached[id];else gate=cached[id];}outputPipelines.push_back(out);gatePipelines.push_back(gate);}}
+        if(quantization==4u){
+            std::map<uint32_t,std::array<VkPipeline,2>> cached;
+            for(uint32_t l=0;l<depth;l++){
+                uint32_t format=p[32u+l*64u+14u];
+                if(!cached.count(format)){
+                    std::array<VkPipeline,2> pipes{};
+                    for(uint32_t batch=0;batch<2;batch++)pipes[batch]=e.pipeline("resident_math",layout,2u,batch?matrixBatchRows:1u,2u,wordTile,128u,featureTile,1u,4u,format);
+                    cached[format]=pipes;
+                }
+                outputPipelines.push_back(cached[format]);
+            }
+        }
 
         if(cacheEnabled){
             opticalPath=std::make_unique<OpticalPathKey>(e,state,propagation,keyGeometry,control,capacity);
@@ -189,9 +195,9 @@ public:
         opticalPath->capture(c,position,index,cacheEpoch,expected);boundPipeline=VK_NULL_HANDLE;boundSet=VK_NULL_HANDLE;
     }
     void bind(VkDescriptorSet target,bool initial,uint32_t layer=0) {
-        VkAccelerationStructureKHR handles[5][4]{};for(uint32_t i=0;i<4;i++){handles[0][i]=history->tops[fullIndex(layer)];handles[1][i]=lenses->tops[sparseRouting?i:0u];handles[3][i]=words->tops[0];}handles[2][0]=scalars->tops[0];handles[4][0]=scalars->tops[0];VkAccelerationStructureKHR featureHandles[RT_LAYER_COUNT]{};for(uint32_t l=0;l<depth;l++)featureHandles[l]=features?features->tops[l]:scalars->tops[0];VkWriteDescriptorSetAccelerationStructureKHR as[36]{};
-        Buffer* buffers[39]{nullptr,nullptr,propagation,nullptr,nullptr,parameters,matrices,basis,state,normalized,query,key,keyGeometry,initial?words->vertices:history->vertices,decoded,geometry,slots,rays,hits,paths,detector,physical,wordDecoded,scalars->vertices,wordResult,lenses->vertices,baseChart,feedForward,auxiliary,prompt,control,audit,nullptr,features?features->vertices:scalars->vertices,featureWork,featureRays,featureDown,partialDown,words->vertices};VkDescriptorBufferInfo infos[39]{};VkWriteDescriptorSet writes[39]{};
-        for(uint32_t i=0;i<39;i++){auto& w=writes[i];w={VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};w.dstSet=target;w.dstBinding=i;w.descriptorCount=i==6||i==32?depth:i==0||i==1||i==3?4:1;w.descriptorType=((i<5&&i!=2)||i==32)?VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;if((i<5&&i!=2)||i==32){as[i]={VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};as[i].accelerationStructureCount=w.descriptorCount;as[i].pAccelerationStructures=i==32?featureHandles:handles[i];w.pNext=&as[i];}else{infos[i]={buffers[i]->handle,0,buffers[i]->size};w.pBufferInfo=i==6?layerMatrices.data():&infos[i];}}vkUpdateDescriptorSets(e.device,39,writes,0,nullptr);
+        VkAccelerationStructureKHR handles[5][4]{};for(uint32_t i=0;i<4;i++){handles[0][i]=history->tops[fullIndex(layer)];handles[1][i]=lenses->tops[sparseRouting?i:0u];handles[3][i]=words->tops[0];}handles[2][0]=scalars->tops[0];handles[4][0]=scalars->tops[0];VkAccelerationStructureKHR featureHandles[RT_LAYER_COUNT]{};for(uint32_t l=0;l<depth;l++)featureHandles[l]=features?features->tops[l]:scalars->tops[0];VkWriteDescriptorSetAccelerationStructureKHR as[40]{};
+        Buffer* buffers[40]{nullptr,nullptr,propagation,nullptr,nullptr,parameters,matrices,basis,state,normalized,query,key,keyGeometry,initial?words->vertices:history->vertices,decoded,geometry,slots,rays,hits,paths,detector,physical,wordDecoded,scalars->vertices,wordResult,lenses->vertices,baseChart,feedForward,auxiliary,prompt,control,audit,nullptr,features?features->vertices:scalars->vertices,featureWork,featureRays,featureDown,partialDown,words->vertices,nullptr};VkDescriptorBufferInfo infos[40]{};VkWriteDescriptorSet writes[40]{};
+        uint32_t writeCount=0;for(uint32_t i=0;i<40;i++){if(i==40u||i==41u)continue;auto& w=writes[writeCount++];w={VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};w.dstSet=target;w.dstBinding=i;w.descriptorCount=i==6||i==32?depth:i==0||i==1||i==3?4:1;w.descriptorType=((i<5&&i!=2)||i==32||i==39)?VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;if((i<5&&i!=2)||i==32||i==39){as[i]={VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};as[i].accelerationStructureCount=w.descriptorCount;as[i].pAccelerationStructures=i==32?featureHandles:i==39?mlpSurfaces->tops.data():handles[i];w.pNext=&as[i];}else{infos[i]={buffers[i]->handle,0,buffers[i]->size};w.pBufferInfo=i==6?layerMatrices.data():&infos[i];}}vkUpdateDescriptorSets(e.device,writeCount,writes,0,nullptr);
     }
     static void sync(VkCommandBuffer c){Engine::barrier(c,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_ACCESS_MEMORY_WRITE_BIT,VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT);}
     void begin(VkCommandBuffer c){e.begin(c);boundSet=VK_NULL_HANDLE;boundPipeline=VK_NULL_HANDLE;}
@@ -207,7 +213,12 @@ public:
         vkCmdDispatch(c,std::min(groups,65535u),(groups+65534u)/65535u,1u);sync(c);
     }
     void launch(VkCommandBuffer c,VkPipeline* pipelines,ResidentConfig cfg,uint32_t x,uint32_t y=1,uint32_t z=1,VkDescriptorSet target=VK_NULL_HANDLE) {
-        cfg.padding0=sparseRouting?1u:exactRT?2u:0u;std::memcpy(&cfg.padding1,&routeAperture,4);bool projection=pipelines==math&&cfg.stage==2u,routeBatch=pipelines==math&&(cfg.stage==28u||cfg.stage==33u)&&cfg.rows>1u&&!sparseRouting;bool batch=(projection&&cfg.rows>1u)||routeBatch;VkPipeline selected=routeBatch?mlpBatch[cfg.stage==28u?0u:1u]:projection?matrixProjection[cfg.index-2u][batch?1u:0u]:pipelines[cfg.stage];if(quantization==4u&&pipelines==math&&cfg.stage==33u&&(downFormats[cfg.layer]==12u||downFormats[cfg.layer]==14u))selected=quantDown[downFormats[cfg.layer]==14u?1u:0u][batch?1u:0u];if(quantization==4u&&projection&&cfg.index==2u)selected=outputPipelines[cfg.layer][batch?1u:0u];if(quantization==4u&&pipelines==math&&cfg.stage==28u)selected=gatePipelines[cfg.layer][batch?1u:0u];if(cfg.rows>=8u&&wideCooperative&&pipelines==math&&cfg.stage==21u)selected=fastState;bindCompute(c,selected,target?target:layerSets[cfg.layer]);vkCmdPushConstants(c,layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(cfg),&cfg);
+        cfg.padding0=sparseRouting?1u:exactRT?2u:0u;std::memcpy(&cfg.padding1,&routeAperture,4);
+        bool projection=pipelines==math&&cfg.stage==2u,batch=projection&&cfg.rows>1u;
+        VkPipeline selected=projection?matrixProjection[cfg.index-2u][batch?1u:0u]:pipelines[cfg.stage];
+        if(quantization==4u&&projection&&cfg.index==2u)selected=outputPipelines[cfg.layer][batch?1u:0u];
+        if(cfg.rows>=8u&&wideCooperative&&pipelines==math&&cfg.stage==21u)selected=fastState;
+        bindCompute(c,selected,target?target:layerSets[cfg.layer]);vkCmdPushConstants(c,layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(cfg),&cfg);
         if(cfg.rows>=8u&&wideCooperative&&pipelines==math&&cfg.stage==18u&&cooperativeAuxiliary[cfg.layer][0]){
             for(auto handle:cooperativeAuxiliary[cfg.layer]){bindCompute(c,handle,target?target:layerSets[cfg.layer]);vkCmdDispatch(c,MODEL_STATE_HEADS/32u,(cfg.rows+127u)/128u,1u);}sync(c);return;
         }
@@ -230,8 +241,8 @@ public:
             const uint32_t widths[4]{fullLayer(cfg.layer)?MODEL_Q:RT_STATE_KEY_HEADS*128u,fullLayer(cfg.layer)?MODEL_GQA:RT_STATE_KEY_HEADS*128u,fullLayer(cfg.layer)?RT_ATTENTION_GATE*MODEL_Q:MODEL_S,fullLayer(cfg.layer)?MODEL_GQA:MODEL_S};
             for(uint32_t part=0;part<4;part++)if(widths[part]){vkCmdPushConstants(c,layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(cfg),&cfg);bindCompute(c,cooperativeQKV[cfg.layer][part],target?target:layerSets[cfg.layer]);vkCmdDispatch(c,(widths[part]+std::min(64u,uint32_t(RT_ATTENTION_HEAD_DIM))-1u)/std::min(64u,uint32_t(RT_ATTENTION_HEAD_DIM)),(y+127u)/128u,1u);}sync(c);return;
         }
-        bool cooperative=cfg.rows>=8u&&wideCooperative&&!sparseRouting&&((projection&&cfg.index==2u)||routeBatch);
-        if(cooperative){selected=projection?cooperativeOutputs[cfg.layer]:cfg.stage==28u?cooperativeGates[cfg.layer]:cooperativeDowns[cfg.layer];packMatrixInput(c,cfg,projection?1u:cfg.stage==28u?0u:2u,target?target:layerSets[cfg.layer]);bindCompute(c,selected,target?target:layerSets[cfg.layer]);vkCmdPushConstants(c,layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(cfg),&cfg);}
+        bool cooperative=cfg.rows>=8u&&wideCooperative&&!sparseRouting&&projection&&cfg.index==2u;
+        if(cooperative){selected=cooperativeOutputs[cfg.layer];packMatrixInput(c,cfg,1u,target?target:layerSets[cfg.layer]);bindCompute(c,selected,target?target:layerSets[cfg.layer]);vkCmdPushConstants(c,layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(cfg),&cfg);}
         uint32_t query=~0u;if(pipelines==ray&&(cfg.stage==0u||cfg.stage==12u||cfg.stage==13u))query=startRT(c,cfg.stage==0u?0u:cfg.stage==12u?1u:2u);
         if(pipelines==ray&&cfg.stage==0u&&x>65535u){y=(x+65534u)/65535u;x=65535u;}
         uint32_t matrixChannelTile=std::min(64u,uint32_t(RT_ATTENTION_HEAD_DIM));
@@ -243,9 +254,9 @@ public:
     void payload(VkCommandBuffer c,ResidentConfig cfg){cfg.stage=8;launch(c,ray,cfg,1);}
     void mark(VkCommandBuffer c,ResidentConfig cfg,uint32_t at){if(cfg.debug==2)vkCmdWriteTimestamp(c,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,e.timestamps,2+cfg.step*(depth*7+4)+cfg.layer*7+at);}
     void setup(){if(initialized)return;ResidentConfig cfg{7,1,0,0,0,0,0,capacity,depth,0,0,0};auto c=e.command();begin(c);vkCmdResetQueryPool(c,e.timestamps,0,2);vkCmdWriteTimestamp(c,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,e.timestamps,0);vkCmdFillBuffer(c,featureRays->handle,0,featureRays->size,0u);sync(c);
-        launch(c,math,cfg,sparseRouting?(depth+1)*32:MODEL_FULL+1,1,1,initialSet);lenses->build(c,lenses->count,true);cfg.stage=8;launch(c,math,cfg,512,1,1,initialSet);scalars->build(c,1,true);cfg.stage=9;launch(c,math,cfg,std::min(MODEL_V,32768u),(MODEL_V+32767u)/32768u,wordBlocks,initialSet);words->build(c,words->count,true);cfg.index=cfg.position=0;if(features){cfg.stage=25;for(uint32_t l=0;l<depth;l++){cfg.layer=l;launch(c,math,cfg,MODEL_FF,sparseRouting?4u:1u,1,initialSet);if(sparseRouting){cfg.stage=31;launch(c,math,cfg,24576);}cfg.stage=25;}features->build(c,features->count,true);}cfg.stage=9;launch(c,ray,cfg,512);if(quantization!=4u){cfg.stage=22;cfg.index=0;for(uint32_t l=0;l<depth;l++){cfg.layer=l;launch(c,math,cfg,32768,(layerMatrices[l].range/4+32768*128-1)/(32768*128));}cfg.index=1;launch(c,math,cfg,32768,(MODEL_V*1024u+32768u*128u-1)/(32768u*128u));}if(wideCooperative)for(uint32_t l=0;l<depth;l++)if(cooperativeControlPack[l][0]){cfg.layer=l;vkCmdPushConstants(c,layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(cfg),&cfg);for(auto handle:cooperativeControlPack[l]){bindCompute(c,handle,layerSets[l]);vkCmdDispatch(c,MODEL_STATE_HEADS*MODEL_D/256u,1u,1u);sync(c);}}
+        mlpSurfaces->build(c,mlpSurfaces->count,true);launch(c,math,cfg,sparseRouting?(depth+1)*32:MODEL_FULL+1,1,1,initialSet);lenses->build(c,lenses->count,true);cfg.stage=8;launch(c,math,cfg,512,1,1,initialSet);scalars->build(c,1,true);cfg.stage=9;launch(c,math,cfg,std::min(MODEL_V,32768u),(MODEL_V+32767u)/32768u,wordBlocks,initialSet);words->build(c,words->count,true);cfg.index=cfg.position=0;if(features){cfg.stage=25;for(uint32_t l=0;l<depth;l++){cfg.layer=l;launch(c,math,cfg,MODEL_FF,sparseRouting?4u:1u,1,initialSet);if(sparseRouting){cfg.stage=31;launch(c,math,cfg,24576);}cfg.stage=25;}features->build(c,features->count,true);}cfg.stage=9;launch(c,ray,cfg,512);if(quantization!=4u){cfg.stage=22;cfg.index=0;for(uint32_t l=0;l<depth;l++){cfg.layer=l;launch(c,math,cfg,32768,(layerMatrices[l].range/4+32768*128-1)/(32768*128));}cfg.index=1;launch(c,math,cfg,32768,(MODEL_V*1024u+32768u*128u-1)/(32768u*128u));}if(wideCooperative)for(uint32_t l=0;l<depth;l++)if(cooperativeControlPack[l][0]){cfg.layer=l;vkCmdPushConstants(c,layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(cfg),&cfg);for(auto handle:cooperativeControlPack[l]){bindCompute(c,handle,layerSets[l]);vkCmdDispatch(c,MODEL_STATE_HEADS*MODEL_D/256u,1u,1u);sync(c);}}
         vkCmdWriteTimestamp(c,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,e.timestamps,1);check(vkEndCommandBuffer(c),"end resident first-forward geometry");auto time=e.measure(c,1);setupGPU=time.gpu;vkFreeCommandBuffers(e.device,e.pool,1,&c);
-        auto coefficients=e.download<uint32_t>(control,11);if(coefficients[3]&512u)throw std::runtime_error("RT coefficient conversion: reference "+std::to_string(coefficients[7])+" measured "+std::to_string(coefficients[8])+" layer "+std::to_string(coefficients[9])+" basis "+std::to_string(coefficients[10])+" count "+std::to_string(coefficients[6]));initialized=true;if(!sparseRouting){wordSceneBytes-=words->scratchBytes();words->releaseScratch();lenses->releaseScratch();scalars->releaseScratch();if(features)features->releaseScratch();}e.release(e.uploadStaging);e.release(e.downloadStaging);}
+        auto coefficients=e.download<uint32_t>(control,11);if(coefficients[3]&512u)throw std::runtime_error("RT coefficient conversion: reference "+std::to_string(coefficients[7])+" measured "+std::to_string(coefficients[8])+" layer "+std::to_string(coefficients[9])+" basis "+std::to_string(coefficients[10])+" count "+std::to_string(coefficients[6]));initialized=true;if(!sparseRouting){wordSceneBytes-=words->scratchBytes();words->releaseScratch();lenses->releaseScratch();scalars->releaseScratch();mlpSurfaces->releaseScratch();if(features)features->releaseScratch();}e.release(e.uploadStaging);e.release(e.downloadStaging);}
     void layer(VkCommandBuffer c,ResidentConfig cfg) {
         mark(c,cfg,0);cfg.stage=1;cfg.index=0;launch(c,math,cfg,cfg.rows);cfg.stage=2;cfg.index=5;launch(c,math,cfg,fullLayer(cfg.layer)?(MODEL_Q+MODEL_GQA)/2u:quantization==4u?(2u*RT_STATE_KEY_HEADS*128u+2u*MODEL_S+3u)/4u:MODEL_D,cfg.rows);
         if(fullLayer(cfg.layer)){
@@ -259,29 +270,37 @@ cfg.stage=6;launch(c,math,cfg,1,cfg.rows);
             cfg.stage=18;launch(c,math,cfg,MODEL_STATE_HEADS,cfg.rows);cfg.stage=19;launch(c,math,cfg,(MODEL_S*3u+127u)/128u,cfg.rows);cfg.stage=20;launch(c,math,cfg,MODEL_STATE_HEADS,cfg.rows);
             mark(c,cfg,1);mark(c,cfg,2);mark(c,cfg,3);mark(c,cfg,4);cfg.stage=21;launch(c,math,cfg,32,MODEL_STATE_HEADS);mark(c,cfg,5);cfg.stage=15;launch(c,math,cfg,MODEL_STATE_HEADS,cfg.rows);
         }
-        cfg.stage=2;cfg.index=2;launch(c,math,cfg,MODEL_D/4u,cfg.rows);cfg.stage=1;cfg.index=1;launch(c,math,cfg,cfg.rows);if(features)routedMLP(c,cfg);else{cfg.stage=2;cfg.index=3;launch(c,math,cfg,(middle+3)/4,cfg.rows);cfg.index=4;launch(c,math,cfg,MODEL_D/4u,cfg.rows);}if(cfg.debug==1){cfg.stage=12;launch(c,math,cfg,MODEL_D/128u);}mark(c,cfg,6);
+        cfg.stage=2;cfg.index=2;launch(c,math,cfg,MODEL_D/4u,cfg.rows);cfg.stage=1;cfg.index=1;launch(c,math,cfg,cfg.rows);routedMLP(c,cfg);if(cfg.debug==1){VkBufferCopy snapshot{0,(size_t(cfg.layer)*captureRows+(cfg.mode==0u?0u:cfg.position))*MODEL_D*4u,size_t(cfg.rows)*MODEL_D*4u};vkCmdCopyBuffer(c,state->handle,audit->handle,1,&snapshot);sync(c);}mark(c,cfg,6);
     }
     size_t featureGlobal()const{return size_t(workRows)*(16u+MODEL_FF*(sparseRouting?2u:1u));}
+    void opticalMLP(VkCommandBuffer c,ResidentConfig cfg){
+        cfg.padding0=2u;
+        uint32_t tile=cfg.rows>1u?matrixBatchRows:1u,groups=(cfg.rows+tile-1u)/tile;
+        if(cfg.debug==4u)vkCmdWriteTimestamp(c,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,e.timestamps,1u);
+        for(uint32_t pass=0;pass<2u;pass++){
+            cfg.stage=pass;bindCompute(c,opticalMlp[pass][cfg.rows>1u?1u:0u],layerSets[cfg.layer]);
+            vkCmdPushConstants(c,layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(cfg),&cfg);
+            uint32_t stamp=startRT(c,2u);
+            vkCmdDispatch(c,(pass==0u?MODEL_FF:MODEL_D)/4u,groups,1u);sync(c);endRT(c,stamp);
+            if(cfg.debug==4u)vkCmdWriteTimestamp(c,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,e.timestamps,2u+pass);
+        }
+        featureTraceRows+=groups;featureReuseRows+=cfg.rows-groups;
+    }
     void routedMLP(VkCommandBuffer c,ResidentConfig cfg){
         vkCmdFillBuffer(c,featureWork->handle,0,size_t(cfg.rows)*(16u+MODEL_FF*(sparseRouting?2u:1u))*4u,0u);sync(c);
-        if(sparseRouting||!exactRT||cfg.index!=1u){cfg.stage=26;launch(c,math,cfg,sparseRouting?4u:1u,cfg.rows);}
-        // Frozen full-coverage geometry has the same receiver set for every
-        // finite chart direction. Reuse its RT receipts; energy is recomputed.
-        bool reuse=exactRT&&!sparseRouting&&cfg.index==1u&&(cacheEnabled||(wideCooperative&&cfg.rows>=8u));
-        cfg.stage=13;
-        if(reuse){VkDeviceSize stride=(16u+MODEL_FF)*4u,cacheOffset=cfg.layer*stride;
-            bool ready=featureCacheReady[cfg.layer];
-            if(!ready){auto first=cfg;first.rows=1u;launch(c,ray,first,((middle/featureTile)+31u)/32u,1u);featureTraceRows++;
-                VkBufferCopy saved{0,cacheOffset,stride};vkCmdCopyBuffer(c,featureWork->handle,featureCache->handle,1,&saved);sync(c);featureCacheReady[cfg.layer]=true;}
-            std::vector<VkBufferCopy> reused(cfg.rows);for(uint32_t r=0;r<cfg.rows;r++)reused[r]={cacheOffset,r*stride,stride};
-            vkCmdCopyBuffer(c,featureCache->handle,featureWork->handle,cfg.rows,reused.data());sync(c);featureReuseRows+=cfg.rows-uint32_t(!ready);
-        }else{launch(c,ray,cfg,((middle/featureTile)*(sparseRouting?4u:1u)+31u)/32u,cfg.rows);featureTraceRows+=cfg.rows;}
-        if(cfg.debug==4u)vkCmdWriteTimestamp(c,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,e.timestamps,1u);if(sparseRouting){cfg.stage=27;launch(c,math,cfg,1);
-        cfg.stage=28;cfg.padding0=1u;std::memcpy(&cfg.padding1,&routeAperture,4);bindCompute(c,math[28],layerSets[cfg.layer]);vkCmdPushConstants(c,layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(cfg),&cfg);
-        vkCmdDispatchIndirect(c,featureWork->handle,featureGlobal()*4u);sync(c);if(cfg.debug==4u)vkCmdWriteTimestamp(c,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,e.timestamps,2u);cfg.stage=29;bindCompute(c,math[29],layerSets[cfg.layer]);vkCmdPushConstants(c,layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(cfg),&cfg);vkCmdDispatchIndirect(c,featureWork->handle,(featureGlobal()+4u)*4u);sync(c);
-        }else{cfg.stage=28;launch(c,math,cfg,(middle+3u)/4u,cfg.rows);if(cfg.debug==4u)vkCmdWriteTimestamp(c,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,e.timestamps,2u);cfg.stage=33;launch(c,math,cfg,MODEL_D/4u,cfg.rows);}
+        if(!sparseRouting){opticalMLP(c,cfg);return;}
+        cfg.stage=26;launch(c,math,cfg,4u,cfg.rows);
+        cfg.stage=13;launch(c,ray,cfg,((middle/featureTile)*4u+31u)/32u,cfg.rows);featureTraceRows+=cfg.rows;
+        if(cfg.debug==4u)vkCmdWriteTimestamp(c,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,e.timestamps,1u);
+        cfg.stage=27;launch(c,math,cfg,1);
+        cfg.stage=28;cfg.padding0=1u;std::memcpy(&cfg.padding1,&routeAperture,4);
+        bindCompute(c,math[28],layerSets[cfg.layer]);vkCmdPushConstants(c,layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(cfg),&cfg);
+        vkCmdDispatchIndirect(c,featureWork->handle,featureGlobal()*4u);sync(c);
+        if(cfg.debug==4u)vkCmdWriteTimestamp(c,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,e.timestamps,2u);
+        cfg.stage=29;bindCompute(c,math[29],layerSets[cfg.layer]);vkCmdPushConstants(c,layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(cfg),&cfg);
+        vkCmdDispatchIndirect(c,featureWork->handle,(featureGlobal()+4u)*4u);sync(c);
         if(cfg.debug==4u)vkCmdWriteTimestamp(c,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,e.timestamps,3u);
-        if(sparseRouting){cfg.stage=32;launch(c,math,cfg,8,cfg.rows);}
+        cfg.stage=32;launch(c,math,cfg,8,cfg.rows);
     }
     void forward(VkCommandBuffer c,ResidentConfig cfg){cfg.stage=0;launch(c,math,cfg,cfg.rows);for(uint32_t l=0;l<depth;l++){cfg.layer=l;layer(c,cfg);}cfg.stage=1;cfg.index=2;launch(c,math,cfg,cfg.rows);}
     void wordMark(VkCommandBuffer c,ResidentConfig cfg,uint32_t at){if(cfg.debug==2u)vkCmdWriteTimestamp(c,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,e.timestamps,2u+cfg.step*(depth*7u+4u)+depth*7u+at);}
@@ -354,7 +373,18 @@ cfg.stage=6;launch(c,math,cfg,1,cfg.rows);
         bool capture=debug==1u,profile=debug==2u;
         if(debug>2u||!count||count>capacity)throw std::runtime_error("Invalid resident prefix");
         ensureReadback(capture?size_t(depth+1)*count*MODEL_D*4+1024:4*1024*1024);
-        if(capture&&audit->size<size_t(depth)*capacity*MODEL_D*4){e.release(audit);audit=e.buffer(size_t(depth)*capacity*MODEL_D*4,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_SRC_BIT);for(uint32_t l=0;l<depth;l++)bind(layerSets[l],false,l);bind(initialSet,true);}
+        if(capture){
+            captureRows=count;uint64_t auditBytes=uint64_t(depth)*count*MODEL_D*4u;
+            VkPhysicalDeviceProperties properties{};vkGetPhysicalDeviceProperties(e.physical,&properties);
+            if(auditBytes>properties.limits.maxStorageBufferRange)throw std::runtime_error("Layer capture exceeds the device storage-buffer range; use a shorter prefix");
+            if(audit->size<auditBytes){
+                e.release(audit);audit=e.buffer(auditBytes,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+                // Transfer detector bits to the capture buffer.
+                VkDescriptorBufferInfo info{audit->handle,0,audit->size};std::vector<VkWriteDescriptorSet> writes(depth+1u);
+                for(uint32_t l=0;l<=depth;l++){auto& w=writes[l];w={VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};w.dstSet=l==depth?initialSet:layerSets[l];w.dstBinding=31u;w.descriptorCount=1u;w.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;w.pBufferInfo=&info;}
+                vkUpdateDescriptorSets(e.device,uint32_t(writes.size()),writes.data(),0u,nullptr);
+            }
+        }
         std::vector<uint32_t> ids;input(ids,count);std::cin.read(reinterpret_cast<char*>(stops.data()),8);
         uint32_t boundary=count;std::map<uint32_t,uint32_t> boundaries;
         if(checkpointMode==1u){std::cin.read(reinterpret_cast<char*>(&boundary),4);boundaries[boundary]|=1u;}
@@ -402,7 +432,7 @@ cfg.stage=6;launch(c,math,cfg,1,cfg.rows);
         if(useCache){if(!addressHit)liveMarker.transfer(c,false);sync(c);}
         if(cacheEnabled&&!addressHit)capturePath(c,count,64u);
         vkCmdWriteTimestamp(c,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,e.timestamps,1);copy(c,control,32,0);size_t bytes=32;
-        if(capture){bytes+=size_t(count)*MODEL_D*4;for(uint32_t l=0;l<depth;l++){copy(c,audit,size_t(count)*MODEL_D*4,bytes,size_t(l)*capacity*MODEL_D*4);bytes+=size_t(count)*MODEL_D*4;}}
+        if(capture){bytes+=size_t(count)*MODEL_D*4;for(uint32_t l=0;l<depth;l++){copy(c,audit,size_t(count)*MODEL_D*4,bytes,size_t(l)*captureRows*MODEL_D*4);bytes+=size_t(count)*MODEL_D*4;}}
         if(cacheEnabled&&!addressHit)copy(c,opticalPath->addresses,sizeof(pathAddress),bytes,64u*sizeof(pathAddress));
         hostBarrier(c);check(vkEndCommandBuffer(c),"end resident prefill");auto time=e.measure(c,1);vkFreeCommandBuffers(e.device,e.pool,1,&c);absolutePosition=count;
         auto* stats=static_cast<uint32_t*>(readback->map);if(stats[3])throw std::runtime_error("Resident prefix optical error "+std::to_string(stats[3]));
@@ -594,8 +624,9 @@ cfg.stage=6;launch(c,math,cfg,1,cfg.rows);
     void resources(){uint64_t deviceBytes=0;for(auto& b:e.buffers)if(!b->map)deviceBytes+=b->allocationSize;
         std::vector<char> output;append(output,std::vector<uint64_t>{e.physicalAllocated,e.physicalDeviceAllocated,wordSceneBytes,words->vertices->size,uint64_t(wordTiles)*wordBlocks,wordTile,featureTile,replyTree?replyTree->sceneBytes:0u,liveMarker.bytes+(sharedHistory?sharedHistory->snapshotBytes():0u),parameters->size+matrices->size+basis->size,featureDown->size,deviceBytes,uint64_t(std::count_if(e.memoryPools.begin(),e.memoryPools.end(),[](const auto& p){return p.memory!=VK_NULL_HANDLE;})),keyGeometry->size,decoded->size,propagation->size,audit->size,partialDown->size,
             e.uploadStaging?e.uploadStaging->size:0u,readback->size,history->sceneBytes(),history->count,uint64_t(history->tops.size()),
-            words->scratchBytes()+lenses->scratchBytes()+scalars->scratchBytes()+(features?features->scratchBytes():0u),
-            hits->size,featureWork->size,workRows,uint64_t(detector==key),geometry->size+paths->size+baseChart->size,0u,sharedHistory?sharedHistory->snapshotBytes():0u,sharedHistory?sharedHistory->blockBytes():0u,sharedHistory?sharedHistory->directory.sceneBytes():0u,sharedHistory?sharedHistory->size():0u,sharedHistory?sharedHistory->evictions:0u});reply(output);
+            words->scratchBytes()+lenses->scratchBytes()+scalars->scratchBytes()+mlpSurfaces->scratchBytes()+(features?features->scratchBytes():0u),
+            hits->size,featureWork->size,workRows,uint64_t(detector==key),geometry->size+paths->size+baseChart->size,0u,sharedHistory?sharedHistory->snapshotBytes():0u,sharedHistory?sharedHistory->blockBytes():0u,sharedHistory?sharedHistory->directory.sceneBytes():0u,sharedHistory?sharedHistory->size():0u,sharedHistory?sharedHistory->evictions:0u,mlpSurfaces->sceneBytes(),mlpSurfaces->count});
+        reply(output);
     }
     void apertureUpdate(){float aperture;std::cin.read(reinterpret_cast<char*>(&aperture),4);if(!std::cin||!(aperture>0&&aperture<=2)||!sparseRouting)throw std::runtime_error("Sparse aperture update requires (0,2]");
         routeAperture=aperture;if(sharedHistory){sharedHistory->entries={};sharedHistory->previousInput.clear();sharedHistory->publish();}prefixReady=false;stableReady=false;cacheEpoch++;setup();auto c=e.command();begin(c);vkCmdResetQueryPool(c,e.timestamps,0,2);vkCmdWriteTimestamp(c,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,e.timestamps,0);
@@ -605,13 +636,40 @@ cfg.stage=6;launch(c,math,cfg,1,cfg.rows);
         std::vector<char> output;append(output,std::vector<double>{time.gpu,time.wall});reply(output);
     }
     void codecCheck(uint32_t count){if(!count||count%2||count>std::min(capacity,32u)*MODEL_D)throw std::runtime_error("Invalid coordinate codec input");std::vector<float> values;input(values,count);uint32_t initial[8]{0,0,1,0,0xffffffffu,0xffffffffu,0,0};e.upload(state,values.data(),count*4);e.upload(control,initial,32);setup();auto c=e.command();begin(c);ResidentConfig cfg{13,count,0,0,0,0,0,capacity,depth,0,0,0};launch(c,math,cfg,(count/2+127)/128);copy(c,detector,count*4,0);hostBarrier(c);check(vkEndCommandBuffer(c),"end resident coordinate codec check");e.submit(c);vkFreeCommandBuffers(e.device,e.pool,1,&c);std::vector<char> output(static_cast<char*>(readback->map),static_cast<char*>(readback->map)+count*4);reply(output);}
-    void mlpCheck(uint32_t count,uint32_t layer){if(!count||count>std::min(capacity,32u)||layer>=depth)throw std::runtime_error("Invalid optical MLP input");std::vector<float> values;input(values,size_t(count)*MODEL_D);uint32_t initial[8]{0,0,1,0,0xffffffffu,0xffffffffu,0,0};e.upload(normalized,values.data(),values.size()*4);e.upload(control,initial,32);setup();auto c=e.command();begin(c);vkCmdResetQueryPool(c,e.timestamps,0,5u);vkCmdWriteTimestamp(c,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,e.timestamps,0u);vkCmdFillBuffer(c,state->handle,0,size_t(count)*MODEL_D*4,0);sync(c);ResidentConfig cfg{2,count,layer,0,0,0,3,capacity,depth,4,0,0};vkCmdFillBuffer(c,feedForward->handle,0,size_t(count)*middle*4,0);sync(c);if(features)routedMLP(c,cfg);else{vkCmdWriteTimestamp(c,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,e.timestamps,1u);launch(c,math,cfg,middle/4,count);vkCmdWriteTimestamp(c,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,e.timestamps,2u);cfg.index=4;launch(c,math,cfg,MODEL_D/4u,count);vkCmdWriteTimestamp(c,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,e.timestamps,3u);}vkCmdWriteTimestamp(c,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,e.timestamps,4u);copy(c,state,size_t(count)*MODEL_D*4,0);for(uint32_t r=0;r<count;r++)copy(c,feedForward,size_t(middle)*4,size_t(count)*MODEL_D*4+size_t(r)*middle*4,size_t(r)*MODEL_W*4);if(features)for(uint32_t r=0;r<count;r++)copy(c,featureWork,4,size_t(count)*(MODEL_D+middle)*4+r*4,size_t(r)*(16u+middle*(sparseRouting?2u:1u))*4);hostBarrier(c);check(vkEndCommandBuffer(c),"end optical MLP check");e.submit(c);uint64_t times[5];check(vkGetQueryPoolResults(e.device,e.timestamps,0u,5u,sizeof(times),times,8u,VK_QUERY_RESULT_64_BIT),"MLP profile");vkFreeCommandBuffers(e.device,e.pool,1,&c);size_t bytes=size_t(count)*(MODEL_D+middle)*4;if(!features)for(uint32_t r=0;r<count;r++)static_cast<uint32_t*>(readback->map)[bytes/4+r]=middle;bytes+=count*4;std::vector<char> output(static_cast<char*>(readback->map),static_cast<char*>(readback->map)+bytes);if(features&&!sparseRouting)append(output,std::vector<double>{double(times[1]-times[0])*e.period/1e6,double(times[2]-times[1])*e.period/1e6,double(times[3]-times[2])*e.period/1e6});reply(output);}
+    void mlpCheck(uint32_t count,uint32_t layer){
+        if(!count||count>std::min({capacity,workRows,32u})||layer>=depth)throw std::runtime_error("Invalid optical MLP input");
+        std::vector<float> values;input(values,size_t(count)*MODEL_D);
+        if(!std::all_of(values.begin(),values.end(),[](float x){return std::isfinite(x);}))throw std::runtime_error("Optical MLP input must be finite");
+        size_t bytes=size_t(count)*(MODEL_D+middle)*4u+count*4u;
+        ensureReadback(bytes+4u);
+        uint32_t initial[8]{0,0,1,0,0xffffffffu,0xffffffffu,0,0};
+        e.upload(normalized,values.data(),values.size()*4u);e.upload(control,initial,32);setup();
+        auto c=e.command();begin(c);vkCmdResetQueryPool(c,e.timestamps,0,5u);
+        vkCmdWriteTimestamp(c,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,e.timestamps,0u);
+        vkCmdFillBuffer(c,state->handle,0,size_t(count)*MODEL_D*4u,0u);sync(c);
+        ResidentConfig cfg{2,count,layer,0,0,0,3,capacity,depth,4,0,0};routedMLP(c,cfg);
+        vkCmdWriteTimestamp(c,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,e.timestamps,4u);
+        copy(c,state,size_t(count)*MODEL_D*4u,0);
+        for(uint32_t r=0;r<count;r++){
+            copy(c,feedForward,size_t(middle)*4u,size_t(count)*MODEL_D*4u+size_t(r)*middle*4u,size_t(r)*MODEL_W*4u);
+            copy(c,featureWork,4u,size_t(count)*(MODEL_D+middle)*4u+r*4u,size_t(r)*(16u+middle*(sparseRouting?2u:1u))*4u);
+        }
+        copy(c,control,4u,bytes,12u);hostBarrier(c);
+        check(vkEndCommandBuffer(c),"end optical MLP check");e.submit(c);
+        uint64_t times[5];check(vkGetQueryPoolResults(e.device,e.timestamps,0u,5u,sizeof(times),times,8u,VK_QUERY_RESULT_64_BIT),"MLP profile");
+        vkFreeCommandBuffers(e.device,e.pool,1,&c);
+        uint32_t error=static_cast<uint32_t*>(readback->map)[bytes/4u];
+        if(error)throw std::runtime_error("RT MLP transmission error "+std::to_string(error));
+        std::vector<char> output(static_cast<char*>(readback->map),static_cast<char*>(readback->map)+bytes);
+        if(!sparseRouting)append(output,std::vector<double>{double(times[1]-times[0])*e.period/1e6,double(times[2]-times[1])*e.period/1e6,double(times[3]-times[2])*e.period/1e6});
+        reply(output);
+    }
     ~Resident(){
         vkDeviceWaitIdle(e.device);if(rtTimestamps)vkDestroyQueryPool(e.device,rtTimestamps,nullptr);
         std::set<VkPipeline> handles;auto add=[&](const auto& pipes){for(auto p:pipes)if(p)handles.insert(p);};
-        add(math);add(ray);add(mlpBatch);add(ownedCooperative);
-        for(auto& pair:matrixProjection)add(pair);for(auto& pair:quantDown)add(pair);for(auto& pair:quantOutput)add(pair);
-        for(auto& pair:outputPipelines)add(pair);for(auto& pair:gatePipelines)add(pair);
+        add(math);add(ray);add(ownedCooperative);for(auto& pair:opticalMlp)add(pair);
+        for(auto& pair:matrixProjection)add(pair);for(auto& pair:quantOutput)add(pair);
+        for(auto& pair:outputPipelines)add(pair);
         for(auto p:{matrixPack,matrixAttention,fastState})if(p)handles.insert(p);
         for(auto p:handles)vkDestroyPipeline(e.device,p,nullptr);
         vkDestroyDescriptorPool(e.device,descriptorPool,nullptr);vkDestroyPipelineLayout(e.device,layout,nullptr);vkDestroyDescriptorSetLayout(e.device,setLayout,nullptr);

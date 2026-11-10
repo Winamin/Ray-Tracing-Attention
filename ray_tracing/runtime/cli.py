@@ -145,11 +145,11 @@ class Console:
                     f"设备分配 {mib(report['resources']['device_allocation_bytes'])} · "
                     f"本轮增量 {mib(report['device_growth_bytes'])}"]
         if report.get('rt_query_gpu_ms') is not None:
-            rows.append(f"RT 查询 GPU {report['rt_query_gpu_ms']:.3f} ms · 查询占时 "
+            rows.append(f"RT 阶段 GPU {report['rt_query_gpu_ms']:.3f} ms · 阶段占时 "
                         f"{report['rt_query_gpu_ms']/report['generation_gpu_ms']*100:.2f}%")
         if 'mlp_route_cached_rows' in report['rt']:
-            rows.append(f"MLP 层求交结果：缓存复用 {report['rt']['mlp_route_cached_rows']:,} 次 · "
-                        f"新计算 {report['rt']['mlp_route_rt_rows']:,} 次")
+            rows.append(f"MLP 固定表面回执：同批共享 {report['rt']['mlp_route_cached_rows']:,} 行 · "
+                        f"RT 查询组 {report['rt']['mlp_route_rt_rows']:,} 组")
         if (cache := report.get('cache')) and cache['capacity']:
             rows.append(f"光路缓存 {cache['nodes']:,}/{cache['capacity']:,} 节点 · 命中后每 token 一条查询光线")
             if cache['state_recovery_tokens'] or cache['checkpoint_restores']:
@@ -434,6 +434,7 @@ class ChatSession:
             rows.append("GPU 传感器：" + data["gpu"].get("reason", "无数据"))
         r = self.resources
         rows.extend([f"RT 状态：{'硬件查询 + 命中回执' if self.native.metadata['routing'] == 'rt_full' else self.native.metadata['routing']}",
+                     f"MLP：RT Core 系数块求交 + 平衡探测 + Sigmoid 透射 · 同批共享 {self.native.metadata['mlp_token_tile']} token",
                      f"Prefill 并行位置 {self.native.metadata['prefill_batch']} · 权重共享 {self.native.metadata['matrix_token_tile']} token",
                      f"历史 BVH {r['history_blas_count']} BLAS / {r['history_tlas_count']} TLAS · "
                      f"词表查询 {r['word_rays']:,} 条 · 每块词 / 特征 {r['word_tile']}/{r['feature_tile']}",

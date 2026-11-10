@@ -2,8 +2,8 @@
 #include "optical_geometry.hpp"
 
 // All block planes form one native BLAS. One root instance connects its TLAS.
-// The driver owns the BVH topology; shaders write only the plane bounds.
-class VocabularyGeometry {
+// The driver owns the BVH topology; the caller supplies fixed plane bounds.
+class ImmutableBlockGeometry {
 public:
     Engine& e;
     uint32_t count;
@@ -13,9 +13,9 @@ public:
     VkAccelerationStructureGeometryKHR geometry{};
     bool built=false;
 
-    VocabularyGeometry(Engine& engine,uint32_t vocabulary,uint32_t blocks):e(engine) {
-        uint64_t total=uint64_t(vocabulary)*blocks;
-        if(!total||total>0xffffffffu)throw std::runtime_error("Vocabulary block primitive address range exceeded");
+    ImmutableBlockGeometry(Engine& engine,uint32_t receivers,uint32_t blocks):e(engine) {
+        uint64_t total=uint64_t(receivers)*blocks;
+        if(!total||total>0xffffffffu)throw std::runtime_error("Block surface primitive address range exceeded");
         count=uint32_t(total);
         const auto usage=VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_SRC_BIT|
             VK_BUFFER_USAGE_TRANSFER_DST_BIT|VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT|
@@ -37,7 +37,7 @@ public:
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
         VkAccelerationStructureCreateInfoKHR create{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR};
         create.type=info.type;create.buffer=plane.storage->handle;create.size=plane.storage->size;
-        check(e.createAS(e.device,&create,nullptr,&plane.handle),"create block vocabulary BLAS");
+        check(e.createAS(e.device,&create,nullptr,&plane.handle),"create immutable block BLAS");
         VkAccelerationStructureDeviceAddressInfoKHR address{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR};
         address.accelerationStructure=plane.handle;
         VkAccelerationStructureInstanceKHR instance{};
@@ -56,11 +56,11 @@ public:
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
         create.type=info.type;create.buffer=storage->handle;create.size=storage->size;
         VkAccelerationStructureKHR top{};
-        check(e.createAS(e.device,&create,nullptr,&top),"create block vocabulary TLAS");tops.push_back(top);
+        check(e.createAS(e.device,&create,nullptr,&top),"create immutable block TLAS");tops.push_back(top);
     }
 
     void build(VkCommandBuffer c,uint32_t active,bool initial=true) {
-        if(built||!initial||active!=count)throw std::runtime_error("Vocabulary geometry is an immutable compiled field");
+        if(built||!initial||active!=count)throw std::runtime_error("Block geometry is an immutable compiled field");
         Engine::barrier(c,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
             VK_ACCESS_SHADER_WRITE_BIT,VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
         VkAccelerationStructureBuildGeometryInfoKHR info{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
@@ -84,7 +84,7 @@ public:
     uint64_t scratchBytes()const{return (scratch?scratch->allocationSize:0u)+(plane.scratch?plane.scratch->allocationSize:0u);}
     uint64_t sceneBytes()const{return vertices->size+instances->size+storage->size+plane.storage->size+scratchBytes();}
     void releaseScratch(){e.release(scratch);e.release(plane.scratch);}
-    ~VocabularyGeometry(){
+    ~ImmutableBlockGeometry(){
         if(!e.device)return;vkDeviceWaitIdle(e.device);
         for(auto top:tops)e.destroyAS(e.device,top,nullptr);
         e.destroyAS(e.device,plane.handle,nullptr);
@@ -92,3 +92,5 @@ public:
         e.release(instances);e.release(vertices);
     }
 };
+
+using VocabularyGeometry=ImmutableBlockGeometry;

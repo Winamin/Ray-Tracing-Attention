@@ -14,7 +14,7 @@ public:
     std::vector<Buffer*> topScratch;std::vector<VkAccelerationStructureGeometryKHR> topGeometry;
     std::vector<Buffer*> topStorage;
     std::vector<VkAccelerationStructureInstanceKHR> hostInstances;
-    ShapeMesh(Engine& engine,uint32_t n,uint32_t verts,uint32_t groupCount,bool translated=false):e(engine),count(n),perInstance(verts),groups(groupCount) {
+    ShapeMesh(Engine& engine,uint32_t n,uint32_t verts,uint32_t groupCount,bool translated=false,bool deferBuild=false):e(engine),count(n),perInstance(verts),groups(groupCount) {
         auto usage=VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT|VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT|VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
         vertices=e.buffer(size_t(count)*perInstance*12,usage);std::vector<float> blank(size_t(count)*perInstance*3);
         if(translated)for(uint32_t i=0;i<count;i++)for(uint32_t p=0;p<perInstance/3;p++){
@@ -41,7 +41,7 @@ public:
             VkAccelerationStructureBuildSizesInfoKHR sizes{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};e.getSizes(e.device,VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,&bi,&primitives,&sizes);auto* storage=e.buffer(sizes.accelerationStructureSize,VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR);topScratch.push_back(e.buffer(std::max(sizes.buildScratchSize,sizes.updateScratchSize)+e.alignment,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT));
             topStorage.push_back(storage);VkAccelerationStructureCreateInfoKHR ci{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR};ci.type=bi.type;ci.buffer=storage->handle;ci.size=storage->size;VkAccelerationStructureKHR top{};check(e.createAS(e.device,&ci,nullptr,&top),"create optical shape TLAS");tops.push_back(top);
         }
-        auto c=e.command();e.begin(c);build(c,count,true);check(vkEndCommandBuffer(c),"end optical shape initialization");e.submit(c);vkFreeCommandBuffers(e.device,e.pool,1,&c);
+        if(!deferBuild){auto c=e.command();e.begin(c);build(c,count,true);check(vkEndCommandBuffer(c),"end optical shape initialization");e.submit(c);vkFreeCommandBuffers(e.device,e.pool,1,&c);}
     }
     void build(VkCommandBuffer command,uint32_t active,bool initial=false,bool onlyTop=false,uint32_t first=0,uint32_t topGroup=~0u) {
         std::vector<VkAccelerationStructureBuildGeometryInfoKHR> infos;std::vector<VkAccelerationStructureBuildRangeInfoKHR> ranges;

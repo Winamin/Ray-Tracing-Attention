@@ -1,0 +1,103 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#include "resident_common.glsl"
+
+layout(set=0,binding=39) uniform accelerationStructureEXT mlpAS;
+layout(constant_id=1) const uint tokenRows=1u;
+const uint SURFACE_BLOCKS=max(D,FEATURE_WIDTH)/256u;
+const uint RECEIPT_WORDS=(SURFACE_BLOCKS+31u)/32u;
+
+// Equations (56)-(58): nonnegative emission and transmission, followed by
+// balanced detection. Balance each coordinate before FP32 accumulation to
+// avoid subtracting two large detector totals. Power-of-two amplification
+// cancels exactly; M=32 for ordinary model weights, raised for larger weights.
+struct TransmissionMaterial {vec4 weight;vec4 transmission;float enhancement;};
+TransmissionMaterial material(vec4 weight) {
+    float largest=subgroupMax(max(32.0,max(max(abs(weight.x),abs(weight.y)),max(abs(weight.z),abs(weight.w)))));
+    float enhancement=exp2(ceil(log2(largest)));
+    if(enhancement<largest)enhancement*=2.0;
+    return TransmissionMaterial(weight,abs(weight)/enhancement,enhancement);
+}
+vec4 balancedTransmission(vec4 inputSignal,TransmissionMaterial surface) {
+    precise vec4 emission=surface.enhancement*abs(inputSignal);
+    precise vec4 energy=emission*surface.transmission;
+    bvec4 sameSign=equal(lessThan(inputSignal,vec4(0)),lessThan(surface.weight,vec4(0)));
+    vec4 positive=mix(vec4(0),energy,sameSign);
+    vec4 negative=mix(energy,vec4(0),sameSign);
+    return positive-negative;
+}
+
+vec4 inputCoordinates(uint row,uint first) {
+    if(operation==0u)return vec4(normalized[row*D+first],normalized[row*D+first+1u],normalized[row*D+first+2u],normalized[row*D+first+3u]);
+    return vec4(feedForward[row*W+first],feedForward[row*W+first+1u],feedForward[row*W+first+2u],feedForward[row*W+first+3u]);
+}
+
+void main() {
+    if(stopped())return;
+    uint lane=gl_SubgroupInvocationID,channel=gl_WorkGroupID.x*4u+gl_SubgroupID;
+    uint firstRow=gl_WorkGroupID.y*tokenRows,width=operation==0u?FEATURE_WIDTH:D;
+    if(channel>=width||firstRow>=cfg.rows)return;
+    uint receiver=operation==0u?channel:FEATURE_WIDTH+channel;
+    uint columns=operation==0u?D:FEATURE_WIDTH,blocks=columns/256u;
+    uint receipts[RECEIPT_WORDS];
+    for(uint i=0u;i<RECEIPT_WORDS;i++)receipts[i]=0u;
+    uint count=0u,invalid=0u;
+    // RT Core traverses the actual fixed material field. One subgroup query
+    // supplies immutable receiver/block receipts to its parallel detectors.
+    if(lane==0u) {
+        vec2 center=2.0*vec2(receiver%256u,receiver/256u);
+        rayQueryEXT ray;
+        rayQueryInitializeEXT(ray,mlpAS,gl_RayFlagsNoneEXT,255u,vec3(center,0),.00001,vec3(0,0,1),float(blocks)+.5);
+        while(rayQueryProceedEXT(ray)) {
+            if(rayQueryGetIntersectionTypeEXT(ray,false)!=gl_RayQueryCandidateIntersectionAABBEXT)continue;
+            uint primitive=rayQueryGetIntersectionPrimitiveIndexEXT(ray,false);
+            uint owner=primitive/SURFACE_BLOCKS,block=primitive%SURFACE_BLOCKS;
+            if(rayQueryGetIntersectionInstanceCustomIndexEXT(ray,false)!=0u||owner!=receiver||block>=blocks){invalid=1u;continue;}
+            uint bit=1u<<(block%32u),word=block/32u;
+            if((receipts[word]&bit)==0u){receipts[word]|=bit;count++;}
+        }
+        if(count!=blocks||invalid!=0u)atomicOr(control[3],4096u);
+    }
+    count=subgroupBroadcast(count,0u);invalid=subgroupBroadcast(invalid,0u);
+    if(count!=blocks||invalid!=0u)return;
+    for(uint i=0u;i<RECEIPT_WORDS;i++)receipts[i]=subgroupBroadcast(receipts[i],0u);
+    precise vec4 low[tokenRows],high[tokenRows],upLow[tokenRows],upHigh[tokenRows];
+    for(uint r=0u;r<tokenRows;r++){low[r]=vec4(0);high[r]=vec4(0);upLow[r]=vec4(0);upHigh[r]=vec4(0);}
+    uint base=blockBase(),weight=parameters[base+(operation==0u?15u:17u)],format=parameters[base+(operation==0u?16u:18u)];
+    // Consume receipts in coordinate order, independent of BVH visit order.
+    for(uint block=0u;block<blocks;block++) {
+        if((receipts[block/32u]&(1u<<(block%32u)))==0u)continue;
+        QuantizedOctet transfer=quantizedOctet(0u,weight,format,channel,columns,block,lane);
+        TransmissionMaterial first=material(transfer.low),second=material(transfer.high);
+        QuantizedOctet up;
+        TransmissionMaterial upFirst,upSecond;
+        if(operation==0u){up=quantizedOctet(0u,parameters[base+19u],parameters[base+20u],channel,D,block,lane);upFirst=material(up.low);upSecond=material(up.high);}
+        for(uint r=0u;r<tokenRows;r++)if(firstRow+r<cfg.rows) {
+            low[r]+=balancedTransmission(inputCoordinates(firstRow+r,transfer.axis.x),first);
+            high[r]+=balancedTransmission(inputCoordinates(firstRow+r,transfer.axis.y),second);
+            if(operation==0u) {
+                // Gate and up can use different packed formats and axis layouts.
+                upLow[r]+=balancedTransmission(inputCoordinates(firstRow+r,up.axis.x),upFirst);
+                upHigh[r]+=balancedTransmission(inputCoordinates(firstRow+r,up.axis.y),upSecond);
+            }
+        }
+    }
+    for(uint r=0u;r<tokenRows;r++)if(firstRow+r<cfg.rows) {
+        float signal=subgroupAdd(dot(low[r]+high[r],vec4(1)));
+        float upSignal=subgroupAdd(dot(upLow[r]+upHigh[r],vec4(1)));
+        if(lane==0u) {
+            uint row=firstRow+r;
+            if(operation==0u) {
+                // Equations (59)-(61): A=|g||u| sigma(g), a=sgn(g)sgn(u) A.
+                float amplitude=abs(signal)*abs(upSignal)*detectorSigmoid(signal);
+                feedForward[row*W+channel]=sign(signal)*sign(upSignal)*amplitude;
+                atomicAdd(featureWork[featureBase(row)],1u);
+                atomicAdd(featureWork[featureGlobal()+8u],1u);
+                atomicAdd(featureWork[featureGlobal()+9u],1u);
+            }else state[row*D+channel]+=signal;
+        }
+    }
+}
