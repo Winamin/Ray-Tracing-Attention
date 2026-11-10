@@ -57,7 +57,6 @@ QuantizedOctet quantizedOctet(uint kind,uint offset,uint metadata,uint row,uint 
     else if(mode==3u)row=(row/RT_ATTENTION_HEAD_DIM)*RT_ATTENTION_HEAD_DIM+originalRotaryAxis(row%RT_ATTENTION_HEAD_DIM);
     else if(mode==5u)row=row%(RT_STATE_KEY_HEADS*128u);
     uint at=offset*4u+(row*(cols/256u)+block)*(type==12u?144u:210u);
-    const uvec4 shifts=uvec4(0u,8u,16u,24u);
     if(type==12u){
         vec2 header=unpackHalf2x16(coefficientWord(kind,at));
         // Decode both scale/minimum pairs from the same three packed words.
@@ -68,18 +67,28 @@ QuantizedOctet quantizedOctet(uint kind,uint offset,uint metadata,uint row,uint 
         uvec2 extra=(uvec2(coefficientWord(kind,at+12u))>>shift)&255u;
         sc=mix(sc&63u,(extra&15u)|((sc>>6u)<<4u),bvec2(group>=4u));
         mn=mix(mn&63u,(extra>>4u)|((mn>>6u)<<4u),bvec2(group>=4u));
-        uvec4 packed=(uvec4(coefficientWord(kind,at+16u+(first/64u)*32u+first%32u))>>shifts);
-        result.low=(header.x*float(sc.x))*vec4(packed&15u)-(header.y*float(mn.x));
-        result.high=(header.x*float(sc.y))*vec4((packed>>4u)&15u)-(header.y*float(mn.y));
+        uint packed=coefficientWord(kind,at+16u+(first/64u)*32u+first%32u);
+        vec4 qLow=vec4(bitfieldExtract(packed,0,4),bitfieldExtract(packed,8,4),bitfieldExtract(packed,16,4),bitfieldExtract(packed,24,4));
+        vec4 qHigh=vec4(bitfieldExtract(packed,4,4),bitfieldExtract(packed,12,4),bitfieldExtract(packed,20,4),bitfieldExtract(packed,28,4));
+        result.low=(header.x*float(sc.x))*qLow-(header.y*float(mn.x));
+        result.high=(header.x*float(sc.y))*qHigh-(header.y*float(mn.y));
     }else{
         uint local=first%128u,part=first/128u;
-        uvec4 low=uvec4(coefficientWord(kind,at+part*64u+local))>>shifts;
-        uvec4 high=uvec4(coefficientWord(kind,at+128u+part*32u+local%32u))>>shifts;
+        uint low=coefficientWord(kind,at+part*64u+local);
+        uint high=coefficientWord(kind,at+128u+part*32u+local%32u);
         uint shift=(local/32u)*2u;
         int s0=bitfieldExtract(int(coefficientByte(kind,at+192u+first/16u)),0,8),s1=bitfieldExtract(int(coefficientByte(kind,at+192u+second/16u)),0,8);
         float scale=coefficientHalf(kind,at+208u);
-        result.low=(scale*float(s0))*vec4(ivec4((low&15u)|(((high>>shift)&3u)<<4u))-32);
-        result.high=(scale*float(s1))*vec4(ivec4(((low>>4u)&15u)|(((high>>(shift+4u))&3u)<<4u))-32);
+        // Merge four Q6 coefficients while they are still packed, following the
+        // word masks in llama.cpp's Vulkan Q6_K matvec. Decode each byte once.
+        uint packedLow=(low&0x0f0f0f0fu)|(((high>>shift)&0x03030303u)<<4u);
+        uint packedHigh=((low>>4u)&0x0f0f0f0fu)|(((high>>(shift+4u))&0x03030303u)<<4u);
+        // Flipping the sign bit makes signed six-bit extraction return q-32.
+        int centeredLow=int(packedLow^0x20202020u),centeredHigh=int(packedHigh^0x20202020u);
+        vec4 qLow=vec4(bitfieldExtract(centeredLow,0,6),bitfieldExtract(centeredLow,8,6),bitfieldExtract(centeredLow,16,6),bitfieldExtract(centeredLow,24,6));
+        vec4 qHigh=vec4(bitfieldExtract(centeredHigh,0,6),bitfieldExtract(centeredHigh,8,6),bitfieldExtract(centeredHigh,16,6),bitfieldExtract(centeredHigh,24,6));
+        result.low=(scale*float(s0))*qLow;
+        result.high=(scale*float(s1))*qHigh;
     }
     return result;
 }

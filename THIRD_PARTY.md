@@ -14,6 +14,10 @@ The system supplies the Vulkan loader, shader compiler and C++ compiler. Local m
 
 The tiled quantized matrix, online attention reduction and clustered recurrent state kernels adapt algorithms from [llama.cpp](https://github.com/ggml-org/llama.cpp).
 
+The quantized matvec input aliases and packed coefficient decoding follow its
+[Vulkan matvec](https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec.comp) and
+[Q6_K word masks](https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q6_k.comp).
+
 MIT License
 
 Copyright (c) 2023-2026 The ggml authors

@@ -10,6 +10,16 @@ const uint matrixUnroll=matrixRows==1u?4u:1u;
 shared float strongestSignals[128];
 shared uint strongestTokens[128];
 #include "resident_history_quant.glsl"
+// Aligned vector input loads follow llama.cpp's Vulkan quantized matvec.
+// These aliases use the existing descriptors and keep the scalar storage layout.
+layout(std430,binding=9) readonly buffer NormalizedVectors {vec4 normalized4[];};
+layout(std430,binding=20) readonly buffer DetectorVectors {vec4 detector4[];};
+layout(std430,binding=27) readonly buffer FeedForwardVectors {vec4 feedForward4[];};
+vec4 projectionVector(uint kind,uint row,uint axis){
+    if(kind==2u)return detector4[(row*A+axis)/4u];
+    if(kind==4u)return feedForward4[(row*W+axis)/4u];
+    return normalized4[(row*D+axis)/4u];
+}
 const vec2 corners[6]=vec2[6](vec2(-1,-1),vec2(-1,1),vec2(1,1),vec2(-1,-1),vec2(1,1),vec2(1,-1));
 void main(){
     if(stopped())return;
@@ -42,13 +52,10 @@ return;}
         for(uint block=0u;block<cols/256u;block++){
             QuantizedOctet transfer=quantizedOctet(0u,weight,metadata,coefficientChannel,cols,block,thread),up;
             if(matrixIndex==3u)up=quantizedOctet(0u,parameters[base+19u],parameters[base+20u],channel,cols,block,thread);
-            [[unroll]] for(uint r=0u;r<matrixRows;r++)if(row+r<cfg.rows)[[unroll]] for(uint i=0u;i<4u;i++){
-                uint a=(row+r)*(matrixIndex==2u?A:D)+transfer.axis.x+i,b=(row+r)*(matrixIndex==2u?A:D)+transfer.axis.y+i;float x,y;
-                if(matrixIndex==2u){x=detector[a];y=detector[b];}
-                else if(matrixIndex==4u){x=feedForward[(row+r)*W+transfer.axis.x+i];y=feedForward[(row+r)*W+transfer.axis.y+i];}
-                else{x=normalized[a];y=normalized[b];}
-                received[r*2u][i]+=x*transfer.low[i];received[r*2u+1u][i]+=y*transfer.high[i];
-                if(matrixIndex==3u){upReceived[r*2u][i]+=x*up.low[i];upReceived[r*2u+1u][i]+=y*up.high[i];}
+            [[unroll]] for(uint r=0u;r<matrixRows;r++)if(row+r<cfg.rows){
+                vec4 x=projectionVector(matrixIndex,row+r,transfer.axis.x),y=projectionVector(matrixIndex,row+r,transfer.axis.y);
+                received[r*2u]+=x*transfer.low;received[r*2u+1u]+=y*transfer.high;
+                if(matrixIndex==3u){upReceived[r*2u]+=x*up.low;upReceived[r*2u+1u]+=y*up.high;}
             }
         }
         [[unroll]] for(uint r=0u;r<matrixRows;r++){if(row+r>=cfg.rows)continue;
@@ -156,9 +163,9 @@ return;}
         [[unroll]] for(uint r=0u;r<matrixRows;r++){low[r]=vec4(0);high[r]=vec4(0);upLow[r]=vec4(0);upHigh[r]=vec4(0);}
         for(uint block=0u;block<D/256u;block++){
             QuantizedOctet gate=quantizedOctet(0u,parameters[base+15u],parameters[base+16u],feature,D,block,c),up=quantizedOctet(0u,parameters[base+19u],parameters[base+20u],feature,D,block,c);
-            [[unroll]] for(uint r=0u;r<matrixRows;r++)if(row+r<cfg.rows)[[unroll]] for(uint i=0u;i<4u;i++){
-                float x=normalized[(row+r)*D+gate.axis.x+i],y=normalized[(row+r)*D+gate.axis.y+i];
-                low[r][i]+=x*gate.low[i];high[r][i]+=y*gate.high[i];upLow[r][i]+=x*up.low[i];upHigh[r][i]+=y*up.high[i];}}
+            [[unroll]] for(uint r=0u;r<matrixRows;r++)if(row+r<cfg.rows){
+                vec4 x=normalized4[((row+r)*D+gate.axis.x)/4u],y=normalized4[((row+r)*D+gate.axis.y)/4u];
+                low[r]+=x*gate.low;high[r]+=y*gate.high;upLow[r]+=x*up.low;upHigh[r]+=y*up.high;}}
         [[unroll]] for(uint r=0u;r<matrixRows;r++)if(row+r<cfg.rows){float gate=subgroupAdd(dot(low[r]+high[r],vec4(1))),up=subgroupAdd(dot(upLow[r]+upHigh[r],vec4(1)));
             if(c==0u)feedForward[(row+r)*W+feature]=sign(gate)*sign(up)*abs(gate)*abs(up)*detectorSigmoid(gate);}return;
     }
@@ -183,9 +190,11 @@ return;}
         vec4 low[matrixRows],high[matrixRows];[[unroll]] for(uint r=0u;r<matrixRows;r++){low[r]=vec4(0);high[r]=vec4(0);}
         for(uint block=0u;block<FEATURE_WIDTH/256u;block++){
             QuantizedOctet transfer=quantizedOctet(0u,parameters[base+17u],parameters[base+18u],channel,FEATURE_WIDTH,block,c);
-            [[unroll]] for(uint i=0u;i<4u;i++){
-                uint f0=featureWork[at+featureQueueOffset()+transfer.axis.x+i],f1=featureWork[at+featureQueueOffset()+transfer.axis.y+i];
-                [[unroll]] for(uint r=0u;r<matrixRows;r++)if(row+r<cfg.rows){low[r][i]+=feedForward[(row+r)*W+f0]*transfer.low[i];high[r][i]+=feedForward[(row+r)*W+f1]*transfer.high[i];}}}
+            // Full-coverage RT writes each receiver ID into its matching slot.
+            uint f0=featureWork[at+featureQueueOffset()+transfer.axis.x],f1=featureWork[at+featureQueueOffset()+transfer.axis.y];
+            [[unroll]] for(uint r=0u;r<matrixRows;r++)if(row+r<cfg.rows){
+                low[r]+=feedForward4[((row+r)*W+f0)/4u]*transfer.low;
+                high[r]+=feedForward4[((row+r)*W+f1)/4u]*transfer.high;}}
         [[unroll]] for(uint r=0u;r<matrixRows;r++)if(row+r<cfg.rows){float signal=subgroupAdd(dot(low[r]+high[r],vec4(1)));if(c==0u)state[(row+r)*D+channel]+=signal;}return;
     }
 
