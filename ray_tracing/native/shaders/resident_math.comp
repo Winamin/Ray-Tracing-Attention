@@ -68,7 +68,8 @@ return;}
                 else if(matrixIndex==8u){uint target=full?(channel/RT_ATTENTION_HEAD_DIM)*(RT_QUERY_WIDTH/RT_GQA_WIDTH)*RT_ATTENTION_HEAD_DIM+channel%RT_ATTENTION_HEAD_DIM:channel;
                     for(uint copy=0u;copy<(full?RT_QUERY_WIDTH/RT_GQA_WIDTH:1u);copy++)feedForward[(row+r)*W+currentWidth+target+copy*RT_ATTENTION_HEAD_DIM]=signal;}
                 else if(matrixIndex==2u||matrixIndex==4u)state[at]+=signal;
-                else{float amplitude=abs(signal)*abs(upSignal)*detectorSigmoid(signal);feedForward[(row+r)*W+channel]=sign(signal)*sign(upSignal)*amplitude;}}
+                else{float amplitude=abs(signal)*abs(upSignal)*detectorSigmoid(signal);feedForward[(row+r)*W+channel]=sign(signal)*sign(upSignal)*amplitude;
+                    if(channel==0u){featureWork[featureBase(row+r)]=FEATURE_WIDTH;atomicAdd(featureWork[featureGlobal()+8u],FEATURE_WIDTH);atomicAdd(featureWork[featureGlobal()+9u],FEATURE_WIDTH);}}}
 
         }
         return;}

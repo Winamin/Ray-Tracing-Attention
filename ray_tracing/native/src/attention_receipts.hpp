@@ -1,7 +1,7 @@
 #pragma once
 
 inline uint32_t attentionBackendCode(const char* name){
-    std::string value=name?name:"grouped_rt";
+    std::string value=name?name:"standard";
     if(value=="standard")return 0u;
     if(value=="standard_fp32")return 1u;
     if(value=="grouped_rt")return 2u;

@@ -8,7 +8,7 @@ import tempfile
 import numpy as np
 
 class ResidentRuntime:
-    def __init__(self,asset,capacity=300,cache=True,routing="rt_full",aperture=.08,word_tile=32,feature_tile=8,readout_unroll=1,readout_words=4,prefill_batch=512,matrix_rows=8,attention_backend="grouped_rt",attention_block=128,attention_stats=False):
+    def __init__(self,asset,capacity=300,cache=True,routing="rt_full",aperture=.08,word_tile=32,feature_tile=8,readout_unroll=1,readout_words=4,prefill_batch=512,matrix_rows=8,attention_backend="standard",attention_block=128,attention_stats=False,mlp_backend="standard"):
         asset=Path(asset).resolve()
         from ..compiler.partition import ensure_partition
         self.partition=ensure_partition(asset.parent)
@@ -19,6 +19,8 @@ class ResidentRuntime:
         self.model_spec=spec
         if attention_backend not in ('standard','standard_fp32','grouped_rt','grouped_rt_dense'):
             raise ValueError('Attention backend must be standard, standard_fp32, grouped_rt or grouped_rt_dense')
+        if mlp_backend not in ('standard','rt_transmission'):
+            raise ValueError('MLP backend must be standard or rt_transmission')
         if attention_block not in (128,256,512):raise ValueError('Attention block must be 128, 256 or 512')
         self.hidden_size=spec.hidden_size
         self.vocabulary_size=spec.vocabulary_size
@@ -33,13 +35,14 @@ class ResidentRuntime:
         worker=build(spec)
         native=worker.parent
         options={'creationflags':subprocess.CREATE_NO_WINDOW} if os.name=='nt' else {}
-        options['env']=dict(os.environ,RT_ATTENTION_BACKEND=attention_backend,RT_ATTENTION_BLOCK=str(attention_block),RT_ATTENTION_STATS=str(int(attention_stats)))
+        options['env']=dict(os.environ,RT_ATTENTION_BACKEND=attention_backend,RT_ATTENTION_BLOCK=str(attention_block),RT_ATTENTION_STATS=str(int(attention_stats)),RT_MLP_BACKEND=mlp_backend)
         self.process=subprocess.Popen([str(worker),str(Path(asset).resolve()),str(Path(asset).resolve().parent/'vocabulary.bin'),str(capacity),str(int(cache)),routing,str(aperture),str(word_tile),str(feature_tile),str(readout_unroll),str(readout_words),str(prefill_batch),str(matrix_rows)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=self.stderr,cwd=native,**options)
         try:
             magic,depth,blocks,middle,mode=struct.unpack('<5I',self.read(20))
             if magic not in (0x52545239,0x5254523a):raise RuntimeError('Resident optical protocol mismatch')
             if attention_backend in ('grouped_rt','grouped_rt_dense') and not mode&512:raise RuntimeError('Worker did not activate grouped RT attention')
             if attention_backend=='standard_fp32' and not mode&1024:raise RuntimeError('Worker did not activate FP32 attention')
+            if (mlp_backend=='standard')!=bool(mode&4096):raise RuntimeError('Worker did not activate the requested MLP backend')
         except BaseException:
             self.close()
             raise
@@ -59,10 +62,13 @@ class ResidentRuntime:
         self.metadata['reply_cache_kind']='verified optical state path'
         self.metadata['cache_verification_bits']=256
         self.metadata['decode_route_cache']=False
-        self.metadata['mlp_compute']='rt_core_balanced_transmission'
-        self.metadata['mlp_activation']='sigmoid_transmission'
-        self.metadata['mlp_material_receipts']='shared within token tile'
-        self.metadata['mlp_token_tile']=matrix_rows
+        self.metadata['mlp_backend']=mlp_backend
+        self.metadata['mlp_compute']='full_matrix' if mode&4096 else 'rt_core_balanced_transmission'
+        self.metadata['mlp_activation']='swiglu' if mode&4096 else 'sigmoid_transmission'
+        self.metadata['mlp_prefill_compute']=('cooperative_matrix2' if mode&256 else 'subgroup') if mode&4096 else 'rt_transmission'
+        self.metadata['mlp_decode_compute']='subgroup' if mode&4096 else 'rt_transmission'
+        self.metadata['mlp_token_tile']=256 if mode&4096 and mode&256 else matrix_rows
+        if not mode&4096:self.metadata['mlp_material_receipts']='shared within token tile'
         self.metadata['source_model']=config.get('source_model')
         self.metadata['coordinate_partition']=config['coordinate_partition']
         self.position=0;self._attention_diagnostic_dirty=False
@@ -231,7 +237,9 @@ class ResidentRuntime:
         payload=self.request(6,len(inputs),layer,inputs.tobytes());size=len(inputs)*(self.hidden_size+self.metadata['middle']);values=np.frombuffer(payload,'<f4',count=size).copy();count=len(inputs)*self.hidden_size
         result={'output':values[:count].reshape(len(inputs),self.hidden_size),'activation':values[count:].reshape(len(inputs),self.metadata['middle']),'feature_hits':np.frombuffer(payload,'<u4',count=len(inputs),offset=size*4).copy()}
         offset=size*4+len(inputs)*4
-        if len(payload)>=offset+24:result['profile_gpu_ms']=dict(zip(('setup','rt_gate_up','rt_down'),map(float,np.frombuffer(payload,'<f8',count=3,offset=offset))))
+        if len(payload)>=offset+24:
+            names=('setup','gate_up','down') if self.metadata['mlp_backend']=='standard' else ('setup','rt_gate_up','rt_down')
+            result['profile_gpu_ms']=dict(zip(names,map(float,np.frombuffer(payload,'<f8',count=3,offset=offset))))
         return result
 
     def attention(self,query,keys,values,gate=None,*,layer=3,query_start=None,history_start=0):

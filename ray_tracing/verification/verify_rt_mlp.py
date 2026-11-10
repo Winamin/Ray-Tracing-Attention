@@ -67,7 +67,7 @@ def verify(directory, layers, tile=8, row_counts=(1, 7, 8, 17, 32)):
     inputs[3] = np.where(np.arange(spec.hidden_size) % 2, -.5, .5)
     report = {'model': str(directory), 'tile': tile, 'checks': []}
     with ResidentRuntime(directory / 'optical_model.bin', capacity=32, cache=False,
-                         prefill_batch=32, matrix_rows=tile) as runtime:
+                         prefill_batch=32, matrix_rows=tile,mlp_backend='rt_transmission') as runtime:
         report['mlp_compute'] = runtime.metadata['mlp_compute']
         # Confirm the built MLP module contains real ray queries and no matrix
         # accelerator instructions, even when other projections enable them.
