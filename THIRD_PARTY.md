@@ -39,3 +39,18 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+## Graphics shader engineering references
+
+The RT-local prefill scheduling was implemented for this project's existing
+class records and compensated arithmetic after studying the following public
+implementations. No upstream rendering or attention kernel is vendored by this
+change. Fixed revisions and measured experiments are recorded in
+[the shader engineering report](benchmarks/attention_graphics_prefill_2026-11-11.md).
+
+- AMD FidelityFX-SPD and FidelityFX-SSSR: subgroup work distribution, barriers,
+  and compact work lists (MIT).
+- NVIDIA vk_compute_mipmaps: subgroup and shared-memory work distribution
+  (Apache-2.0).
+- Wicked Engine: shared bitmask candidate buckets (MIT).
+- pbrt-v4: separating traversal and shading stages (Apache-2.0).
