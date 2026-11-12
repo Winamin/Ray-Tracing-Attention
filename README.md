@@ -74,10 +74,6 @@ $$
 
 Each output position queries the Tree once. An existing path hit returns the token directly and advances the address for the next step; a new path runs through the RT layers and writes its result into the Tree. Input and generation endpoints store shared block references, high-dimensional readout rows, and light-path addresses; consecutive hits stream tokens along the addresses, and new light paths form the current recurrent field through native propagation.
 
-![Blockwise vocabulary geometry and optical readout](docs/images/ray_tracing_attention_output_detail.png)
-
-The vocabulary operator diagram expands full coordinate blocking, local angles and magnitudes, BVH intersection identities, optical coefficient responses, and the merge of token contributions. Each block keeps its original channel identity, and the full high-dimensional score connects the strongest light signal to token selection.
-
 ## Key capabilities
 
 - **Unified model compilation.** GGUF files and Hugging Face safetensors directories share one entry point. The model spec describes the vocabulary, head dimensions, GQA, layer order, RoPE, and recurrent state; the same shaders build the native pipeline from the spec.
@@ -137,10 +133,6 @@ Four rounds of real tasks read this project's runtime, builder, attention inters
 | 2 | Attention query granularity | 2558 | 120 | 7526.86 | 3.60 |
 | 3 | Full packets and column equivalence | 4096 | 85 | 11424.91 | 3.41 |
 | 4 | Causal cache branch review | 5792 | 121 | 20799.59 | 4.56 |
-
-
-
-![Shared causal BVHs and compact boundary states](docs/images/ray_tracing_attention_cache_detail.png)
 
 
 

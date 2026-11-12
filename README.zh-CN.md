@@ -74,10 +74,6 @@ $$
 
 每个输出位置先查询一次 Tree。已有路径命中时直接返回 token，并推进下一步地址；新路径进入 RT 层计算，再把结果写入 Tree。输入与生成终点保存共享块引用、高维读出行和光路地址；连续命中沿地址输出，新光路通过原生传播形成当前递归场。
 
-![Blockwise vocabulary geometry and optical readout](docs/images/ray_tracing_attention_output_detail.png)
-
-词表算子图展开完整坐标分块、局部角度与幅度、BVH 求交身份、光学系数响应和词元贡献汇合。各块保持原始通道身份，完整高维分数连接最强光信号选词。
-
 ## 核心能力
 
 - **统一模型编译。** GGUF 文件和 Hugging Face safetensors 目录共用一个入口。模型规格描述词表、头维度、GQA、层顺序、RoPE 与递推状态；同一套 Shader 根据规格生成原生管线。
@@ -137,10 +133,6 @@ rt-chat --capacity 1024 --profile --no-cache
 | 2 | Attention 查询粒度 | 2558 | 120 | 7526.86 | 3.60 |
 | 3 | 完整包与列等价 | 4096 | 85 | 11424.91 | 3.41 |
 | 4 | 因果缓存分支 review | 5792 | 121 | 20799.59 | 4.56 |
-
-
-
-![Shared causal BVHs and compact boundary states](docs/images/ray_tracing_attention_cache_detail.png)
 
 
 ## 长上下文与显存
