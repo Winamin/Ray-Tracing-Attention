@@ -1,0 +1,143 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#include "resident_common.glsl"
+#include "resident_attention_classes.glsl"
+#define headCount() parameters[blockBase()+23u]
+
+// RT classes are per history position. QK consumes complete K member chains;
+// V independently selects representative axes or all class member axes.
+// No packet deduplication, column equivalence, V runs, or (m,Z,U) summaries.
+layout(constant_id=1) const uint BLOCK=128u;
+layout(std430,binding=42) buffer AttentionReceipts {uint attentionReceipts[];};
+const uint DH=RT_ATTENTION_HEAD_DIM,Q_BATCH=4u,KEY_SLICES=8u;
+const uint Q_PER_KV=RT_QUERY_WIDTH/RT_GQA_WIDTH,LANE_AXES=(DH+31u)/32u;
+const uint COVERAGE_WORDS=BLOCK/32u,SCORE_OFFSET=8u+COVERAGE_WORDS;
+const uint WEIGHT_OFFSET=SCORE_OFFSET+BLOCK,RECORD_WORDS=WEIGHT_OFFSET+BLOCK;
+const uint ATTENTION_ERROR=65536u,WORK_STRIDE=DH+1u,WORK_PLANE=Q_BATCH*WORK_STRIDE;
+rayQueryEXT receiptRay;
+shared uint localSlots[BLOCK],coverage[COVERAGE_WORDS];
+shared uint groupFailure,uniqueHits,rayInitializations;
+shared vec3 historyOrigin,historyDirection;
+shared uint classTile[KEY_SLICES*(DH/4u)],keyWork[KEY_SLICES*Q_BATCH*2u];
+shared vec4 qHeadTile[DH];
+void accurateAddHeads(inout vec4 sum,inout vec4 correction,vec4 value){
+    precise vec4 adjusted=value-correction,next=sum+adjusted;
+    correction=(next-sum)-adjusted;sum=next;
+}
+vec4 accurateReduceHeads(vec4 sum,vec4 correction){
+    for(uint offset=16u;offset>0u;offset>>=1u){
+        vec4 otherSum=subgroupShuffleXor(sum,offset),otherCorrection=subgroupShuffleXor(correction,offset);
+        accurateAddHeads(sum,correction,otherSum);
+        accurateAddHeads(sum,correction,-otherCorrection);
+    }
+    return sum-correction;
+}
+#include "resident_attention_direct_trace.glsl"
+
+void keyAttention(uint row,uint group,uint lane){
+    uint available=availablePositions(row),first=group*BLOCK;
+    if(first>=available)return;
+    uint count=min(BLOCK,available-first);
+    traceGroup(row,group,count,lane);if(groupFailure!=0u)return;
+    for(uint i=lane;i<count;i+=gl_WorkGroupSize.x)
+        hits[row*(cfg.capacity+1u)+first+i+1u]=localSlots[i];
+    uint c=gl_SubgroupInvocationID,slice=gl_SubgroupID,heads=headCount();
+    uint kvHeads=(heads+Q_PER_KV-1u)/Q_PER_KV;
+    bool diagnostics=(cfg.debug&(65536u|131072u))!=0u;
+    for(uint kv=0u;kv<kvHeads;kv++)for(uint headOffset=0u;headOffset<Q_PER_KV;headOffset+=Q_BATCH){
+        uint headBase=kv*Q_PER_KV+headOffset;
+        for(uint axis=lane;axis<DH;axis+=gl_WorkGroupSize.x){
+            qHeadTile[axis]=vec4(
+                headBase+0u<heads&&headOffset+0u<Q_PER_KV?queries[row*A+(headBase+0u)*DH+axis]:0.0,
+                headBase+1u<heads&&headOffset+1u<Q_PER_KV?queries[row*A+(headBase+1u)*DH+axis]:0.0,
+                headBase+2u<heads&&headOffset+2u<Q_PER_KV?queries[row*A+(headBase+2u)*DH+axis]:0.0,
+                headBase+3u<heads&&headOffset+3u<Q_PER_KV?queries[row*A+(headBase+3u)*DH+axis]:0.0);
+        }
+        barrier();
+        uvec4 products=uvec4(0u);uint decodes=0u;
+        for(uint firstToken=0u;firstToken<count;firstToken+=KEY_SLICES){
+            uint n=min(KEY_SLICES,count-firstToken),slot=slice<n?localSlots[firstToken+slice]:0u;
+            uvec2 directory=slice<n?classDirectory(slot,kv,false):uvec2(0u);
+            uint roots=directory.y,payload=classPayloadBase()+directory.x;
+            if(slice<n&&(roots==0u||roots>DH)){attentionFailure();roots=0u;}
+            if(slice<n)for(uint p=c;p<DH/4u;p+=32u)
+                classTile[slice*(DH/4u)+p]=attentionClasses[payload+2u*roots+p];
+            subgroupMemoryBarrierShared();subgroupBarrier();
+            precise vec4 sum=vec4(0.0),error=vec4(0.0);
+            // D is supplied by the RT class producer. No parent scan or repeat
+            // equality test is performed in this score loop.
+            if(slice<n)for(uint rank=c;rank<roots;rank+=32u){
+                uint descriptor=attentionClasses[payload+rank],axis=compactAxis(descriptor);
+                uint offset=compactMemberOffset(descriptor),members=compactMemberCount(descriptor);
+                if(axis>=DH||members==0u||offset+members>DH){attentionFailure();continue;}
+                float value=uintBitsToFloat(attentionClasses[payload+roots+rank]);
+                if(!finiteValue(value)){attentionFailure();continue;}
+                if(diagnostics)decodes++;
+                if(value==0.0)continue;
+                precise vec4 qsum=qHeadTile[axis],qerror=vec4(0.0);
+                // Members retain their original Q values. Multiplicity is never
+                // substituted for this full sum, and the packed plane is K-only.
+                for(uint m=1u;m<members;m++){
+                    uint index=offset+m,word=classTile[slice*(DH/4u)+index/4u];
+                    uint member=(word>>((index&3u)*8u))&255u;
+                    accurateAddHeads(qsum,qerror,qHeadTile[member]);
+                }
+                qsum-=qerror;
+                // Match the scalar qsum!=0 branch per head: a zero Q sum
+                // must preserve both the accumulated value and its correction.
+                precise vec4 product=qsum*vec4(value);
+                precise vec4 pendingSum=sum,pendingError=error;
+                accurateAddHeads(pendingSum,pendingError,product);
+                accurateAddHeads(pendingSum,pendingError,fma(qsum,vec4(value),-product));
+                bvec4 activeHeads=notEqual(qsum,vec4(0.0));
+                sum=mix(sum,pendingSum,activeHeads);
+                error=mix(error,pendingError,activeHeads);
+                if(diagnostics)products+=uvec4(notEqual(qsum,vec4(0.0)));
+            }
+            vec4 scores=accurateReduceHeads(sum,error)/sqrt(float(DH));
+            if(slice<n&&c<4u){uint head=headBase+c;
+                if(head<heads&&headOffset+c<Q_PER_KV){
+                    float score=scores[c];if(!finiteValue(score))attentionFailure();
+                    attentionReceipts[recordIndex(row,group,head)*RECORD_WORDS+SCORE_OFFSET+firstToken+slice]=floatBitsToUint(score);
+                }
+            }
+            subgroupMemoryBarrierShared();subgroupBarrier();
+        }
+        if(diagnostics){products=subgroupAdd(products);decodes=subgroupAdd(decodes);}
+        if(c==0u)for(uint h=0u;h<4u;h++){
+            uint at=(slice*Q_BATCH+h)*2u;keyWork[at]=products[h];keyWork[at+1u]=decodes;
+        }
+        barrier();if(groupFailure!=0u)return;
+        if(slice==0u)for(uint h=0u;h<4u;h++){
+            uint head=headBase+h;if(head>=heads||headOffset+h>=Q_PER_KV)continue;
+            uint at=recordIndex(row,group,head)*RECORD_WORDS;
+            if(c==0u){
+                uint p=0u,d=0u;
+                if(diagnostics)for(uint s=0u;s<KEY_SLICES;s++){p+=keyWork[(s*Q_BATCH+h)*2u];d+=keyWork[(s*Q_BATCH+h)*2u+1u];}
+                attentionReceipts[at]=p;attentionReceipts[at+1u]=d;attentionReceipts[at+2u]=count;
+                attentionReceipts[at+3u]=head==0u?rayInitializations:0u;attentionReceipts[at+7u]=3u;
+                if(diagnostics){statisticAdd(0u,count);statisticAdd(1u,count);statisticAdd(2u,p);
+                    statisticAdd(6u,d);statisticAdd(9u,head==0u?rayInitializations:0u);statisticAdd(10u,1u);}
+            }
+            for(uint w=c;w<COVERAGE_WORDS;w+=32u)attentionReceipts[at+8u+w]=coverage[w];
+            for(uint j=c;j<BLOCK;j+=32u){
+                if(j>=count)attentionReceipts[at+SCORE_OFFSET+j]=floatBitsToUint(-1.0/0.0);
+                attentionReceipts[at+WEIGHT_OFFSET+j]=0u;
+            }
+        }
+        barrier();if(groupFailure!=0u)return;
+    }
+}
+
+void main(){
+    if(stopped())return;
+    if(DH!=256u||Q_PER_KV!=4u){if(gl_LocalInvocationID.x==0u)atomicOr(control[3],ATTENTION_ERROR);return;}
+    uint row=gl_WorkGroupID.y,lane=gl_LocalInvocationID.x;
+    if(row>=cfg.rows)return;
+    if(gl_WorkGroupSize.x!=256u||gl_SubgroupSize!=32u){if(lane==0u)atomicOr(control[3],ATTENTION_ERROR);return;}
+    keyAttention(row,gl_WorkGroupID.x,lane);
+}

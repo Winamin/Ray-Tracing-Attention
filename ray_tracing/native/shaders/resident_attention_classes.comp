@@ -1,0 +1,109 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#include "resident_common.glsl"
+#include "resident_attention_classes.glsl"
+layout(binding=43) uniform accelerationStructureEXT attentionClassAS;
+layout(std430,binding=44) buffer AttentionClassScratch {uint attentionClassScratch[];};
+
+const uint STATIC_BUCKETS=256u;
+const uint CLASS_STAGE_AXES=RT_ATTENTION_HEAD_DIM;
+const uint CLASS_TEMP_MAP_OFFSET=0u;
+const uint CLASS_TEMP_BITS_OFFSET=CLASS_STAGE_AXES;
+const uint CLASS_TEMP_HEAD_OFFSET=2u*CLASS_STAGE_AXES;
+const uint CLASS_TEMP_NEXT_OFFSET=CLASS_TEMP_HEAD_OFFSET+CLASS_STAGE_AXES/2u;
+const uint CLASS_TEMP_DESCRIPTOR_OFFSET=CLASS_TEMP_HEAD_OFFSET;
+const uint CLASS_TEMP_VALUE_OFFSET=CLASS_TEMP_DESCRIPTOR_OFFSET+CLASS_STAGE_AXES;
+const uint CLASS_TEMP_MEMBER_OFFSET=CLASS_TEMP_VALUE_OFFSET+CLASS_STAGE_AXES;
+const uint CLASS_TEMP_COUNT_OFFSET=CLASS_TEMP_MEMBER_OFFSET+CLASS_STAGE_AXES/4u;
+const uint CLASS_TEMP_DOMAIN_WORDS=CLASS_TEMP_COUNT_OFFSET+1u;
+shared uint staticHeads[256],staticNext[CLASS_STAGE_AXES];
+
+uint tempDomainAddress(uint row,uint domain){return (row*CLASS_DOMAINS+domain)*CLASS_TEMP_DOMAIN_WORDS;}
+uint tempClassParent(uint word){return word&255u;}
+uint tempClassNext(uint word){return (word>>8u)&511u;}
+uint tempClassCount(uint word){return (word>>17u)&511u;}
+uint canonicalClassBits(uint bits){return (bits&0x7fffffffu)==0u?0u:bits;}
+uint staticClassBucket(uint bits){
+    bits^=bits>>16u;bits*=0x7feb352du;
+    bits^=bits>>15u;bits*=0x846ca68bu;bits^=bits>>16u;
+    return bits&(STATIC_BUCKETS-1u);
+}
+uint scratchPacked(uint base,uint offset,uint index){
+    uint pair=attentionClassScratch[base+offset+index/2u];
+    return (pair>>((index&1u)*16u))&65535u;
+}
+
+void prepareStaticBucketMembers(){
+    uint domain=gl_WorkGroupID.x,row=domain/CLASS_DOMAINS,kind=domain%CLASS_DOMAINS;
+    if(row>=cfg.rows)return;
+    uint kv=kind%CLASS_KV_HEADS,lane=gl_LocalInvocationID.x;bool content=kind>=CLASS_KV_HEADS;
+    uint slot=parameters[blockBase()+41u]*cfg.capacity+(cfg.position+row)%cfg.capacity;
+    uint base=tempDomainAddress(row,kind);
+    for(uint bucket=lane;bucket<256u;bucket+=128u)staticHeads[bucket]=0u;
+    barrier();
+    for(uint axis=lane;axis<CLASS_STAGE_AXES;axis+=128u){
+        float value=pathCoordinate(slot,kv*(RT_QUERY_WIDTH/RT_GQA_WIDTH)*CLASS_STAGE_AXES+axis,content);
+        uint raw=floatBitsToUint(value);
+        if(isnan(value)||isinf(value))atomicOr(control[3],65536u);
+        attentionClassScratch[base+CLASS_TEMP_BITS_OFFSET+axis]=raw;
+        uint bucket=staticClassBucket(canonicalClassBits(raw));
+        staticNext[axis]=atomicExchange(staticHeads[bucket],axis+1u);
+    }
+    barrier();
+    for(uint pair=lane;pair<CLASS_STAGE_AXES/2u;pair+=128u){
+        uint axis=2u*pair;
+        attentionClassScratch[base+CLASS_TEMP_HEAD_OFFSET+pair]=staticHeads[axis]|(staticHeads[axis+1u]<<16u);
+        attentionClassScratch[base+CLASS_TEMP_NEXT_OFFSET+pair]=staticNext[axis]|(staticNext[axis+1u]<<16u);
+    }
+}
+
+void classifyWithStaticBuckets(){
+    uint id=gl_GlobalInvocationID.x,dim=CLASS_STAGE_AXES;
+    if(id>=cfg.rows*CLASS_DOMAINS*dim)return;
+    uint row=id/(CLASS_DOMAINS*dim),kind=(id/dim)%CLASS_DOMAINS,axis=id%dim;
+    uint base=tempDomainAddress(row,kind);
+    uint bits=canonicalClassBits(attentionClassScratch[base+CLASS_TEMP_BITS_OFFSET+axis]);
+    if((bits&0x7f800000u)==0x7f800000u){atomicOr(control[3],65536u);return;}
+    uint bucket=staticClassBucket(bits),parent=axis,next=dim,count=0u,bucketHits=0u;
+    rayQueryEXT ray;
+    rayQueryInitializeEXT(ray,attentionClassAS,gl_RayFlagsNoOpaqueEXT,255u,
+                         vec3(float(bucket),0.0,-.5),.01,vec3(0,0,1),1.0);
+    while(rayQueryProceedEXT(ray)){
+        if(rayQueryGetIntersectionTypeEXT(ray,false)!=gl_RayQueryCandidateIntersectionAABBEXT)continue;
+        uint hit=rayQueryGetIntersectionPrimitiveIndexEXT(ray,false);
+        if(hit!=bucket)continue;
+        bucketHits++;
+        uint member=scratchPacked(base,CLASS_TEMP_HEAD_OFFSET,bucket),seen=0u;
+        while(member!=0u&&seen<dim){
+            uint candidate=member-1u;
+            if(candidate>=dim){atomicOr(control[3],65536u);break;}
+            uint candidateBits=canonicalClassBits(attentionClassScratch[base+CLASS_TEMP_BITS_OFFSET+candidate]);
+            if(candidateBits==bits){parent=min(parent,candidate);if(candidate>axis)next=min(next,candidate);count++;}
+            member=scratchPacked(base,CLASS_TEMP_NEXT_OFFSET,candidate);seen++;
+        }
+        if(member!=0u)atomicOr(control[3],65536u);
+    }
+    if(bucketHits!=1u||count==0u||count>dim){atomicOr(control[3],65536u);return;}
+    attentionClassScratch[base+CLASS_TEMP_MAP_OFFSET+axis]=parent|(next<<8u)|(count<<17u);
+    if((cfg.debug&65536u)!=0u&&gl_LocalInvocationID.x==0u){
+        uint at=11u+cfg.capacity+65536u+parameters[blockBase()+41u]*32u+18u;
+        uint rays=min(gl_WorkGroupSize.x,cfg.rows*CLASS_DOMAINS*dim-gl_WorkGroupID.x*gl_WorkGroupSize.x);
+        uint old=atomicAdd(control[at],rays);if(old+rays<old)atomicAdd(control[at+1u],1u);
+    }
+}
+
+#include "resident_attention_compact_build.glsl"
+
+void main(){
+    if(stopped())return;
+    if(CLASS_STAGE_AXES!=256u||gl_WorkGroupSize.x!=128u||gl_SubgroupSize!=32u){
+        if(gl_LocalInvocationID.x==0u)atomicOr(control[3],65536u);return;
+    }
+    if(operation==0u)prepareStaticBucketMembers();
+    else if(operation==1u)classifyWithStaticBuckets();
+    else if(operation==2u)buildCompactClasses();
+    else if(operation==3u)storeCompactClasses();
+    else if(operation==4u)expandCompactClasses();
+}

@@ -1,0 +1,163 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#include "resident_common.glsl"
+#include "resident_attention_classes.glsl"
+#define headCount() parameters[blockBase()+23u]
+layout(constant_id=1) const uint BLOCK=128u;
+layout(constant_id=7) const uint DISTRIBUTE_V_MEMBERS=0u;
+layout(std430,binding=42) buffer AttentionReceipts {uint attentionReceipts[];};
+const uint DH=RT_ATTENTION_HEAD_DIM,Q_PER_KV=RT_QUERY_WIDTH/RT_GQA_WIDTH;
+const uint COVERAGE_WORDS=BLOCK/32u,SCORE_OFFSET=8u+COVERAGE_WORDS;
+const uint WEIGHT_OFFSET=SCORE_OFFSET+BLOCK,RECORD_WORDS=WEIGHT_OFFSET+BLOCK;
+const uint ATTENTION_ERROR=65536u,VALUE_AXES=(DH+127u)/128u,WINDOW=4u;
+shared uint groupFailure,valueInvalid;
+shared vec4 valueMaximum,valueReference;
+shared uint ownerRank[WINDOW*DH];
+shared float representativeValue[WINDOW*DH];
+#include "resident_attention_local_common.glsl"
+
+void accurateAdd4(inout vec4 sum,inout vec4 correction,vec4 value){
+    precise vec4 adjusted=value-correction,next=sum+adjusted;
+    correction=(next-sum)-adjusted;sum=next;
+}
+uint weightAddress(uint at,uint j,uint head){return at+head*RECORD_WORDS+WEIGHT_OFFSET+j;}
+vec4 weight4(uint at,uint j,bvec4 headEnabled){
+    vec4 result=vec4(0.0);
+    for(uint h=0u;h<4u;h++)if(headEnabled[h])result[h]=uintBitsToFloat(attentionReceipts[weightAddress(at,j,h)]);
+    return result;
+}
+
+void valueAttentionWindow(uint row,uint kv,uint lane){
+    uint heads=headCount(),c=gl_SubgroupInvocationID,tile=gl_SubgroupID;
+    uint available=availablePositions(row),groups=groupCount(row);
+    bool diagnostics=(cfg.debug&(65536u|131072u))!=0u;
+    for(uint headOffset=0u;headOffset<Q_PER_KV;headOffset+=4u){
+        uint firstHead=kv*Q_PER_KV+headOffset;
+        if(firstHead>=heads)return;
+        bvec4 headEnabled=lessThan(uvec4(firstHead)+uvec4(0u,1u,2u,3u),uvec4(heads));
+        for(uint h=0u;h<4u;h++)headEnabled[h]=headEnabled[h]&&headOffset+h<Q_PER_KV;
+        if(lane==0u){groupFailure=0u;valueInvalid=0u;}
+        barrier();
+        if(tile==0u){
+            vec4 maximum=vec4(-1.0/0.0);bool invalid=false;
+            for(uint group=0u;group<groups;group++){
+                uint at=recordIndex(row,group,firstHead)*RECORD_WORDS,count=min(BLOCK,available-group*BLOCK);
+                for(uint h=0u;h<4u;h++)if(headEnabled[h]){
+                    uint record=at+h*RECORD_WORDS;
+                    if(attentionReceipts[record+2u]!=count||attentionReceipts[record+7u]!=3u)invalid=true;
+                    if(c==0u){attentionReceipts[record+4u]=0u;attentionReceipts[record+5u]=0u;}
+                }
+                for(uint j=c;j<count;j+=32u){
+                    vec4 score=vec4(-1.0/0.0);
+                    for(uint h=0u;h<4u;h++)if(headEnabled[h])score[h]=uintBitsToFloat(attentionReceipts[at+h*RECORD_WORDS+SCORE_OFFSET+j]);
+                    maximum=max(maximum,score);
+                }
+            }
+            maximum=subgroupMax(maximum);
+            precise vec4 reference=vec4(0.0),referenceError=vec4(0.0);
+            for(uint group=0u;group<groups;group++){
+                uint at=recordIndex(row,group,firstHead)*RECORD_WORDS,count=min(BLOCK,available-group*BLOCK);
+                for(uint j=c;j<count;j+=32u){
+                    vec4 weight=vec4(0.0);
+                    for(uint h=0u;h<4u;h++)if(headEnabled[h]){
+                        weight[h]=exp(uintBitsToFloat(attentionReceipts[at+h*RECORD_WORDS+SCORE_OFFSET+j])-maximum[h]);
+                        attentionReceipts[weightAddress(at,j,h)]=floatBitsToUint(weight[h]);
+                    }
+                    accurateAdd4(reference,referenceError,weight);
+                }
+            }
+            reference=subgroupAdd(reference-referenceError);invalid=subgroupAny(invalid);
+            if(c==0u){valueMaximum=maximum;valueReference=reference;
+                if(invalid){valueInvalid=1u;attentionFailure();}}
+        }
+        memoryBarrierBuffer();barrier();if(valueInvalid!=0u)return;
+        vec4 maximum=valueMaximum,reference=valueReference;
+        precise vec4 signal[VALUE_AXES],correction[VALUE_AXES],chunkSignal[VALUE_AXES];
+        for(uint a=0u;a<VALUE_AXES;a++){signal[a]=vec4(0.0);correction[a]=vec4(0.0);chunkSignal[a]=vec4(0.0);}
+        for(uint group=0u;group<groups;group++){
+            uint count=min(BLOCK,available-group*BLOCK),at=recordIndex(row,group,firstHead)*RECORD_WORDS;
+            uint products=0u,decodes=0u;
+            for(uint firstToken=0u;firstToken<count;firstToken+=WINDOW){
+                uint n=min(WINDOW,count-firstToken);
+                // Each subgroup builds one token's transient ownership table.
+                // K domains are never touched. Only D V descriptors are read.
+                if(tile<n){
+                    uint slot=hits[row*(cfg.capacity+1u)+group*BLOCK+firstToken+tile+1u];
+                    uvec2 directory=classDirectory(slot,kv,true);
+                    uint roots=directory.y,payload=classPayloadBase()+directory.x;
+                    if(roots==0u||roots>DH){attentionFailure();roots=0u;}
+                    for(uint axis=c;axis<DH;axis+=32u)ownerRank[tile*DH+axis]=0xffffffffu;
+                    subgroupMemoryBarrierShared();subgroupBarrier();
+                    for(uint rank=c;rank<roots;rank+=32u){
+                        uint descriptor=attentionClasses[payload+rank],root=compactAxis(descriptor);
+                        uint offset=compactMemberOffset(descriptor),members=compactMemberCount(descriptor);
+                        float value=uintBitsToFloat(attentionClasses[payload+roots+rank]);
+                        if(root>=DH||members==0u||offset+members>DH||!finiteValue(value)){attentionFailure();continue;}
+                        representativeValue[tile*DH+rank]=value;
+                        if(DISTRIBUTE_V_MEMBERS!=0u){
+                            for(uint m=0u;m<members;m++){
+                                uint index=offset+m,word=attentionClasses[payload+2u*roots+index/4u];
+                                uint axis=(word>>((index&3u)*8u))&255u;
+                                if(axis>=DH){attentionFailure();continue;}
+                                ownerRank[tile*DH+axis]=rank;
+                            }
+                        }else ownerRank[tile*DH+root]=rank;
+                    }
+                }
+                // Publish all four token maps and values to every axis owner.
+                barrier();if(groupFailure!=0u)return;
+                for(uint t=0u;t<n;t++){
+                    uint j=firstToken+t;
+                    if(j!=0u&&(j&63u)==0u){for(uint a=0u;a<VALUE_AXES;a++){
+                        accurateAdd4(signal[a],correction[a],chunkSignal[a]);chunkSignal[a]=vec4(0.0);}}
+                    vec4 weight=weight4(at,j,headEnabled);
+                    for(uint a=0u;a<VALUE_AXES;a++){
+                        uint axis=lane+a*128u;
+                        if(axis>=DH)continue;
+                        uint rank=ownerRank[t*DH+axis];if(rank==0xffffffffu)continue;
+                        float value=representativeValue[t*DH+rank];
+                        if(diagnostics)decodes++;
+                        if(value!=0.0){chunkSignal[a]=fma(weight,vec4(value),chunkSignal[a]);if(diagnostics)products++;}
+                    }
+                }
+                // Readers finish before the next window reuses the same maps.
+                barrier();
+            }
+            for(uint a=0u;a<VALUE_AXES;a++){accurateAdd4(signal[a],correction[a],chunkSignal[a]);chunkSignal[a]=vec4(0.0);}
+            if(diagnostics){products=subgroupAdd(products);decodes=subgroupAdd(decodes);}
+            if(c==0u)for(uint h=0u;h<4u;h++)if(headEnabled[h]){
+                uint record=at+h*RECORD_WORDS;
+                if(diagnostics){atomicAdd(attentionReceipts[record+4u],products);atomicAdd(attentionReceipts[record+5u],decodes);statisticAdd(3u,products);}
+                if(tile==0u){attentionReceipts[record+6u]=count;attentionReceipts[record+7u]=15u;
+                    if(diagnostics){statisticAdd(7u,count);statisticAdd(8u,count);}}
+            }
+        }
+        if(lane==0u)for(uint h=0u;h<4u;h++)if(headEnabled[h]){
+            if(!finiteValue(reference[h])||reference[h]<=0.0||!finiteValue(maximum[h]))attentionFailure();
+            uint p=(row*max(H,uint(RT_ATTENTION_HEADS))+firstHead+h)*2u;
+            physical[p]=maximum[h]+20.0;physical[p+1u]=reference[h];
+            if(diagnostics){statisticAdd(4u,DH);statisticAdd(5u,DH);statisticAdd(15u,DH);statisticAdd(11u,DH);}
+        }
+        for(uint a=0u;a<VALUE_AXES;a++){
+            uint axis=lane+a*128u;if(axis>=DH)continue;
+            for(uint h=0u;h<4u;h++)if(headEnabled[h]){
+                uint channel=(firstHead+h)*DH+axis;
+                detector[row*A+channel]=finalHeadSignal(row,channel,signal[a][h]-correction[a][h],reference[h]);
+            }
+        }
+        barrier();if(groupFailure!=0u)return;
+    }
+}
+void main(){
+    if(stopped())return;
+    if(DH!=256u||Q_PER_KV!=4u){if(gl_LocalInvocationID.x==0u)atomicOr(control[3],ATTENTION_ERROR);return;}
+    uint row=gl_WorkGroupID.y,lane=gl_LocalInvocationID.x;
+    if(row>=cfg.rows||gl_WorkGroupID.x*Q_PER_KV>=headCount())return;
+    if(gl_WorkGroupSize.x!=128u||gl_SubgroupSize!=32u){if(lane==0u)atomicOr(control[3],ATTENTION_ERROR);return;}
+    if((control[3]&ATTENTION_ERROR)!=0u)return;
+    valueAttentionWindow(row,gl_WorkGroupID.x,lane);
+}

@@ -13,14 +13,14 @@ public:
     VkAccelerationStructureGeometryKHR geometry{};
     bool built=false;
 
-    ImmutableBlockGeometry(Engine& engine,uint32_t receivers,uint32_t blocks):e(engine) {
+    ImmutableBlockGeometry(Engine& engine,uint32_t receivers,uint32_t blocks,bool transient=false):e(engine) {
         uint64_t total=uint64_t(receivers)*blocks;
         if(!total||total>0xffffffffu)throw std::runtime_error("Block surface primitive address range exceeded");
         count=uint32_t(total);
         const auto usage=VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_SRC_BIT|
             VK_BUFFER_USAGE_TRANSFER_DST_BIT|VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT|
             VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
-        vertices=e.buffer(uint64_t(count)*sizeof(VkAabbPositionsKHR),usage);
+        vertices=e.buffer(uint64_t(count)*sizeof(VkAabbPositionsKHR),usage,false,transient);
         plane.geometry={VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
         plane.geometry.geometryType=VK_GEOMETRY_TYPE_AABBS_KHR;
         auto& aabb=plane.geometry.geometry.aabbs;
@@ -32,9 +32,9 @@ public:
         info.geometryCount=1;info.pGeometries=&plane.geometry;
         VkAccelerationStructureBuildSizesInfoKHR sizes{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
         e.getSizes(e.device,VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,&info,&count,&sizes);
-        plane.storage=e.buffer(sizes.accelerationStructureSize,VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR);
+        plane.storage=e.buffer(sizes.accelerationStructureSize,VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR,false,transient);
         plane.scratch=e.buffer(sizes.buildScratchSize+e.alignment,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,false,transient);
         VkAccelerationStructureCreateInfoKHR create{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR};
         create.type=info.type;create.buffer=plane.storage->handle;create.size=plane.storage->size;
         check(e.createAS(e.device,&create,nullptr,&plane.handle),"create immutable block BLAS");
@@ -43,7 +43,7 @@ public:
         VkAccelerationStructureInstanceKHR instance{};
         instance.transform.matrix[0][0]=instance.transform.matrix[1][1]=instance.transform.matrix[2][2]=1;
         instance.mask=255;instance.accelerationStructureReference=e.asAddress(e.device,&address);
-        instances=e.buffer(sizeof(instance),usage);e.upload(instances,&instance,sizeof(instance));
+        instances=e.buffer(sizeof(instance),usage,false,transient);e.upload(instances,&instance,sizeof(instance));
         geometry={VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
         geometry.geometryType=VK_GEOMETRY_TYPE_INSTANCES_KHR;
         geometry.geometry.instances.sType=VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
@@ -51,9 +51,9 @@ public:
         info.type=VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;info.pGeometries=&geometry;
         uint32_t rootCount=1u;
         e.getSizes(e.device,VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,&info,&rootCount,&sizes);
-        storage=e.buffer(sizes.accelerationStructureSize,VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR);
+        storage=e.buffer(sizes.accelerationStructureSize,VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR,false,transient);
         scratch=e.buffer(sizes.buildScratchSize+e.alignment,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,false,transient);
         create.type=info.type;create.buffer=storage->handle;create.size=storage->size;
         VkAccelerationStructureKHR top{};
         check(e.createAS(e.device,&create,nullptr,&top),"create immutable block TLAS");tops.push_back(top);

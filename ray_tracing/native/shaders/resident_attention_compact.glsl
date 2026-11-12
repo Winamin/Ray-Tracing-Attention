@@ -1,4 +1,8 @@
+#ifdef RT_ATTENTION_TC
+shared uint tokenHash[BLOCK],tokenWeight[BLOCK],tokenList[BLOCK];
+#else
 shared uint tokenHash[BLOCK],tokenParent[BLOCK],tokenWeight[BLOCK],tokenList[BLOCK];
+#endif
 shared uint tokenCount;
 shared uint keyHash[KV_BATCH*DH],valueHash[KV_BATCH*DH];
 shared uint keyMap[KV_BATCH*DH],valueMap[KV_BATCH*DH];
@@ -23,10 +27,21 @@ void compactTokens(uint count,uint lane){
     for(uint i=lane;i<count;i+=gl_WorkGroupSize.x){
         uint parent=i;
         for(uint p=0u;p<i;p++)if(tokenHash[p]==tokenHash[i]&&samePacket(localSlots[p],localSlots[i])){parent=p;break;}
-        tokenParent[i]=parent;atomicAdd(tokenWeight[parent],1u);
+#ifndef RT_ATTENTION_TC
+        tokenParent[i]=parent;
+#endif
+        atomicAdd(tokenWeight[parent],1u);
     }
     barrier();
-    if(lane==0u){tokenCount=0u;for(uint i=0u;i<count;i++)if(tokenParent[i]==i)tokenList[tokenCount++]=i;}
+    if(lane==0u){tokenCount=0u;for(uint i=0u;i<count;i++){
+#ifdef RT_ATTENTION_TC
+        // Only a representative receives multiplicity; its parent array is
+        // redundant after the workgroup barrier.
+        if(tokenWeight[i]!=0u)tokenList[tokenCount++]=i;
+#else
+        if(tokenParent[i]==i)tokenList[tokenCount++]=i;
+#endif
+    }}
     barrier();
 }
 
@@ -40,7 +55,11 @@ bool sameColumn(uint kv,uint a,uint b,bool content){
     uint base=kv*Q_PER_KV*DH;
     for(uint i=0u;i<tokenCount;i++){
         uint slot=localSlots[tokenList[i]];
+#ifdef RT_LOCAL_CLASSES
+        if(classParent(classWord(slot,kv,a,content))!=classParent(classWord(slot,kv,b,content)))return false;
+#else
         if(any(notEqual(coordinateSignature(slot,base+a,content),coordinateSignature(slot,base+b,content))))return false;
+#endif
     }
     return true;
 }

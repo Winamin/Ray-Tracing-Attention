@@ -1,0 +1,225 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#include "resident_common.glsl"
+#include "resident_attention_classes.glsl"
+#define headCount() parameters[blockBase()+23u]
+
+// RT classes are per history position. QK consumes complete K member chains;
+// V independently selects representative axes or all class member axes.
+// No packet deduplication, column equivalence, V runs, or (m,Z,U) summaries.
+layout(constant_id=1) const uint BLOCK=128u;
+layout(constant_id=7) const uint DISTRIBUTE_V_MEMBERS=0u;
+layout(std430,binding=42) buffer AttentionReceipts {uint attentionReceipts[];};
+const uint DH=RT_ATTENTION_HEAD_DIM,Q_BATCH=4u,KEY_SLICES=2u;
+const uint Q_PER_KV=RT_QUERY_WIDTH/RT_GQA_WIDTH,LANE_AXES=(DH+31u)/32u;
+const uint COVERAGE_WORDS=BLOCK/32u,SCORE_OFFSET=8u+COVERAGE_WORDS;
+const uint WEIGHT_OFFSET=SCORE_OFFSET+BLOCK,RECORD_WORDS=WEIGHT_OFFSET+BLOCK;
+const uint ATTENTION_ERROR=65536u,WORK_STRIDE=DH+1u,WORK_PLANE=Q_BATCH*WORK_STRIDE;
+rayQueryEXT receiptRay;
+shared uint localSlots[BLOCK],coverage[COVERAGE_WORDS];
+shared uint groupFailure,uniqueHits,rayInitializations;
+shared vec3 historyOrigin,historyDirection;
+shared uint classTile[KEY_SLICES*DH],keyWork[KEY_SLICES*Q_BATCH*2u];
+shared float addressTile[KEY_SLICES*DH],localWork[2u*WORK_PLANE];
+#include "resident_attention_direct_trace.glsl"
+
+float accurateKeyReduce(float sum,float error){
+    for(uint offset=16u;offset>0u;offset>>=1u){
+        float otherSum=subgroupShuffleXor(sum,offset),otherError=subgroupShuffleXor(error,offset);
+        accurateAdd(sum,error,otherSum);accurateAdd(sum,error,-otherError);
+    }
+    return sum-error;
+}
+
+void keyAttention(uint row,uint group,uint lane){
+    uint available=availablePositions(row),first=group*BLOCK;
+    if(first>=available)return;
+    uint count=min(BLOCK,available-first);
+    traceGroup(row,group,count,lane);if(groupFailure!=0u)return;
+    for(uint i=lane;i<count;i+=gl_WorkGroupSize.x)
+        hits[row*(cfg.capacity+1u)+first+i+1u]=localSlots[i];
+    uint c=gl_SubgroupInvocationID,subgroup=gl_SubgroupID;
+    uint qLane=subgroup%Q_BATCH,slice=subgroup/Q_BATCH,heads=headCount();
+    uint kvHeads=(heads+Q_PER_KV-1u)/Q_PER_KV;
+    for(uint kv=0u;kv<kvHeads;kv++)for(uint headOffset=0u;headOffset<Q_PER_KV;headOffset+=Q_BATCH){
+        uint head=kv*Q_PER_KV+headOffset+qLane;
+        bool headActive=head<heads&&headOffset+qLane<Q_PER_KV;
+        if(slice==0u)for(uint axis=c;axis<DH;axis+=32u)
+            localWork[qLane*WORK_STRIDE+axis]=headActive?queries[row*A+head*DH+axis]:0.0;
+        barrier();
+        uint products=0u,decodes=0u;
+        for(uint firstToken=0u;firstToken<count;firstToken+=KEY_SLICES){
+            uint n=min(KEY_SLICES,count-firstToken);
+            for(uint i=lane;i<n*(DH/4u);i+=gl_WorkGroupSize.x){
+                uint j=i/(DH/4u),p=i%(DH/4u),slot=localSlots[firstToken+j];
+                uint packedBase=j*DH+4u*p;
+                classTile[packedBase]=compactMember(slot,kv,4u*p,false);
+                classTile[packedBase+1u]=compactMember(slot,kv,4u*p+1u,false);
+                classTile[packedBase+2u]=compactMember(slot,kv,4u*p+2u,false);
+                classTile[packedBase+3u]=compactMember(slot,kv,4u*p+3u,false);
+            }
+            barrier();if(groupFailure!=0u)return;
+            precise float sum=0.0,error=0.0;
+            uint slot=slice<n?localSlots[firstToken+slice]:0u;
+            uint roots=slice<n?compactCount(slot,kv,false):0u;
+            if(roots>DH){attentionFailure();roots=0u;}
+            if(headActive&&slice<n)for(uint rank=c;rank<roots;rank+=32u){
+                uint descriptor=compactDescriptor(slot,kv,rank,false),axis=compactAxis(descriptor),base=slice*DH;
+                uint offset=compactMemberOffset(descriptor),members=compactMemberCount(descriptor);
+                if(axis>=DH||members==0u||offset+members>DH){attentionFailure();continue;}
+                decodes++;float value=classValue(slot,kv,rank,false);
+                if(!finiteValue(value)){attentionFailure();continue;}if(value==0.0)continue;
+                precise float qsum=localWork[qLane*WORK_STRIDE+axis],qerror=0.0;
+                for(uint m=1u;m<members;m++){
+                    uint member=classTile[base+offset+m];
+                    accurateAdd(qsum,qerror,localWork[qLane*WORK_STRIDE+member]);
+                }
+                qsum-=qerror;
+                if(qsum!=0.0){precise float product=qsum*value;
+                    accurateAdd(sum,error,product);accurateAdd(sum,error,fma(qsum,value,-product));products++;}
+            }
+            float total=accurateKeyReduce(sum,error),score=total/sqrt(float(DH));
+            if(headActive&&slice<n){
+                if(!finiteValue(score))attentionFailure();
+                if(c==0u)attentionReceipts[recordIndex(row,group,head)*RECORD_WORDS+SCORE_OFFSET+firstToken+slice]=floatBitsToUint(score);
+            }
+            barrier();if(groupFailure!=0u)return;
+        }
+        products=subgroupAdd(products);decodes=subgroupAdd(decodes);
+        if(c==0u){keyWork[subgroup*2u]=products;keyWork[subgroup*2u+1u]=decodes;}
+        barrier();
+        if(slice==0u&&headActive){
+            uint at=recordIndex(row,group,head)*RECORD_WORDS;
+            if(c==0u){
+                products=0u;decodes=0u;
+                for(uint p=0u;p<KEY_SLICES;p++){products+=keyWork[(p*Q_BATCH+qLane)*2u];decodes+=keyWork[(p*Q_BATCH+qLane)*2u+1u];}
+                attentionReceipts[at]=products;attentionReceipts[at+1u]=decodes;attentionReceipts[at+2u]=count;
+                attentionReceipts[at+3u]=head==0u?rayInitializations:0u;attentionReceipts[at+7u]=3u;
+                statisticAdd(0u,count);statisticAdd(1u,count);statisticAdd(2u,products);
+                statisticAdd(6u,decodes);statisticAdd(9u,head==0u?rayInitializations:0u);statisticAdd(10u,1u);
+            }
+            for(uint w=c;w<COVERAGE_WORDS;w+=32u)attentionReceipts[at+8u+w]=coverage[w];
+            for(uint j=c;j<BLOCK;j+=32u){
+                if(j>=count)attentionReceipts[at+SCORE_OFFSET+j]=floatBitsToUint(-1.0/0.0);
+                attentionReceipts[at+WEIGHT_OFFSET+j]=0u;
+            }
+        }
+        barrier();if(groupFailure!=0u)return;
+    }
+}
+
+void valueAttention(uint row,uint kv,uint lane){
+    uint heads=headCount();if(kv*Q_PER_KV>=heads)return;
+    uint c=gl_SubgroupInvocationID,qLane=gl_SubgroupID;
+    uint available=availablePositions(row),groups=groupCount(row);
+    if(lane==0u)groupFailure=0u;
+    barrier();
+    for(uint headOffset=0u;headOffset<Q_PER_KV;headOffset+=Q_BATCH){
+        uint head=kv*Q_PER_KV+headOffset+qLane;
+        bool headActive=head<heads&&headOffset+qLane<Q_PER_KV;
+        float maximum=-1.0/0.0;
+        if(headActive)for(uint group=0u;group<groups;group++){
+            uint at=recordIndex(row,group,head)*RECORD_WORDS,count=min(BLOCK,available-group*BLOCK);
+            if(attentionReceipts[at+2u]!=count||attentionReceipts[at+7u]!=3u)attentionFailure();
+            for(uint j=c;j<count;j+=32u)maximum=max(maximum,uintBitsToFloat(attentionReceipts[at+SCORE_OFFSET+j]));
+        }
+        maximum=subgroupMax(maximum);
+        precise float reference=0.0,referenceError=0.0;
+        // Cache each globally stabilized weight once, then consume it below.
+        if(headActive)for(uint group=0u;group<groups;group++){
+            uint at=recordIndex(row,group,head)*RECORD_WORDS,count=min(BLOCK,available-group*BLOCK);
+            for(uint j=c;j<count;j+=32u){
+                float weight=exp(uintBitsToFloat(attentionReceipts[at+SCORE_OFFSET+j])-maximum);
+                attentionReceipts[at+WEIGHT_OFFSET+j]=floatBitsToUint(weight);
+                accurateAdd(reference,referenceError,weight);
+            }
+        }
+        reference=subgroupAdd(reference-referenceError);
+        precise float signal[LANE_AXES],correction[LANE_AXES];
+        for(uint k=0u;k<LANE_AXES;k++){signal[k]=0.0;correction[k]=0.0;}
+        memoryBarrierBuffer();barrier();if(groupFailure!=0u)return;
+        for(uint group=0u;group<groups;group++){
+            uint count=min(BLOCK,available-group*BLOCK),at=headActive?recordIndex(row,group,head)*RECORD_WORDS:0u;
+            uint products=0u,decodes=0u;
+            for(uint j=0u;j<count;j++){
+                uint slot=hits[row*(cfg.capacity+1u)+group*BLOCK+j+1u];
+                uint roots=compactCount(slot,kv,true);
+                if(roots==0u||roots>DH){attentionFailure();roots=0u;}
+                for(uint rank=lane;rank<roots;rank+=gl_WorkGroupSize.x){
+                    classTile[rank]=compactDescriptor(slot,kv,rank,true);
+                    addressTile[rank]=classValue(slot,kv,rank,true);
+                    if(!finiteValue(addressTile[rank]))attentionFailure();
+                }
+                barrier();if(groupFailure!=0u)return;
+                float weight=headActive?uintBitsToFloat(attentionReceipts[at+WEIGHT_OFFSET+j]):0.0;
+                for(uint k=0u;k<LANE_AXES;k++){
+                    uint axis=c+k*32u;
+                    if(axis<DH){localWork[qLane*WORK_STRIDE+axis]=0.0;
+                        localWork[WORK_PLANE+qLane*WORK_STRIDE+axis]=0.0;}
+                }
+                subgroupMemoryBarrierShared();subgroupBarrier();
+                if(headActive)for(uint rank=c;rank<roots;rank+=32u){
+                    uint descriptor=classTile[rank],root=compactAxis(descriptor);
+                    uint offset=compactMemberOffset(descriptor),members=compactMemberCount(descriptor);
+                    float value=addressTile[rank];
+                    if(root>=DH||members==0u||offset+members>DH){attentionFailure();continue;}
+                    uint consumed=DISTRIBUTE_V_MEMBERS!=0u?members:1u;decodes+=consumed;
+                    if(value!=0.0){
+                        precise float product=weight*value,residual=fma(weight,value,-product);
+                        if(DISTRIBUTE_V_MEMBERS!=0u)for(uint m=0u;m<members;m++){
+                            uint axis=compactMember(slot,kv,offset+m,true);
+                            localWork[qLane*WORK_STRIDE+axis]=product;
+                            localWork[WORK_PLANE+qLane*WORK_STRIDE+axis]=residual;
+                        }else{
+                            localWork[qLane*WORK_STRIDE+root]=product;
+                            localWork[WORK_PLANE+qLane*WORK_STRIDE+root]=residual;
+                        }
+                        products+=consumed;
+                    }
+                }
+                subgroupMemoryBarrierShared();subgroupBarrier();
+                for(uint k=0u;k<LANE_AXES;k++){
+                    uint axis=c+k*32u;if(headActive&&axis<DH){
+                        accurateAdd(signal[k],correction[k],localWork[qLane*WORK_STRIDE+axis]);
+                        accurateAdd(signal[k],correction[k],localWork[WORK_PLANE+qLane*WORK_STRIDE+axis]);
+                    }
+                }
+                barrier();
+            }
+            products=subgroupAdd(products);decodes=subgroupAdd(decodes);
+            if(headActive&&c==0u){
+                attentionReceipts[at+4u]=products;attentionReceipts[at+5u]=decodes;
+                attentionReceipts[at+6u]=count;attentionReceipts[at+7u]=15u;
+                statisticAdd(3u,products);statisticAdd(7u,count);statisticAdd(8u,count);
+            }
+        }
+        if(headActive){
+            if(!finiteValue(reference)||reference<=0.0||!finiteValue(maximum))attentionFailure();
+            if(c==0u){uint p=(row*max(H,uint(RT_ATTENTION_HEADS))+head)*2u;
+                physical[p]=maximum+20.0;physical[p+1u]=reference;
+                statisticAdd(4u,DH);statisticAdd(5u,DH);statisticAdd(15u,DH);statisticAdd(11u,DH);}
+            for(uint k=0u;k<LANE_AXES;k++){uint axis=c+k*32u;
+                if(axis<DH)detector[row*A+head*DH+axis]=finalHeadSignal(row,head*DH+axis,signal[k]-correction[k],reference);}
+        }
+        barrier();if(groupFailure!=0u)return;
+    }
+}
+
+void main(){
+    if(stopped())return;
+    uint lane=gl_LocalInvocationID.x;
+    if(operation==2u){uint row=gl_WorkGroupID.x*gl_WorkGroupSize.x+lane;
+        if(row<cfg.rows)hits[row*(cfg.capacity+1u)]=0u;if(row==0u)control[6]=0u;return;}
+    uint row=gl_WorkGroupID.y;if(row>=cfg.rows)return;
+    if(operation==0u){
+        if(gl_WorkGroupSize.x!=256u||gl_SubgroupSize!=32u){if(lane==0u)atomicOr(control[3],ATTENTION_ERROR);return;}
+        keyAttention(row,gl_WorkGroupID.x,lane);
+    }else if(operation==1u){
+        if((control[3]&ATTENTION_ERROR)!=0u)return;
+        valueAttention(row,gl_WorkGroupID.x,lane);
+    }
+}

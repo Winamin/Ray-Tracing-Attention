@@ -38,7 +38,7 @@ public:
     struct MemoryPool {VkDeviceMemory memory;VkDeviceSize size,used;uint32_t type,kind,live;};
     std::vector<MemoryPool> memoryPools;
     uint64_t allocated{},physicalAllocated{},physicalDeviceAllocated{};std::filesystem::path directory;VkPipelineLayout layout{};
-    Buffer* buffer(VkDeviceSize size,VkBufferUsageFlags usage,bool host=false) {
+    Buffer* buffer(VkDeviceSize size,VkBufferUsageFlags usage,bool host=false,bool standalone=false) {
         auto item=std::make_unique<Buffer>();auto* b=item.get();buffers.push_back(std::move(item));b->size=size;
         VkBufferCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};ci.size=size;ci.usage=usage;
         check(vkCreateBuffer(device,&ci,nullptr,&b->handle),"create buffer");
@@ -54,7 +54,7 @@ public:
         uint32_t kind=usage&VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR?2u:
             (usage&VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)&&!(usage&VK_BUFFER_USAGE_TRANSFER_DST_BIT)?1u:0u;
         VkDeviceSize bindingOffset=0;
-        if(!host&&req.size<16u*1024u*1024u&&!dedicated.requiresDedicatedAllocation){
+        if(!host&&!standalone&&req.size<16u*1024u*1024u&&!dedicated.requiresDedicatedAllocation){
             MemoryPool* selected=nullptr;
             for(auto& pool:memoryPools){auto at=(pool.used+req.alignment-1)&~(req.alignment-1);if(pool.memory&&pool.type==type&&pool.kind==kind&&at+req.size<=pool.size){selected=&pool;bindingOffset=at;break;}}
             if(!selected){
@@ -122,14 +122,14 @@ public:
         check(vkEndCommandBuffer(c),"end download");submit(c);vkFreeCommandBuffers(device,pool,1,&c);
         std::vector<T> data(count);std::memcpy(data.data(),staging->map,count*sizeof(T));return data;
     }
-    VkPipeline pipeline(const char* name,VkPipelineLayout customLayout=VK_NULL_HANDLE,uint32_t operation=0xffffffffu,uint32_t tile=1u,uint32_t projection=0xffffffffu,uint32_t spatialTile=0xffffffffu,uint32_t localWidth=0xffffffffu,uint32_t featureTile=0xffffffffu,uint32_t readoutUnroll=0xffffffffu,uint32_t readoutWords=0xffffffffu,uint32_t coefficientFormat=0xffffffffu,uint32_t upFormat=0xffffffffu) {
+    VkPipeline pipeline(const char* name,VkPipelineLayout customLayout=VK_NULL_HANDLE,uint32_t operation=0xffffffffu,uint32_t tile=1u,uint32_t projection=0xffffffffu,uint32_t spatialTile=0xffffffffu,uint32_t localWidth=0xffffffffu,uint32_t featureTile=0xffffffffu,uint32_t readoutUnroll=0xffffffffu,uint32_t readoutWords=0xffffffffu,uint32_t coefficientFormat=0xffffffffu,uint32_t upFormat=0xffffffffu,uint32_t attentionTC=0xffffffffu) {
         std::ifstream file(directory/(std::string(name)+".spv"),std::ios::binary|std::ios::ate);if(!file)throw std::runtime_error("Missing SPIR-V");
         size_t bytes=size_t(file.tellg());file.seekg(0);std::vector<uint32_t> code(bytes/4);file.read(reinterpret_cast<char*>(code.data()),bytes);
         VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};mi.codeSize=bytes;mi.pCode=code.data();VkShaderModule module{};
         check(vkCreateShaderModule(device,&mi,nullptr,&module),"create shader");
         VkComputePipelineCreateInfo pi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};pi.layout=customLayout?customLayout:layout;
         pi.stage={VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};pi.stage.stage=VK_SHADER_STAGE_COMPUTE_BIT;pi.stage.module=module;pi.stage.pName="main";
-        uint32_t constants[10]{operation,tile,projection,spatialTile,localWidth==0xffffffffu?128u:localWidth,featureTile,readoutUnroll,readoutWords,coefficientFormat,upFormat};VkSpecializationMapEntry entries[10]{{0,0,4},{1,4,4},{2,8,4},{3,12,4},{4,16,4},{5,20,4},{6,24,4},{7,28,4},{8,32,4},{9,36,4}};uint32_t constantCount=upFormat!=0xffffffffu?10u:coefficientFormat!=0xffffffffu?9u:readoutWords!=0xffffffffu?8u:readoutUnroll!=0xffffffffu?7u:featureTile!=0xffffffffu?6u:localWidth!=0xffffffffu?5u:spatialTile!=0xffffffffu?4u:projection!=0xffffffffu?3u:tile==1u?1u:2u;VkSpecializationInfo specialization{constantCount,entries,size_t(constantCount)*4u,constants};if(operation!=0xffffffffu)pi.stage.pSpecializationInfo=&specialization;
+        uint32_t constants[11]{operation,tile,projection,spatialTile,localWidth==0xffffffffu?128u:localWidth,featureTile,readoutUnroll,readoutWords,coefficientFormat,upFormat,attentionTC};VkSpecializationMapEntry entries[11]{{0,0,4},{1,4,4},{2,8,4},{3,12,4},{4,16,4},{5,20,4},{6,24,4},{7,28,4},{8,32,4},{9,36,4},{10,40,4}};uint32_t constantCount=attentionTC!=0xffffffffu?11u:upFormat!=0xffffffffu?10u:coefficientFormat!=0xffffffffu?9u:readoutWords!=0xffffffffu?8u:readoutUnroll!=0xffffffffu?7u:featureTile!=0xffffffffu?6u:localWidth!=0xffffffffu?5u:spatialTile!=0xffffffffu?4u:projection!=0xffffffffu?3u:tile==1u?1u:2u;VkSpecializationInfo specialization{constantCount,entries,size_t(constantCount)*4u,constants};if(operation!=0xffffffffu)pi.stage.pSpecializationInfo=&specialization;
         VkPipeline result{};auto r=vkCreateComputePipelines(device,VK_NULL_HANDLE,1,&pi,nullptr,&result);vkDestroyShaderModule(device,module,nullptr);check(r,"create pipeline");return result;
     }
     void initialize(const std::filesystem::path& dir,uint32_t cap){directory=dir;capacity=cap;bool integerDot=false;

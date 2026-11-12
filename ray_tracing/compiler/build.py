@@ -40,10 +40,24 @@ def build(spec, output=None):
     cpp+='constexpr uint32_t MODEL_FULL_INDEX[]={'+','.join(map(str,mapping))+'};\n'
     (target/'rt_layer_map.hpp').write_text(cpp,encoding='utf8')
     commands=[]
-    for name in ('resident_math','resident_mlp','resident_batch2','resident_pack','resident_attention','resident_attention_receipt','resident_attention_dense','resident_auxiliary','resident_state','resident_ray','reply_cache','optical_path_key','history_cache'):
+    shader_names=('resident_math','resident_mlp','resident_batch2','resident_pack','resident_attention','resident_attention_receipt','resident_attention_dense','resident_attention_local','resident_attention_classes','resident_auxiliary','resident_state','resident_ray','reply_cache','optical_path_key','history_cache')
+    local_split_names=()
+    if spec.full_layers and spec.attention_head_dim==256 and spec.query_width==4*spec.kv_width:
+        local_split_names=('resident_attention_local_key','resident_attention_local_value',
+                           'resident_attention_local_trace','resident_attention_local_key_fallback')
+        shader_names+=local_split_names
+    for name in shader_names:
         environment='vulkan1.3' if name in ('resident_batch2','resident_attention','resident_auxiliary') else 'vulkan1.2'
-        commands += [[shader_compiler,'-V','--target-env',environment,'-DRT_VECTOR_DECODE='+str(int(vector_decode)),'-I'+str(target),'-I'+str(NATIVE/'shaders'),str(NATIVE/'shaders'/(name+'.comp')),'-o',str(target/(name+'.spv'))],
+        defines=[]
+        source='resident_attention_direct.comp' if name=='resident_attention_local' else name+'.comp'
+        optimization=['-Os'] if name in local_split_names else []
+        commands += [[shader_compiler,'-V',*optimization,'--target-env',environment,'-DRT_VECTOR_DECODE='+str(int(vector_decode)),'-I'+str(target),'-I'+str(NATIVE/'shaders'),*defines,str(NATIVE/'shaders'/source),'-o',str(target/(name+'.spv'))],
                      [validator,'--target-env',environment,str(target/(name+'.spv'))]]
+        if name=='resident_attention_receipt':
+            # Compile the TC variant from the same source; keep the portable
+            # FP32 module free of cooperative-matrix capability requirements.
+            commands += [[shader_compiler,'-V','--target-env','vulkan1.3','-DRT_ATTENTION_TC=1','-I'+str(target),'-I'+str(NATIVE/'shaders'),str(NATIVE/'shaders'/source),'-o',str(target/(name+'_tc.spv'))],
+                         [validator,'--target-env','vulkan1.3',str(target/(name+'_tc.spv'))]]
     flags=['-static-libgcc','-static-libstdc++','-Wl,-Bstatic,--whole-archive','-lwinpthread','-Wl,--no-whole-archive,-Bdynamic','-lvulkan-1'] if os.name=='nt' else ['-lvulkan','-pthread']
     commands += [[os.environ.get('CXX','g++'),'-std=c++17','-O3','-ffp-contract=off','-I'+str(target),'-I'+str(NATIVE/'include'),str(NATIVE/'src/optical_resident.cpp'),*flags,'-o',str(executable)]]
     options={'creationflags':subprocess.CREATE_NO_WINDOW} if os.name=='nt' else {}

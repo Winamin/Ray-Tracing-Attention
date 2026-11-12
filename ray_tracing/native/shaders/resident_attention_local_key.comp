@@ -1,0 +1,186 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#include "resident_common.glsl"
+#include "resident_attention_classes.glsl"
+#define headCount() parameters[blockBase()+23u]
+
+// RT-defined local K classes serve four GQA heads and two query rows.
+// K consumes all original Q members; only D representative products remain.
+layout(constant_id=1) const uint BLOCK=128u;
+layout(std430,binding=42) buffer AttentionReceipts {uint attentionReceipts[];};
+const uint DH=RT_ATTENTION_HEAD_DIM,Q_BATCH=4u,KEY_SLICES=4u,Q_ROWS=2u;
+const uint Q_PER_KV=RT_QUERY_WIDTH/RT_GQA_WIDTH;
+const uint COVERAGE_WORDS=BLOCK/32u,SCORE_OFFSET=8u+COVERAGE_WORDS;
+const uint WEIGHT_OFFSET=SCORE_OFFSET+BLOCK,RECORD_WORDS=WEIGHT_OFFSET+BLOCK;
+const uint ATTENTION_ERROR=65536u;
+shared uint groupFailure;
+shared uint classTile[KEY_SLICES*(DH/4u)],keyWork[Q_ROWS*KEY_SLICES*Q_BATCH*2u];
+shared vec4 qHeadTile[Q_ROWS*DH];
+#include "resident_attention_local_common.glsl"
+void accurateAddHeads(inout vec4 sum,inout vec4 correction,vec4 value){
+    precise vec4 adjusted=value-correction,next=sum+adjusted;
+    correction=(next-sum)-adjusted;sum=next;
+}
+void accurateProductHeads(inout vec4 sum,inout vec4 correction,vec4 query,float key){
+    precise vec4 product=query*vec4(key),nextSum=sum,nextCorrection=correction;
+    accurateAddHeads(nextSum,nextCorrection,product);
+    accurateAddHeads(nextSum,nextCorrection,fma(query,vec4(key),-product));
+    // Zero query sums preserve the existing compensation independently per head.
+    bvec4 activeHeads=notEqual(query,vec4(0.0));
+    sum=mix(sum,nextSum,activeHeads);correction=mix(correction,nextCorrection,activeHeads);
+}
+vec4 accurateReduceHeads(vec4 sum,vec4 correction){
+    for(uint offset=16u;offset>0u;offset>>=1u){
+        vec4 otherSum=subgroupShuffleXor(sum,offset),otherCorrection=subgroupShuffleXor(correction,offset);
+        accurateAddHeads(sum,correction,otherSum);
+        accurateAddHeads(sum,correction,-otherCorrection);
+    }
+    return sum-correction;
+}
+void keyAttention(uint firstRow,uint group,uint kv,uint lane){
+    uint rows=min(Q_ROWS,cfg.rows-firstRow),lastRow=firstRow+rows-1u;
+    bool diagnostics=(cfg.debug&(65536u|131072u))!=0u;
+    uint available=availablePositions(lastRow),first=group*BLOCK;
+    if(first>=available)return;
+    if(cfg.mode!=1u&&rows>1u&&available==cfg.capacity){if(lane==0u)atomicOr(control[3],ATTENTION_ERROR);return;}
+    uint count=min(BLOCK+(cfg.mode==1u?0u:rows-1u),available-first),heads=headCount();
+    if(lane==0u)groupFailure=0u;
+    uint c=gl_SubgroupInvocationID,slice=gl_SubgroupID;
+    for(uint headOffset=0u;headOffset<Q_PER_KV;headOffset+=Q_BATCH){
+        for(uint i=lane;i<Q_ROWS*DH;i+=gl_WorkGroupSize.x){
+            uint r=i/DH,axis=i%DH,head=kv*Q_PER_KV+headOffset;
+            qHeadTile[i]=vec4(r<rows&&head+0u<heads&&headOffset+0u<Q_PER_KV?queries[(firstRow+r)*A+(head+0u)*DH+axis]:0.0,r<rows&&head+1u<heads&&headOffset+1u<Q_PER_KV?queries[(firstRow+r)*A+(head+1u)*DH+axis]:0.0,r<rows&&head+2u<heads&&headOffset+2u<Q_PER_KV?queries[(firstRow+r)*A+(head+2u)*DH+axis]:0.0,r<rows&&head+3u<heads&&headOffset+3u<Q_PER_KV?queries[(firstRow+r)*A+(head+3u)*DH+axis]:0.0);
+        }
+        barrier();
+        uvec4 products0=uvec4(0u);uint decodes0=0u;
+        uvec4 products1=uvec4(0u);uint decodes1=0u;
+        for(uint firstToken=0u;firstToken<count;firstToken+=KEY_SLICES){
+            uint n=min(KEY_SLICES,count-firstToken);
+            if(slice<n){
+                uint slot=hits[lastRow*(cfg.capacity+1u)+first+firstToken+slice+1u];
+                uint membersAddress=classDomainAddress(slot,kv,false)+2u*compactCount(slot,kv,false);
+                for(uint index=c;index<DH/4u;index+=32u)classTile[slice*(DH/4u)+index]=attentionClasses[membersAddress+index];
+            }
+            subgroupMemoryBarrierShared();subgroupBarrier();
+            uint shift0=cfg.mode==1u?0u:rows-1u-0u,rowAvailable0=availablePositions(firstRow+0u);
+            uint rowCount0=first<rowAvailable0?min(BLOCK,rowAvailable0-first):0u;
+            bool scoreActive0=0u<rows&&slice<n&&firstToken+slice>=shift0&&firstToken+slice-shift0<rowCount0;
+            precise vec4 sum0=vec4(0.0),error0=vec4(0.0);
+            uint shift1=cfg.mode==1u?0u:rows-1u-1u,rowAvailable1=availablePositions(firstRow+1u);
+            uint rowCount1=first<rowAvailable1?min(BLOCK,rowAvailable1-first):0u;
+            bool scoreActive1=1u<rows&&slice<n&&firstToken+slice>=shift1&&firstToken+slice-shift1<rowCount1;
+            precise vec4 sum1=vec4(0.0),error1=vec4(0.0);
+            uint descriptorSlot=slice<n?hits[lastRow*(cfg.capacity+1u)+first+firstToken+slice+1u]:0u;
+            uint descriptorBase=slice<n?classDomainAddress(descriptorSlot,kv,false):0u;
+            uint rootCount=slice<n?compactCount(descriptorSlot,kv,false):0u;
+            if(slice<n&&(rootCount==0u||rootCount>DH)){attentionFailure();rootCount=0u;}
+            // Consume RT-provided D roots directly; each rank matches its value.
+            // The current product producer preserves its own representative order.
+            if(slice<n)for(uint root=c;root<rootCount;root+=32u){
+                uint descriptor=attentionClasses[descriptorBase+root],axis=descriptor&255u;
+                uint members=(descriptor>>16u)&511u,offset=(descriptor>>8u)&255u;
+                if(axis>=DH||members==0u||offset+members>DH){attentionFailure();continue;}
+                uint base=slice*(DH/4u);
+                float value=uintBitsToFloat(attentionClasses[descriptorBase+rootCount+root]);
+                if(!finiteValue(value)){attentionFailure();continue;}
+                if(value==0.0){
+                    if(diagnostics&&scoreActive0)decodes0++;
+                    if(diagnostics&&scoreActive1)decodes1++;
+                    continue;
+                }
+                precise vec4 qsum0=qHeadTile[0u*DH+axis],qerror0=vec4(0.0);
+                if(diagnostics&&scoreActive0)decodes0++;
+                precise vec4 qsum1=qHeadTile[1u*DH+axis],qerror1=vec4(0.0);
+                if(diagnostics&&scoreActive1)decodes1++;
+                for(uint seen=1u;seen<members;seen++){
+                    uint index=offset+seen,word=classTile[base+index/4u];
+                    uint member=(word>>((index&3u)*8u))&255u;
+                    accurateAddHeads(qsum0,qerror0,qHeadTile[0u*DH+member]);
+                    accurateAddHeads(qsum1,qerror1,qHeadTile[1u*DH+member]);
+                }
+                qsum0-=qerror0;qsum1-=qerror1;
+                if(scoreActive0){
+                    accurateProductHeads(sum0,error0,qsum0,value);
+                    if(diagnostics)products0+=uvec4(notEqual(qsum0,vec4(0.0)));
+                }
+                if(scoreActive1){
+                    accurateProductHeads(sum1,error1,qsum1,value);
+                    if(diagnostics)products1+=uvec4(notEqual(qsum1,vec4(0.0)));
+                }
+
+            }
+            vec4 scores0=accurateReduceHeads(sum0,error0)/sqrt(float(DH));
+            if(scoreActive0&&c<4u){uint h=c;
+                uint head=kv*Q_PER_KV+headOffset+h;
+                if(head<heads&&headOffset+h<Q_PER_KV){
+                    float score=scores0[h];if(!finiteValue(score))attentionFailure();
+                    attentionReceipts[recordIndex(firstRow+0u,group,head)*RECORD_WORDS+SCORE_OFFSET+firstToken+slice-shift0]=floatBitsToUint(score);
+                }
+            }
+            vec4 scores1=accurateReduceHeads(sum1,error1)/sqrt(float(DH));
+            if(scoreActive1&&c<4u){uint h=c;
+                uint head=kv*Q_PER_KV+headOffset+h;
+                if(head<heads&&headOffset+h<Q_PER_KV){
+                    float score=scores1[h];if(!finiteValue(score))attentionFailure();
+                    attentionReceipts[recordIndex(firstRow+1u,group,head)*RECORD_WORDS+SCORE_OFFSET+firstToken+slice-shift1]=floatBitsToUint(score);
+                }
+            }
+
+            subgroupMemoryBarrierShared();subgroupBarrier();
+        }
+        if(diagnostics){
+        products0=subgroupAdd(products0);decodes0=subgroupAdd(decodes0);
+        if(c==0u)for(uint h=0u;h<4u;h++){
+            uint at=((0u*KEY_SLICES+slice)*Q_BATCH+h)*2u;
+            keyWork[at]=products0[h];keyWork[at+1u]=decodes0;
+        }
+        products1=subgroupAdd(products1);decodes1=subgroupAdd(decodes1);
+        if(c==0u)for(uint h=0u;h<4u;h++){
+            uint at=((1u*KEY_SLICES+slice)*Q_BATCH+h)*2u;
+            keyWork[at]=products1[h];keyWork[at+1u]=decodes1;
+        }
+        }
+        barrier();if(groupFailure!=0u)return;
+        if(slice==0u)for(uint r=0u;r<rows;r++){
+            uint row=firstRow+r,rowAvailable=availablePositions(row);
+            if(first>=rowAvailable)continue;
+            uint rowCount=min(BLOCK,rowAvailable-first);
+            for(uint h=0u;h<4u;h++){
+                uint head=kv*Q_PER_KV+headOffset+h;
+                if(head>=heads||headOffset+h>=Q_PER_KV)continue;
+                uint at=recordIndex(row,group,head)*RECORD_WORDS;
+                if(c==0u){
+                    uint p=0u,d=0u;
+                    if(diagnostics)for(uint s=0u;s<KEY_SLICES;s++){p+=keyWork[((r*KEY_SLICES+s)*Q_BATCH+h)*2u];d+=keyWork[((r*KEY_SLICES+s)*Q_BATCH+h)*2u+1u];}
+                    uint rays=head==0u?attentionReceipts[at+3u]:0u;
+                    attentionReceipts[at]=p;attentionReceipts[at+1u]=d;attentionReceipts[at+2u]=rowCount;
+                    attentionReceipts[at+3u]=rays;attentionReceipts[at+7u]=3u;
+                    if(diagnostics)statisticAdd(0u,rowCount);if(diagnostics)statisticAdd(1u,rowCount);if(diagnostics)statisticAdd(2u,p);
+                    if(diagnostics)statisticAdd(6u,d);if(diagnostics)statisticAdd(9u,rays);if(diagnostics)statisticAdd(10u,1u);
+                }
+                for(uint w=c;w<COVERAGE_WORDS;w+=32u){
+                    uint bit=w*32u,n=bit<rowCount?min(32u,rowCount-bit):0u;
+                    attentionReceipts[at+8u+w]=n==32u?0xffffffffu:n==0u?0u:(1u<<n)-1u;
+                }
+                for(uint j=c;j<BLOCK;j+=32u){
+                    if(j>=rowCount)attentionReceipts[at+SCORE_OFFSET+j]=floatBitsToUint(-1.0/0.0);
+                    attentionReceipts[at+WEIGHT_OFFSET+j]=0u;
+                }
+            }
+        }
+        barrier();if(groupFailure!=0u)return;
+    }
+}
+void main(){
+    if(stopped())return;
+    if(DH!=256u||Q_PER_KV!=4u){if(gl_LocalInvocationID.x==0u)atomicOr(control[3],ATTENTION_ERROR);return;}
+    uint lane=gl_LocalInvocationID.x,row=gl_WorkGroupID.y;
+    uint firstRow=row*Q_ROWS;if(firstRow>=cfg.rows)return;
+    if(gl_WorkGroupSize.x!=128u||gl_SubgroupSize!=32u){if(lane==0u)atomicOr(control[3],ATTENTION_ERROR);return;}
+    uint kvHeads=(headCount()+Q_PER_KV-1u)/Q_PER_KV;
+    keyAttention(firstRow,gl_WorkGroupID.x/kvHeads,gl_WorkGroupID.x%kvHeads,lane);
+}

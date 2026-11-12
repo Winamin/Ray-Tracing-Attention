@@ -1,0 +1,29 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#include "resident_common.glsl"
+#define headCount() parameters[blockBase()+23u]
+layout(constant_id=1) const uint BLOCK=128u;
+layout(std430,binding=42) buffer AttentionReceipts {uint attentionReceipts[];};
+const uint DH=RT_ATTENTION_HEAD_DIM,COVERAGE_WORDS=BLOCK/32u,SCORE_OFFSET=8u+COVERAGE_WORDS;
+const uint WEIGHT_OFFSET=SCORE_OFFSET+BLOCK,RECORD_WORDS=WEIGHT_OFFSET+BLOCK;
+const uint ATTENTION_ERROR=65536u;
+rayQueryEXT receiptRay;
+shared uint localSlots[BLOCK],coverage[COVERAGE_WORDS];
+shared uint groupFailure,uniqueHits,rayInitializations;
+shared vec3 historyOrigin,historyDirection;
+#include "resident_attention_direct_trace.glsl"
+void main(){
+    if(stopped())return;
+    uint row=gl_WorkGroupID.y,lane=gl_LocalInvocationID.x,group=gl_WorkGroupID.x;
+    if(row>=cfg.rows)return;
+    if(gl_WorkGroupSize.x!=32u||gl_SubgroupSize!=32u){if(lane==0u)atomicOr(control[3],ATTENTION_ERROR);return;}
+    uint available=availablePositions(row),first=group*BLOCK;if(first>=available)return;
+    uint count=min(BLOCK,available-first);
+    traceGroup(row,group,count,lane);if(groupFailure!=0u)return;
+    for(uint i=lane;i<count;i+=gl_WorkGroupSize.x)hits[row*(cfg.capacity+1u)+first+i+1u]=localSlots[i];
+    if(lane==0u)attentionReceipts[recordIndex(row,group,0u)*RECORD_WORDS+3u]=rayInitializations;
+}

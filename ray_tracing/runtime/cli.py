@@ -434,7 +434,8 @@ class ChatSession:
             rows.append("GPU 传感器：" + data["gpu"].get("reason", "无数据"))
         r = self.resources
         rows.extend([f"RT 状态：{'硬件查询 + 命中回执' if self.native.metadata['routing'] == 'rt_full' else self.native.metadata['routing']}",
-                     f"Attention：{self.native.metadata['attention_backend']} · 历史分组 {self.native.metadata['attention_block']} · 保留全部因果贡献",
+                     f"Attention：{self.native.metadata['attention_backend']} · 历史分组 {self.native.metadata['attention_block']} · "
+                     f"{'V 成员分发开启' if self.native.metadata.get('attention_v_members') else 'V 成员分发关闭' if self.native.metadata.get('attention_backend')=='grouped_rt_local' else '保留全部因果贡献'}",
                      f"MLP：{self.native.metadata['mlp_backend']} · prefill {self.native.metadata['mlp_prefill_compute']} · decode {self.native.metadata['mlp_decode_compute']} · 同批共享 {self.native.metadata['mlp_token_tile']} token",
                      f"Prefill 并行位置 {self.native.metadata['prefill_batch']} · 权重共享 {self.native.metadata['matrix_token_tile']} token",
                      f"历史 BVH {r['history_blas_count']} BLAS / {r['history_tlas_count']} TLAS · "
@@ -589,12 +590,14 @@ def parser():
                    help="Prefill 并行位置数；按绝对位置批量写入和查询 Tree")
     p.add_argument("--prefill-matrix-rows", type=int, choices=(4,8,16), default=8,
                    help="共享一组量化权重的 token 数")
-    p.add_argument("--attention-backend", choices=("standard","standard_fp32","grouped_rt","grouped_rt_dense"), default="standard",
+    p.add_argument("--attention-backend", choices=("standard","standard_fp32","grouped_rt","grouped_rt_dense","grouped_rt_local","grouped_rt_tc"), default="standard",
                    help="Attention 算法：原版、FP32 对照或 RT 全贡献分组聚合")
     p.add_argument("--mlp-backend", choices=("standard","rt_transmission"), default="standard",
                    help="MLP 算法：原矩阵通路或 RT Core 固定透射通路")
     p.add_argument("--attention-block", type=int, choices=(128,256,512), default=128,
                    help="每个完整 attention 回执覆盖的历史位置数")
+    p.add_argument("--attention-v-members", action=argparse.BooleanOptionalAction, default=False,
+                   help="将 RT 代表 V 分发到全部成员维度，默认关闭")
     p.add_argument("--cache", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--profile", action="store_true", help="启用阶段 GPU 时间戳；执行计算路径")
     p.set_defaults(routing="rt_full",aperture=.08)
@@ -646,7 +649,8 @@ def main(argv=None):
                                  aperture=args.aperture, word_tile=args.word_tile, feature_tile=args.feature_tile,
                                  readout_unroll=args.readout_unroll, readout_words=args.readout_words,
                                  prefill_batch=args.prefill_batch,matrix_rows=args.prefill_matrix_rows,
-                                 attention_backend=args.attention_backend,attention_block=args.attention_block,mlp_backend=args.mlp_backend)
+                                 attention_backend=args.attention_backend,attention_block=args.attention_block,mlp_backend=args.mlp_backend,
+                                 attention_v_members=args.attention_v_members)
         session = ChatSession(native, encoder, args, console, monitor, log)
         monitor.progress("idle")
         monitor.sample()
