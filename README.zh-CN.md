@@ -200,7 +200,8 @@ Ray Tracing Attention/
     native/src/                 Vulkan 引擎、几何场景、共享因果缓存
     native/shaders/             共用 RT 与光学计算 Shader
     native/include/             Vulkan 头文件
-  docs/images/                  英文算子图的 PNG、SVG 与 PDF
+  docs/images/                  英文算子图 PNG 与渲染脚本
+  docs/paper/images/            论文用图的 PDF
   docs/paper/                    成品论文 PDF 与内置图片
   .github/workflows/            源码语法与打包检查
   .local/                       本机模型、工具、构建缓存与会话

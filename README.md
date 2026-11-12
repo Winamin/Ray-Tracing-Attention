@@ -201,7 +201,8 @@ Ray Tracing Attention/
     native/src/                 Vulkan engine, geometric scenes, shared causal cache
     native/shaders/             Shared RT and optical compute shaders
     native/include/             Vulkan headers
-  docs/images/                  English operator diagrams as PNG, SVG, and PDF
+  docs/images/                  English operator diagram PNGs and the rendering script
+  docs/paper/images/            Paper figures as PDF
   docs/paper/                   Finished paper PDF and embedded figures
   .github/workflows/            Source syntax and packaging checks
   .local/                       Local models, tools, build caches, and sessions
