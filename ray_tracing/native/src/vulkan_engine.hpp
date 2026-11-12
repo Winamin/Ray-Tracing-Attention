@@ -30,7 +30,11 @@ class Engine {
 public:
     VkInstance instance{};VkPhysicalDevice physical{};VkDevice device{};VkQueue queue{};
     VkPhysicalDeviceMemoryProperties memory{};uint32_t family{},alignment{},capacity{},width{};
-    float period{};std::string deviceName;VkCommandPool pool{};VkFence fence{};VkQueryPool timestamps{};uint32_t timestampCount{};bool cooperativeMatrix{},cooperativeMatrix2{};
+    float period{};std::string deviceName;VkCommandPool pool{};VkFence fence{};VkQueryPool timestamps{};uint32_t timestampCount{};bool cooperativeMatrix{},cooperativeMatrix2{},shaderSubgroupPartitioned{},shaderBfloat16{};
+    uint32_t maxComputeInvocations{},maxComputeSizeX{},maxComputeSharedMemory{};
+    bool supportsWorkgroup(uint32_t invocations,uint64_t sharedBytes)const{
+        return invocations<=maxComputeInvocations&&invocations<=maxComputeSizeX&&sharedBytes<=maxComputeSharedMemory;
+    }
     PFN_vkCreateAccelerationStructureKHR createAS{};PFN_vkDestroyAccelerationStructureKHR destroyAS{};
     PFN_vkGetAccelerationStructureBuildSizesKHR getSizes{};PFN_vkCmdBuildAccelerationStructuresKHR buildAS{};
     PFN_vkGetAccelerationStructureDeviceAddressKHR asAddress{};
@@ -144,6 +148,9 @@ public:
         VkPhysicalDeviceAccelerationStructurePropertiesKHR asProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR};asProps.pNext=&subgroup;
         VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};props.pNext=&asProps;vkGetPhysicalDeviceProperties2(physical,&props);
         alignment=asProps.minAccelerationStructureScratchOffsetAlignment;period=props.properties.limits.timestampPeriod;deviceName=props.properties.deviceName;
+        maxComputeInvocations=props.properties.limits.maxComputeWorkGroupInvocations;
+        maxComputeSizeX=props.properties.limits.maxComputeWorkGroupSize[0];
+        maxComputeSharedMemory=props.properties.limits.maxComputeSharedMemorySize;
         if(subgroup.subgroupSize!=32||!(subgroup.supportedOperations&VK_SUBGROUP_FEATURE_ARITHMETIC_BIT))throw std::runtime_error("32-lane arithmetic subgroups required");
         if(integerDot&&!dotProps.integerDotProduct4x8BitPackedSignedAccelerated)throw std::runtime_error("Hardware packed signed integer dot product required");
         VkPhysicalDeviceBufferDeviceAddressFeatures address{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
@@ -152,6 +159,9 @@ public:
         VkPhysicalDeviceShaderIntegerDotProductFeaturesKHR dot{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR};
         uint32_t extensionCount=0;vkEnumerateDeviceExtensionProperties(physical,nullptr,&extensionCount,nullptr);std::vector<VkExtensionProperties> available(extensionCount);vkEnumerateDeviceExtensionProperties(physical,nullptr,&extensionCount,available.data());
         bool hasCooperative=std::any_of(available.begin(),available.end(),[](const auto& p){return std::strcmp(p.extensionName,VK_NV_COOPERATIVE_MATRIX_EXTENSION_NAME)==0;});
+        shaderSubgroupPartitioned=(subgroup.supportedStages&VK_SHADER_STAGE_COMPUTE_BIT)&&
+            (subgroup.supportedOperations&VK_SUBGROUP_FEATURE_PARTITIONED_BIT_NV)&&
+            std::any_of(available.begin(),available.end(),[](const auto& p){return std::strcmp(p.extensionName,VK_NV_SHADER_SUBGROUP_PARTITIONED_EXTENSION_NAME)==0;});
         VkPhysicalDeviceShaderFloat16Int8Features half{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES};
         VkPhysicalDeviceCooperativeMatrixFeaturesNV coop{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_NV};
         bool hasCooperative2=std::any_of(available.begin(),available.end(),[](const auto& p){return std::strcmp(p.extensionName,"VK_NV_cooperative_matrix2")==0;});
@@ -161,9 +171,12 @@ public:
         VkPhysicalDevice16BitStorageFeatures storage16{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES};
         bool hasVector=std::any_of(available.begin(),available.end(),[](const auto& p){return std::strcmp(p.extensionName,"VK_NV_cooperative_matrix_decode_vector")==0;});
         VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV vectorDecode{VkStructureType(1000689000)};
+        bool hasBfloat=std::any_of(available.begin(),available.end(),[](const auto& p){return std::strcmp(p.extensionName,"VK_KHR_shader_bfloat16")==0;});
+        VkPhysicalDeviceShaderBfloat16FeaturesKHR bfloat{VkStructureType(1000141000)};
         if(hasCooperative){address.pNext=&half;half.pNext=&coop;}
         if(hasCooperative2){coop.pNext=&coopKHR;coopKHR.pNext=&coop2;coop2.pNext=&maintenance;maintenance.pNext=&storage16;}
         if(hasVector)storage16.pNext=&vectorDecode;
+        if(hasBfloat){if(hasVector)vectorDecode.pNext=&bfloat;else storage16.pNext=&bfloat;}
         if(integerDot)address.pNext=&dot;
         rq.pNext=&as;as.pNext=&address;VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};features.pNext=&rq;vkGetPhysicalDeviceFeatures2(physical,&features);
         if(!rq.rayQuery||!as.accelerationStructure||!address.bufferDeviceAddress)throw std::runtime_error("Vulkan RT unavailable");
@@ -171,12 +184,14 @@ public:
         cooperativeMatrix=hasCooperative&&half.shaderFloat16&&coop.cooperativeMatrix;
         cooperativeMatrix2=hasCooperative2&&maintenance.maintenance4&&storage16.storageBuffer16BitAccess&&coopKHR.cooperativeMatrix&&coop2.cooperativeMatrixWorkgroupScope&&coop2.cooperativeMatrixFlexibleDimensions&&coop2.cooperativeMatrixTensorAddressing&&coop2.cooperativeMatrixBlockLoads&&coop2.cooperativeMatrixReductions&&coop2.cooperativeMatrixConversions&&coop2.cooperativeMatrixPerElementOperations;
         cooperativeMatrix2=cooperativeMatrix2&&hasVector&&vectorDecode.cooperativeMatrixDecodeVector&&half.shaderFloat16&&features.features.shaderInt16&&features.features.shaderInt64&&(subgroup.supportedOperations&VK_SUBGROUP_FEATURE_CLUSTERED_BIT);
+        shaderBfloat16=cooperativeMatrix2&&hasBfloat&&bfloat.shaderBFloat16Type&&bfloat.shaderBFloat16CooperativeMatrix;
         if(cooperativeMatrix){auto get=(PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesNV)vkGetInstanceProcAddr(instance,"vkGetPhysicalDeviceCooperativeMatrixPropertiesNV");uint32_t n=0;check(get(physical,&n,nullptr),"query cooperative matrix shapes");std::vector<VkCooperativeMatrixPropertiesNV> shapes(n,{VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_NV});check(get(physical,&n,shapes.data()),"query cooperative matrix shapes");cooperativeMatrix=std::any_of(shapes.begin(),shapes.end(),[](const auto& p){return p.MSize==16&&p.NSize==8&&p.KSize==16&&p.AType==VK_COMPONENT_TYPE_FLOAT16_NV&&p.BType==VK_COMPONENT_TYPE_FLOAT16_NV&&p.CType==VK_COMPONENT_TYPE_FLOAT32_NV&&p.DType==VK_COMPONENT_TYPE_FLOAT32_NV&&p.scope==VK_SCOPE_SUBGROUP_NV;});}
         rq={VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};as={VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};address={VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
         rq.rayQuery=as.accelerationStructure=address.bufferDeviceAddress=VK_TRUE;rq.pNext=&as;as.pNext=&address;
         if(cooperativeMatrix){half={VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES};half.shaderFloat16=VK_TRUE;coop={VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_NV};coop.cooperativeMatrix=VK_TRUE;address.pNext=&half;half.pNext=&coop;}
         if(cooperativeMatrix2){coopKHR={VkStructureType(1000506000)};coopKHR.cooperativeMatrix=VK_TRUE;coop2={VkStructureType(1000593000)};coop2.cooperativeMatrixWorkgroupScope=coop2.cooperativeMatrixFlexibleDimensions=coop2.cooperativeMatrixTensorAddressing=coop2.cooperativeMatrixBlockLoads=coop2.cooperativeMatrixReductions=coop2.cooperativeMatrixConversions=coop2.cooperativeMatrixPerElementOperations=VK_TRUE;coop.pNext=&coopKHR;coopKHR.pNext=&coop2;maintenance={VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES_KHR};maintenance.maintenance4=VK_TRUE;coop2.pNext=&maintenance;storage16={VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES};storage16.storageBuffer16BitAccess=VK_TRUE;maintenance.pNext=&storage16;}
         if(cooperativeMatrix2){vectorDecode={VkStructureType(1000689000)};vectorDecode.cooperativeMatrixDecodeVector=VK_TRUE;storage16.pNext=&vectorDecode;}
+        if(shaderBfloat16){bfloat={VkStructureType(1000141000)};bfloat.shaderBFloat16Type=bfloat.shaderBFloat16CooperativeMatrix=VK_TRUE;vectorDecode.pNext=&bfloat;}
         if(integerDot)address.pNext=&dot;
         vkGetPhysicalDeviceQueueFamilyProperties(physical,&count,nullptr);std::vector<VkQueueFamilyProperties> families(count);vkGetPhysicalDeviceQueueFamilyProperties(physical,&count,families.data());family=~0u;
         for(uint32_t i=0;i<count;i++)if((families[i].queueFlags&VK_QUEUE_COMPUTE_BIT)&&families[i].timestampValidBits==64){family=i;break;}
@@ -184,6 +199,8 @@ public:
         float priority=1;VkDeviceQueueCreateInfo qi{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};qi.queueFamilyIndex=family;qi.queueCount=1;qi.pQueuePriorities=&priority;
         std::vector<const char*> extensions{"VK_KHR_acceleration_structure","VK_KHR_ray_query","VK_KHR_deferred_host_operations"};if(integerDot)extensions.push_back("VK_KHR_shader_integer_dot_product");if(cooperativeMatrix)extensions.push_back(VK_NV_COOPERATIVE_MATRIX_EXTENSION_NAME);
         if(cooperativeMatrix2){extensions.push_back("VK_KHR_cooperative_matrix");extensions.push_back("VK_NV_cooperative_matrix2");extensions.push_back("VK_NV_cooperative_matrix_decode_vector");}
+        if(shaderBfloat16)extensions.push_back("VK_KHR_shader_bfloat16");
+        if(shaderSubgroupPartitioned)extensions.push_back(VK_NV_SHADER_SUBGROUP_PARTITIONED_EXTENSION_NAME);
         VkDeviceCreateInfo di{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};di.pNext=&rq;di.queueCreateInfoCount=1;di.pQueueCreateInfos=&qi;di.enabledExtensionCount=uint32_t(extensions.size());di.ppEnabledExtensionNames=extensions.data();VkPhysicalDeviceFeatures enabled{};enabled.shaderStorageBufferArrayDynamicIndexing=features.features.shaderStorageBufferArrayDynamicIndexing;di.pEnabledFeatures=&enabled;
         if(cooperativeMatrix2){enabled.shaderInt16=features.features.shaderInt16;enabled.shaderInt64=features.features.shaderInt64;}
         check(vkCreateDevice(physical,&di,nullptr,&device),"create Vulkan device");vkGetDeviceQueue(device,family,0,&queue);vkGetPhysicalDeviceMemoryProperties(physical,&memory);

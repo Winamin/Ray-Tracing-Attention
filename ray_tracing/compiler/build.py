@@ -27,12 +27,14 @@ def build(spec, output=None):
     if version.returncode:raise RuntimeError(version.stderr or version.stdout)
     match=re.search(r'Glslang Version: \d+:(\d+)\.(\d+)',version.stdout)
     vector_decode=bool(match and tuple(map(int,match.groups()))>=(16,6))
+    bfloat_shader=vector_decode
     digest.update(str(vector_decode).encode())
     target=Path(output) if output else LOCAL/'build'/digest.hexdigest()[:20]
     executable=target/('rt_optical_resident.exe' if os.name=='nt' else 'rt_optical_resident')
     if executable.exists() and (target/'complete').exists(): return executable
     target.mkdir(parents=True,exist_ok=True)
     lines=[f'#define {k} {v}' for k,v in spec.defines().items()]
+    lines.append('#define RT_MLP_BFLOAT16_AVAILABLE '+str(int(bfloat_shader)))
     (target/'rt_model_config.h').write_text('\n'.join(lines)+'\n',encoding='utf8')
     full=list(spec.full_layers)
     mapping=[full.index(i) if i in full else 0 for i in range(spec.depth)]
@@ -40,16 +42,18 @@ def build(spec, output=None):
     cpp+='constexpr uint32_t MODEL_FULL_INDEX[]={'+','.join(map(str,mapping))+'};\n'
     (target/'rt_layer_map.hpp').write_text(cpp,encoding='utf8')
     commands=[]
-    shader_names=('resident_math','resident_mlp','resident_batch2','resident_pack','resident_attention','resident_attention_receipt','resident_attention_dense','resident_attention_local','resident_attention_classes','resident_auxiliary','resident_state','resident_ray','reply_cache','optical_path_key','history_cache')
+    shader_names=('resident_math','resident_mlp','resident_mlp_material','resident_mlp_tensor','resident_batch2','resident_pack','resident_attention','resident_attention_receipt','resident_attention_dense','resident_attention_local','resident_attention_classes','resident_auxiliary','resident_state','resident_ray','reply_cache','optical_path_key','history_cache')
+    if bfloat_shader:shader_names+=('resident_mlp_bfloat',)
     local_split_names=()
     if spec.full_layers and spec.attention_head_dim==256 and spec.query_width==4*spec.kv_width:
         local_split_names=('resident_attention_local_key','resident_attention_local_value',
                            'resident_attention_local_trace','resident_attention_local_key_fallback')
         shader_names+=local_split_names
     for name in shader_names:
-        environment='vulkan1.3' if name in ('resident_batch2','resident_attention','resident_auxiliary') else 'vulkan1.2'
+        environment='vulkan1.3' if name in ('resident_batch2','resident_attention','resident_auxiliary','resident_mlp_tensor','resident_mlp_bfloat') else 'vulkan1.2'
         defines=[]
         source='resident_attention_direct.comp' if name=='resident_attention_local' else name+'.comp'
+        if name=='resident_mlp_bfloat':source='resident_mlp_tensor.comp';defines=['-DRT_MLP_BFLOAT16=1']
         optimization=['-Os'] if name in local_split_names else []
         commands += [[shader_compiler,'-V',*optimization,'--target-env',environment,'-DRT_VECTOR_DECODE='+str(int(vector_decode)),'-I'+str(target),'-I'+str(NATIVE/'shaders'),*defines,str(NATIVE/'shaders'/source),'-o',str(target/(name+'.spv'))],
                      [validator,'--target-env',environment,str(target/(name+'.spv'))]]

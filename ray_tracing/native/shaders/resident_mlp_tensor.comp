@@ -1,0 +1,126 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_NV_cooperative_matrix2 : require
+#extension GL_KHR_memory_scope_semantics : require
+#ifdef RT_MLP_BFLOAT16
+#extension GL_EXT_bfloat16 : require
+#define MLP_OPERAND bfloat16_t
+#else
+#define MLP_OPERAND float16_t
+#endif
+#include "resident_common.glsl"
+
+// Complete RT material-block coverage precedes matrix arithmetic. BF16 keeps
+// its native exponent range; FP16 uses power-of-two-scaled coefficients and
+// inputs. Both Tensor Core variants accumulate in FP32. Conversion error is
+// measured against the source weights rather than hidden by a tolerance.
+layout(set=0,binding=39) uniform accelerationStructureEXT mlpAS;
+const uint BM=32u,BN=128u,BK=32u;
+const uint SURFACE_BLOCKS=max(D,FEATURE_WIDTH)/256u;
+#ifdef RT_MLP_BFLOAT16
+const float WEIGHT_SCALE=1.0,INPUT_SCALE=1.0,OPERAND_LIMIT=3.3895313892515355e38;
+#else
+const float WEIGHT_SCALE=256.0,INPUT_SCALE=16.0,OPERAND_LIMIT=65504.0;
+#endif
+shared MLP_OPERAND weightsHigh[BM*BK],upHigh[BM*BK],inputHigh[BK*BN];
+// Hits write directly to their immutable block-address slot. BVH visitation
+// order is immaterial; there is no comparison, partition or sorting pass.
+shared uint materialAxes[BM*SURFACE_BLOCKS];
+shared uint invalid,exceptional;
+
+float inputValue(uint row,uint axis){return operation==0u?normalized[row*D+axis]:feedForward[row*W+axis];}
+uint materialAxis(uint channel,uint axis){
+    uint localChannel=channel-gl_WorkGroupID.x*BM;
+    return materialAxes[localChannel*SURFACE_BLOCKS+axis/256u]+axis%256u;
+}
+float weightValue(uint row,uint axis,bool up){
+    uint base=blockBase(),field=up?19u:operation==0u?15u:17u;
+    return quantizedWeight(0u,parameters[base+field],parameters[base+field+1u],row,operation==0u?D:FEATURE_WIDTH,materialAxis(row,axis));
+}
+void validateMaterial(uint channel){
+    uint columns=operation==0u?D:FEATURE_WIDTH,blocks=columns/256u;
+    uint receiver=operation==0u?channel:FEATURE_WIDTH+channel,count=0u;
+    uint coverage[(SURFACE_BLOCKS+31u)/32u];
+    for(uint i=0u;i<(SURFACE_BLOCKS+31u)/32u;i++)coverage[i]=0u;
+    vec2 center=2.0*vec2(receiver%256u,receiver/256u);
+    rayQueryEXT ray;
+    rayQueryInitializeEXT(ray,mlpAS,gl_RayFlagsNoneEXT,255u,vec3(center,0),.00001,vec3(0,0,1),float(blocks)+.5);
+    while(rayQueryProceedEXT(ray)){
+        if(rayQueryGetIntersectionTypeEXT(ray,false)!=gl_RayQueryCandidateIntersectionAABBEXT)continue;
+        uint primitive=rayQueryGetIntersectionPrimitiveIndexEXT(ray,false),owner=primitive/SURFACE_BLOCKS,block=primitive%SURFACE_BLOCKS;
+        if(rayQueryGetIntersectionInstanceCustomIndexEXT(ray,false)!=0u||owner!=receiver||block>=blocks){atomicOr(invalid,1u);continue;}
+        uint bit=1u<<(block%32u),word=block/32u;
+        if((coverage[word]&bit)==0u){
+            coverage[word]|=bit;count++;
+            materialAxes[(channel-gl_WorkGroupID.x*BM)*SURFACE_BLOCKS+block]=block*256u;
+        }
+    }
+    if(count!=blocks)atomicOr(invalid,1u);
+}
+float storeGate(const in uint channel,const in uint row,const in float gate,const in float up){
+    uint r=gl_WorkGroupID.y*BN+row,c=gl_WorkGroupID.x*BM+channel;
+    if(r<cfg.rows&&c<FEATURE_WIDTH){feedForward[r*W+c]=gate*up*detectorSigmoid(gate);atomicAdd(featureWork[featureBase(r)],1u);atomicAdd(featureWork[featureGlobal()+8u],1u);atomicAdd(featureWork[featureGlobal()+9u],1u);}
+    return gate;
+}
+float residual(const in uint channel,const in uint row,const in float signal){uint r=gl_WorkGroupID.y*BN+row,c=gl_WorkGroupID.x*BM+channel;return r<cfg.rows&&c<D?state[r*D+c]+signal:0.0;}
+void compensatedAdd(inout float total,inout float correction,float value){
+    precise float adjusted=value-correction,next=total+adjusted;
+    correction=(next-total)-adjusted;total=next;
+}
+void scalarFallback(uint firstChannel,uint firstRow,uint lane){
+    uint columns=operation==0u?D:FEATURE_WIDTH,width=operation==0u?FEATURE_WIDTH:D;
+    for(uint i=lane;i<BM*BN;i+=gl_WorkGroupSize.x){
+        uint channel=firstChannel+i/BN,row=firstRow+i%BN;if(channel>=width||row>=cfg.rows)continue;
+        precise float gate=0.0,up=0.0,gateCorrection=0.0,upCorrection=0.0;
+        for(uint axis=0u;axis<columns;axis++){
+            float x=inputValue(row,materialAxis(channel,axis)),w=weightValue(channel,axis,false);
+            precise float product=x*w;
+            compensatedAdd(gate,gateCorrection,product);
+            compensatedAdd(gate,gateCorrection,fma(x,w,-product));
+            if(operation==0u){
+                float u=weightValue(channel,axis,true);precise float upProduct=x*u;
+                compensatedAdd(up,upCorrection,upProduct);
+                compensatedAdd(up,upCorrection,fma(x,u,-upProduct));
+            }
+        }
+        if(operation==0u)storeGate(channel-firstChannel,row-firstRow,gate,up);else state[row*D+channel]+=gate;
+    }
+}
+void main(){
+    if(stopped())return;
+    uint lane=gl_LocalInvocationID.x,firstChannel=gl_WorkGroupID.x*BM,firstRow=gl_WorkGroupID.y*BN;
+    uint columns=operation==0u?D:FEATURE_WIDTH,width=operation==0u?FEATURE_WIDTH:D;
+    if(firstRow>=cfg.rows||firstChannel>=width)return;
+    if(lane==0u){invalid=0u;exceptional=0u;}barrier();
+    if(lane<BM&&firstChannel+lane<width)validateMaterial(firstChannel+lane);
+    barrier();if(invalid!=0u){if(lane==0u)atomicOr(control[3],4096u);return;}
+    coopmat<float,gl_ScopeWorkgroup,BM,BN,gl_MatrixUseAccumulator> sum=coopmat<float,gl_ScopeWorkgroup,BM,BN,gl_MatrixUseAccumulator>(0.0),upSum=coopmat<float,gl_ScopeWorkgroup,BM,BN,gl_MatrixUseAccumulator>(0.0);
+    for(uint k=0u;k<columns;k+=BK){
+        for(uint i=lane;i<BM*BK;i+=gl_WorkGroupSize.x){
+            uint channel=firstChannel+i/BK,axis=k+i%BK;float w=channel<width?weightValue(channel,axis,false)*WEIGHT_SCALE:0.0;
+            weightsHigh[i]=MLP_OPERAND(w);if(abs(w)>OPERAND_LIMIT||isnan(w)||isinf(w))atomicOr(exceptional,1u);
+            if(operation==0u){float u=channel<width?weightValue(channel,axis,true)*WEIGHT_SCALE:0.0;upHigh[i]=MLP_OPERAND(u);if(abs(u)>OPERAND_LIMIT||isnan(u)||isinf(u))atomicOr(exceptional,1u);}
+        }
+        // Every receiver has validated the same complete coordinate blocks.
+        // Reuse the first receiver's RT address when loading the shared input.
+        for(uint i=lane;i<BK*BN;i+=gl_WorkGroupSize.x){uint localRow=i/BK,localAxis=i%BK,row=firstRow+localRow,axis=materialAxis(firstChannel,k+localAxis),at=localAxis*BN+localRow;float x=row<cfg.rows?inputValue(row,axis)*INPUT_SCALE:0.0;inputHigh[at]=MLP_OPERAND(x);if(abs(x)>OPERAND_LIMIT||isnan(x)||isinf(x))atomicOr(exceptional,1u);}
+        barrier();if(exceptional!=0u)break;
+        coopmat<MLP_OPERAND,gl_ScopeWorkgroup,BM,BK,gl_MatrixUseA> ah;
+        coopmat<MLP_OPERAND,gl_ScopeWorkgroup,BK,BN,gl_MatrixUseB> bh;
+        coopMatLoad(ah,weightsHigh,0,BK,gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(bh,inputHigh,0,BN,gl_CooperativeMatrixLayoutRowMajor);
+        sum=coopMatMulAdd(ah,bh,sum);
+        if(operation==0u){coopMatLoad(ah,upHigh,0,BK,gl_CooperativeMatrixLayoutRowMajor);upSum=coopMatMulAdd(ah,bh,upSum);}
+        barrier();
+    }
+    if(exceptional!=0u){scalarFallback(firstChannel,firstRow,lane);return;}
+    sum*=1.0/(WEIGHT_SCALE*INPUT_SCALE);upSum*=1.0/(WEIGHT_SCALE*INPUT_SCALE);
+    if(operation==0u){coopMatPerElementNV(sum,sum,storeGate,upSum);return;}
+    coopMatPerElementNV(sum,sum,residual);
+    tensorLayoutNV<2,gl_CooperativeMatrixClampModeConstantNV> outputLayout=createTensorLayoutNV(2,gl_CooperativeMatrixClampModeConstantNV);
+    outputLayout=setTensorLayoutDimensionNV(outputLayout,cfg.rows,D);outputLayout=setTensorLayoutStrideNV(outputLayout,D,1);
+    tensorViewNV<2,false,1,0> transpose=createTensorViewNV(2,false,1,0);
+    coopMatStoreTensorNV(sum,state,0,sliceTensorLayoutNV(outputLayout,firstRow,BN,firstChannel,BM),transpose);
+}

@@ -79,7 +79,7 @@ struct AttentionClassLayerCache {
 class Resident {
 public:
     Engine& e;uint32_t depth{},blocks{},middle{},quantization{},step{},capacity{},absolutePosition{},workRows{},matrixBatchRows{};bool initialized=false;
-    uint32_t captureRows{};
+    uint32_t captureRows{};bool rtMaterialMLP=false,rtTensorMLP=false,rtBfloatMLP=false;VkPipeline tensorMlp[2]{};
     uint32_t attentionBackend=0u,attentionBlock=128u;bool rtTransmissionMLP=false,attentionDiagnosticDirty=false,attentionStatsEnabled=false,attentionVMemberDistribution=false,attentionLocalSplit=false;Buffer* attentionReceipts{};VkPipeline attentionReceiptPipelines[5]{};
     std::unique_ptr<AttentionClassGeometry> attentionClassScene;
     Buffer *attentionClassDummy{},*attentionClassScratch{},*attentionClassCounts{};
@@ -109,8 +109,16 @@ public:
         if(attentionBackend==4u&&RT_ATTENTION_HEAD_DIM!=256u)
             throw std::runtime_error("grouped_rt_local requires a 256-dimensional attention head");
         std::string mlpBackend=std::getenv("RT_MLP_BACKEND")?std::getenv("RT_MLP_BACKEND"):"standard";
-        if(mlpBackend!="standard"&&mlpBackend!="rt_transmission")throw std::runtime_error("MLP backend must be standard or rt_transmission");
-        rtTransmissionMLP=mlpBackend=="rt_transmission";
+        if(mlpBackend!="standard"&&mlpBackend!="rt_transmission"&&mlpBackend!="rt_material"&&mlpBackend!="rt_tensor"&&mlpBackend!="rt_bfloat")throw std::runtime_error("MLP backend must be standard, rt_transmission, rt_material, rt_tensor or rt_bfloat");
+        rtTransmissionMLP=mlpBackend!="standard";
+        rtMaterialMLP=mlpBackend=="rt_material"&&e.shaderSubgroupPartitioned;
+        // The Tensor module uses a 128-invocation workgroup, FP16 operand
+        // tiles, and one RT block-address table per output receiver.
+        constexpr uint64_t tensorSharedBytes=2u*(32u*32u*2u+32u*128u)+
+            uint64_t(32u)*(std::max(MODEL_D,MODEL_FF)/256u)*4u+24u;
+        rtBfloatMLP=mlpBackend=="rt_bfloat"&&RT_MLP_BFLOAT16_AVAILABLE&&e.shaderBfloat16;
+        rtTensorMLP=(mlpBackend=="rt_tensor"||rtBfloatMLP)&&e.cooperativeMatrix2&&e.supportsWorkgroup(128u,tensorSharedBytes);
+        rtBfloatMLP=rtBfloatMLP&&rtTensorMLP;
         attentionStatsEnabled=std::getenv("RT_ATTENTION_STATS")&&std::string(std::getenv("RT_ATTENTION_STATS"))=="1";
         attentionVMemberDistribution=std::getenv("RT_ATTENTION_V_MEMBERS")&&std::string(std::getenv("RT_ATTENTION_V_MEMBERS"))=="1";
         if(const char* block=std::getenv("RT_ATTENTION_BLOCK"))attentionBlock=uint32_t(std::stoul(block));
@@ -143,7 +151,21 @@ public:
         VkDescriptorSetLayoutBinding bindings[46]{};uint32_t bindingCount=0;for(uint32_t i=0;i<46;i++){if(i==40u||i==41u)continue;bindings[bindingCount++]={i,((i<5&&i!=2)||i==32||i==39||i==43)?VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,i==6||i==32?depth:i==0||i==1||i==3?4u:1u,VK_SHADER_STAGE_COMPUTE_BIT,nullptr};}
         VkDescriptorSetLayoutCreateInfo sl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};sl.bindingCount=bindingCount;sl.pBindings=bindings;check(vkCreateDescriptorSetLayout(e.device,&sl,nullptr,&setLayout),"resident set layout");VkPushConstantRange pc{VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(ResidentConfig)};VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};pl.setLayoutCount=1;pl.pSetLayouts=&setLayout;pl.pushConstantRangeCount=1;pl.pPushConstantRanges=&pc;check(vkCreatePipelineLayout(e.device,&pl,nullptr,&layout),"resident pipeline layout");VkDescriptorPoolSize sizes[2]{{VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,(15+depth)*(depth+1)},{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,(depth+1)*(36+depth)}};VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};pool.maxSets=depth+1;pool.poolSizeCount=2;pool.pPoolSizes=sizes;check(vkCreateDescriptorPool(e.device,&pool,nullptr,&descriptorPool),"resident descriptor pool");std::vector<VkDescriptorSetLayout> layouts(depth+1,setLayout);VkDescriptorSetAllocateInfo alloc{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};alloc.descriptorPool=descriptorPool;alloc.descriptorSetCount=depth+1;alloc.pSetLayouts=layouts.data();std::vector<VkDescriptorSet> sets(depth+1);check(vkAllocateDescriptorSets(e.device,&alloc,sets.data()),"resident descriptor sets");layerSets.assign(sets.begin(),sets.begin()+depth);set=sets[0];initialSet=sets[depth];for(uint32_t l=0;l<depth;l++)bind(layerSets[l],false,l);bind(initialSet,true);for(uint32_t i=0;i<35;i++)if(i!=2&&i!=4&&i!=5&&i!=10)math[i]=e.pipeline("resident_math",layout,i,1u,0xffffffffu,wordTile,i==16u?readoutWords*32u:128u,featureTile,readoutUnroll,readoutWords,quantization==4u?(i==16u?p[15]:0xffffffffu):0xffffffffu);for(uint32_t i=0;i<14;i++)if(i<4||i>7||i==5)ray[i]=e.pipeline("resident_ray",layout,i,32u,0xffffffffu,wordTile,i==0||i==12||i==13?32u:128u,featureTile);
         for(uint32_t kind=2;kind<=5;kind++)if(!rtTransmissionMLP||kind==2u||kind==5u)for(uint32_t batch=0;batch<2;batch++)matrixProjection[kind-2][batch]=e.pipeline("resident_math",layout,2u,batch?matrixBatchRows:1u,kind,wordTile,128u,featureTile);
-        if(rtTransmissionMLP)for(uint32_t kind=0;kind<2;kind++)for(uint32_t batch=0;batch<2;batch++)opticalMlp[kind][batch]=e.pipeline("resident_mlp",layout,kind,batch?matrixBatchRows:1u,0xffffffffu,wordTile,128u,featureTile);
+        if(rtTransmissionMLP)for(uint32_t kind=0;kind<2;kind++)for(uint32_t batch=0;batch<2;batch++)opticalMlp[kind][batch]=e.pipeline(rtMaterialMLP?"resident_mlp_material":"resident_mlp",layout,kind,batch?matrixBatchRows:1u,0xffffffffu,wordTile,128u,featureTile);
+        if(rtTensorMLP){
+            try{
+                for(uint32_t kind=0;kind<2;kind++)tensorMlp[kind]=e.pipeline(rtBfloatMLP?"resident_mlp_bfloat":"resident_mlp_tensor",layout,kind,1u,0xffffffffu,wordTile,128u,featureTile);
+            }catch(const std::runtime_error& failure){
+                // Feature booleans do not promise every flexible matrix shape.
+                // A device that rejects the actual FP16/FP32 pipelines retains
+                // the original RT path, including its coverage checks.
+                const std::string message=failure.what();
+                if(message!="create pipeline: Vulkan "+std::to_string(VK_ERROR_FEATURE_NOT_PRESENT)&&
+                   message!="create pipeline: Vulkan "+std::to_string(VK_ERROR_INITIALIZATION_FAILED))throw;
+                for(auto& pipeline:tensorMlp){if(pipeline)vkDestroyPipeline(e.device,pipeline,nullptr);pipeline=VK_NULL_HANDLE;}
+                rtTensorMLP=rtBfloatMLP=false;
+            }
+        }
         {
             std::map<std::pair<uint32_t,uint32_t>,VkPipeline> cached;
             const uint32_t projections[4]{0u,1u,6u,8u},formats[4]{10u,12u,22u,33u};
@@ -335,13 +357,17 @@ cfg.stage=6;launch(c,math,cfg,1,cfg.rows);
     }
     void opticalMLP(VkCommandBuffer c,ResidentConfig cfg){
         cfg.padding0=2u;
-        uint32_t tile=cfg.rows>1u?matrixBatchRows:1u,groups=(cfg.rows+tile-1u)/tile;
+        // The fixed 128-row tile loses to RT transmission at eight rows on
+        // the measured GPU; seventeen rows is the first verified faster case.
+        bool tensor=rtTensorMLP&&cfg.rows>=17u;
+        uint32_t tile=tensor?128u:cfg.rows>1u?matrixBatchRows:1u,groups=(cfg.rows+tile-1u)/tile;
         if(cfg.debug==4u)vkCmdWriteTimestamp(c,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,e.timestamps,1u);
         for(uint32_t pass=0;pass<2u;pass++){
-            cfg.stage=pass;bindCompute(c,opticalMlp[pass][cfg.rows>1u?1u:0u],layerSets[cfg.layer]);
+            cfg.stage=pass;bindCompute(c,tensor?tensorMlp[pass]:opticalMlp[pass][cfg.rows>1u?1u:0u],layerSets[cfg.layer]);
             vkCmdPushConstants(c,layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(cfg),&cfg);
             uint32_t stamp=startRT(c,2u);
-            vkCmdDispatch(c,(pass==0u?MODEL_FF:MODEL_D)/4u,groups,1u);sync(c);endRT(c,stamp);
+            uint32_t width=pass==0u?MODEL_FF:MODEL_D;
+            vkCmdDispatch(c,(width+(tensor?32u:4u)-1u)/(tensor?32u:4u),groups,1u);sync(c);endRT(c,stamp);
             if(cfg.debug==4u)vkCmdWriteTimestamp(c,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,e.timestamps,2u+pass);
         }
         featureTraceRows+=groups;featureReuseRows+=cfg.rows-groups;
@@ -765,7 +791,7 @@ cfg.stage=6;launch(c,math,cfg,1,cfg.rows);
     ~Resident(){
         vkDeviceWaitIdle(e.device);if(rtTimestamps)vkDestroyQueryPool(e.device,rtTimestamps,nullptr);if(attentionSubmitTimestamps)vkDestroyQueryPool(e.device,attentionSubmitTimestamps,nullptr);
         std::set<VkPipeline> handles;auto add=[&](const auto& pipes){for(auto p:pipes)if(p)handles.insert(p);};
-        add(math);add(ray);add(ownedCooperative);add(attentionReceiptPipelines);add(attentionClassPipelines);for(auto& pair:opticalMlp)add(pair);
+        add(math);add(ray);add(ownedCooperative);add(attentionReceiptPipelines);add(attentionClassPipelines);add(tensorMlp);for(auto& pair:opticalMlp)add(pair);
         for(auto& pair:matrixProjection)add(pair);for(auto& pair:quantOutput)add(pair);
         for(auto& pair:outputPipelines)add(pair);
         for(auto p:{matrixPack,matrixAttention,fastState})if(p)handles.insert(p);
@@ -778,7 +804,7 @@ int main(int argc,char** argv){
 #ifdef _WIN32
     _setmode(_fileno(stdin),_O_BINARY);_setmode(_fileno(stdout),_O_BINARY);
 #endif
-    try{if(argc<3)throw std::runtime_error("Usage: rt_optical_resident student.bin original_head.bin [capacity]");uint32_t capacity=argc>3?uint32_t(std::stoul(argv[3])):300;auto root=std::filesystem::absolute(argv[0]).parent_path();Engine engine;engine.initialize(root,capacity);bool sparse=argc>5&&std::string(argv[5])=="sparse";float aperture=argc>6?std::stof(argv[6]):.08f;if(!(aperture>0&&aperture<=2))throw std::runtime_error("Route aperture must be in (0,2]");uint32_t wordTile=argc>7?uint32_t(std::stoul(argv[7])):32;if(wordTile<8||wordTile>256||(wordTile&(wordTile-1u)))throw std::runtime_error("Word tile requires a dividing power of two in [8,256]");uint32_t featureTile=argc>8?uint32_t(std::stoul(argv[8])):8;if(featureTile<8||featureTile>256||(featureTile&(featureTile-1u)))throw std::runtime_error("Feature tile requires a power of two in [8,256]");uint32_t readoutUnroll=argc>9?uint32_t(std::stoul(argv[9])):1u,readoutWords=argc>10?uint32_t(std::stoul(argv[10])):4u;if((readoutUnroll!=1u&&readoutUnroll!=2u&&readoutUnroll!=4u&&readoutUnroll!=8u)||(readoutWords!=4u&&readoutWords!=8u))throw std::runtime_error("Readout requires unroll 1/2/4/8 and words per group 4/8");uint32_t prefillBatch=argc>11?uint32_t(std::stoul(argv[11])):512u;if(prefillBatch<32u||prefillBatch>1024u||(prefillBatch&(prefillBatch-1u)))throw std::runtime_error("Prefill batch requires a power of two in [32,1024]");uint32_t matrixRows=argc>12?uint32_t(std::stoul(argv[12])):8u;if(matrixRows!=4u&&matrixRows!=8u&&matrixRows!=16u)throw std::runtime_error("Matrix row tile requires 4, 8 or 16 tokens");Resident model(engine,argv[1],argv[2],argc<=4||std::stoul(argv[4])!=0,sparse,aperture,wordTile,argc>5&&std::string(argv[5])=="rt_full",featureTile,readoutUnroll,readoutWords,prefillBatch,matrixRows);uint32_t hello[5]{0x5254523a,model.depth,model.blocks,model.middle,model.quantization|(model.wideCooperative?256u:0u)|(model.attentionBackend>=2u?512u:0u)|((model.attentionBackend==2u||model.attentionBackend==4u||model.attentionBackend==5u)?2048u:0u)|(model.attentionBackend==1u?1024u:0u)|(!model.rtTransmissionMLP?4096u:0u)};std::cout.write(reinterpret_cast<char*>(hello),20);std::cout.flush();uint32_t op;
+    try{if(argc<3)throw std::runtime_error("Usage: rt_optical_resident student.bin original_head.bin [capacity]");uint32_t capacity=argc>3?uint32_t(std::stoul(argv[3])):300;auto root=std::filesystem::absolute(argv[0]).parent_path();Engine engine;engine.initialize(root,capacity);bool sparse=argc>5&&std::string(argv[5])=="sparse";float aperture=argc>6?std::stof(argv[6]):.08f;if(!(aperture>0&&aperture<=2))throw std::runtime_error("Route aperture must be in (0,2]");uint32_t wordTile=argc>7?uint32_t(std::stoul(argv[7])):32;if(wordTile<8||wordTile>256||(wordTile&(wordTile-1u)))throw std::runtime_error("Word tile requires a dividing power of two in [8,256]");uint32_t featureTile=argc>8?uint32_t(std::stoul(argv[8])):8;if(featureTile<8||featureTile>256||(featureTile&(featureTile-1u)))throw std::runtime_error("Feature tile requires a power of two in [8,256]");uint32_t readoutUnroll=argc>9?uint32_t(std::stoul(argv[9])):1u,readoutWords=argc>10?uint32_t(std::stoul(argv[10])):4u;if((readoutUnroll!=1u&&readoutUnroll!=2u&&readoutUnroll!=4u&&readoutUnroll!=8u)||(readoutWords!=4u&&readoutWords!=8u))throw std::runtime_error("Readout requires unroll 1/2/4/8 and words per group 4/8");uint32_t prefillBatch=argc>11?uint32_t(std::stoul(argv[11])):512u;if(prefillBatch<32u||prefillBatch>1024u||(prefillBatch&(prefillBatch-1u)))throw std::runtime_error("Prefill batch requires a power of two in [32,1024]");uint32_t matrixRows=argc>12?uint32_t(std::stoul(argv[12])):8u;if(matrixRows!=4u&&matrixRows!=8u&&matrixRows!=16u)throw std::runtime_error("Matrix row tile requires 4, 8 or 16 tokens");Resident model(engine,argv[1],argv[2],argc<=4||std::stoul(argv[4])!=0,sparse,aperture,wordTile,argc>5&&std::string(argv[5])=="rt_full",featureTile,readoutUnroll,readoutWords,prefillBatch,matrixRows);uint32_t hello[5]{0x5254523a,model.depth,model.blocks,model.middle,model.quantization|(model.wideCooperative?256u:0u)|(model.attentionBackend>=2u?512u:0u)|((model.attentionBackend==2u||model.attentionBackend==4u||model.attentionBackend==5u)?2048u:0u)|(model.attentionBackend==1u?1024u:0u)|(!model.rtTransmissionMLP?4096u:0u)};hello[4]|=(model.rtMaterialMLP?8192u:0u)|(model.rtTensorMLP?16384u:0u)|(model.rtBfloatMLP?32768u:0u);std::cout.write(reinterpret_cast<char*>(hello),20);std::cout.flush();uint32_t op;
         while(std::cin.read(reinterpret_cast<char*>(&op),4)){if(!op)break;uint32_t count,debug;if(!std::cin.read(reinterpret_cast<char*>(&count),4)||!std::cin.read(reinterpret_cast<char*>(&debug),4))throw std::runtime_error("Incomplete resident request");if(op==4||op==5||op==6||op==14){model.prefixReady=false;model.stableReady=false;model.gpuFieldReady=false;}if(op==1||op==11||op==12)model.prefill(count,debug,op==12?2u:op==11?1u:0u);else if(op==2)model.generate(count,debug);else if(op==4)model.wordCheck();else if(op==5)model.codecCheck(count);else if(op==6)model.mlpCheck(count,debug);else if(op==7)model.apertureUpdate();else if(op==8)model.resources();else if(op==9)model.streamGenerate(count,debug);else if(op==10)model.growTree(count);else if(op==13)model.finishHistory();else if(op==14)model.attentionCheck(count,debug);else if(op==15)model.attentionStatistics(count);else throw std::runtime_error("Unknown resident operation");}return 0;
     }catch(const std::exception& error){std::cerr<<error.what()<<std::endl;return 1;}
 }

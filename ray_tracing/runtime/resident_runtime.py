@@ -21,8 +21,8 @@ class ResidentRuntime:
             raise ValueError('Attention backend must be standard, standard_fp32, grouped_rt, grouped_rt_dense, grouped_rt_local or grouped_rt_tc')
         if attention_backend=='grouped_rt_local' and spec.attention_head_dim!=256:
             raise ValueError('grouped_rt_local requires a 256-dimensional attention head')
-        if mlp_backend not in ('standard','rt_transmission'):
-            raise ValueError('MLP backend must be standard or rt_transmission')
+        if mlp_backend not in ('standard','rt_transmission','rt_material','rt_tensor','rt_bfloat'):
+            raise ValueError('MLP backend must be standard, rt_transmission, rt_material, rt_tensor or rt_bfloat')
         if attention_block not in (128,256,512):raise ValueError('Attention block must be 128, 256 or 512')
         self.hidden_size=spec.hidden_size
         self.vocabulary_size=spec.vocabulary_size
@@ -78,6 +78,21 @@ class ResidentRuntime:
         self.metadata['mlp_decode_compute']='subgroup' if mode&4096 else 'rt_transmission'
         self.metadata['mlp_token_tile']=256 if mode&4096 and mode&256 else matrix_rows
         if not mode&4096:self.metadata['mlp_material_receipts']='shared within token tile'
+        self.metadata['mlp_backend_effective']=('rt_bfloat' if mode&32768 else 'rt_tensor' if mode&16384 else 'rt_material' if mode&8192 else
+                                               'standard' if mode&4096 else 'rt_transmission')
+        if mode&8192:
+            self.metadata['mlp_compute']='RT weight-block receipts / complete FP32 material classes'
+            self.metadata['mlp_prefill_compute']=self.metadata['mlp_decode_compute']='subgroup_partitioned_fp32'
+        if mode&16384:
+            self.metadata['mlp_compute']='RT weight-block addresses / '+('BF16' if mode&32768 else 'scaled FP16')+' operands with FP32 MMA accumulation'
+            self.metadata['mlp_prefill_compute']='cooperative_matrix2 for rows >= 17; RT transmission for smaller batches'
+            self.metadata['mlp_decode_compute']='rt_transmission'
+            self.metadata['mlp_token_tile']=128
+            self.metadata['mlp_tensor_min_rows']=17
+            self.metadata['mlp_tensor_operands']='bf16' if mode&32768 else 'fp16'
+            self.metadata['mlp_tensor_accumulator']='fp32'
+            self.metadata['mlp_tensor_bfloat16']=bool(mode&32768)
+            self.metadata['mlp_material_receipts']='direct block-address slots; no sorting pass'
         self.metadata['source_model']=config.get('source_model')
         self.metadata['coordinate_partition']=config['coordinate_partition']
         self.position=0;self._attention_diagnostic_dirty=False

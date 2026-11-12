@@ -1,0 +1,145 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_NV_shader_subgroup_partitioned : require
+#include "resident_common.glsl"
+
+layout(set=0,binding=39) uniform accelerationStructureEXT mlpAS;
+layout(constant_id=1) const uint tokenRows=1u;
+const uint SURFACE_BLOCKS=max(D,FEATURE_WIDTH)/256u;
+const uint RECEIPT_WORDS=(SURFACE_BLOCKS+31u)/32u;
+
+// Immutable packed weights are the member map. RT returns receiver/block
+// identities; exact decoded FP32 values define independent gate/up classes.
+// The subgroup partition gives the complete member mask without storing a
+// second, expanded copy of all model coefficients. It is reused for every
+// input row in this tokenRows tile, and never merges distinct receivers.
+uint materialKey(float weight) {
+    uint bits=floatBitsToUint(weight);
+    return (bits&0x7fffffffu)==0u?0u:bits;
+}
+
+// quantizedOctet uses different coordinate layouts for Q4_K and other
+// formats. Restore a contiguous 32-coordinate group before classifying.
+float groupWeight(QuantizedOctet transfer,uint format,uint group,uint lane) {
+    bool q4=(format&255u)==12u;
+    uint owner=q4?(group/2u)*8u+lane/4u:
+        (group/4u)*16u+(group%2u)*8u+lane/4u;
+    bool high=q4?(group&1u)!=0u:(group%4u)>=2u;
+    float result=0.0;
+    for(uint component=0u;component<4u;component++) {
+        // Every lane participates in every shuffle; using a varying vector
+        // component directly would shuffle different source components.
+        float value=subgroupShuffle(high?transfer.high[component]:transfer.low[component],owner);
+        if(component==lane%4u)result=value;
+    }
+    return result;
+}
+
+float inputCoordinate(uint row,uint axis) {
+    return operation==0u?normalized[row*D+axis]:feedForward[row*W+axis];
+}
+
+void accurateAdd(inout float sum,inout float correction,float value) {
+    precise float adjusted=value-correction,next=sum+adjusted;
+    correction=(next-sum)-adjusted;sum=next;
+}
+
+// Split each input losslessly, then partition both parts. This retains small
+// contributions when material grouping changes the reduction order. Neither
+// part is quantized to FP16, and all arithmetic here remains FP32 Shader work.
+vec2 memberSum(float inputSignal,uvec4 members) {
+    precise float high=uintBitsToFloat(floatBitsToUint(inputSignal)&0xfffff000u);
+    precise float low=inputSignal-high;
+    return vec2(subgroupPartitionedAddNV(high,members),subgroupPartitionedAddNV(low,members));
+}
+
+void receiveClass(inout float signal,inout float correction,vec2 inputSum,float weight) {
+    precise float first=inputSum.x*weight,second=inputSum.y*weight;
+    precise float firstError=fma(inputSum.x,weight,-first),secondError=fma(inputSum.y,weight,-second);
+    accurateAdd(signal,correction,first);
+    accurateAdd(signal,correction,second);
+    accurateAdd(signal,correction,firstError);
+    accurateAdd(signal,correction,secondError);
+}
+
+float finalSignal(float signal,float correction) {
+    precise float high=uintBitsToFloat(floatBitsToUint(signal)&0xfffff000u);
+    precise float low=(signal-high)-correction;
+    precise float result=subgroupAdd(high)+subgroupAdd(low);
+    return result;
+}
+
+void main() {
+    if(stopped())return;
+    uint lane=gl_SubgroupInvocationID,channel=gl_WorkGroupID.x*4u+gl_SubgroupID;
+    uint firstRow=gl_WorkGroupID.y*tokenRows,width=operation==0u?FEATURE_WIDTH:D;
+    if(channel>=width||firstRow>=cfg.rows)return;
+    uint receiver=operation==0u?channel:FEATURE_WIDTH+channel;
+    uint columns=operation==0u?D:FEATURE_WIDTH,blocks=columns/256u;
+    uint receipts[RECEIPT_WORDS];
+    for(uint i=0u;i<RECEIPT_WORDS;i++)receipts[i]=0u;
+    uint count=0u,invalid=0u;
+    if(lane==0u) {
+        vec2 center=2.0*vec2(receiver%256u,receiver/256u);
+        rayQueryEXT ray;
+        rayQueryInitializeEXT(ray,mlpAS,gl_RayFlagsNoneEXT,255u,vec3(center,0),.00001,vec3(0,0,1),float(blocks)+.5);
+        while(rayQueryProceedEXT(ray)) {
+            if(rayQueryGetIntersectionTypeEXT(ray,false)!=gl_RayQueryCandidateIntersectionAABBEXT)continue;
+            uint primitive=rayQueryGetIntersectionPrimitiveIndexEXT(ray,false);
+            uint owner=primitive/SURFACE_BLOCKS,block=primitive%SURFACE_BLOCKS;
+            if(rayQueryGetIntersectionInstanceCustomIndexEXT(ray,false)!=0u||owner!=receiver||block>=blocks){invalid=1u;continue;}
+            uint bit=1u<<(block%32u),word=block/32u;
+            if((receipts[word]&bit)==0u){receipts[word]|=bit;count++;}
+        }
+        if(count!=blocks||invalid!=0u)atomicOr(control[3],4096u);
+    }
+    count=subgroupBroadcast(count,0u);invalid=subgroupBroadcast(invalid,0u);
+    if(count!=blocks||invalid!=0u)return;
+    for(uint i=0u;i<RECEIPT_WORDS;i++)receipts[i]=subgroupBroadcast(receipts[i],0u);
+    precise float signal[tokenRows],correction[tokenRows],upSignal[tokenRows],upCorrection[tokenRows];
+    for(uint r=0u;r<tokenRows;r++){signal[r]=0.0;correction[r]=0.0;upSignal[r]=0.0;upCorrection[r]=0.0;}
+    uint base=blockBase(),weight=parameters[base+(operation==0u?15u:17u)],format=parameters[base+(operation==0u?16u:18u)];
+    uint upFormat=parameters[base+20u];
+    for(uint block=0u;block<blocks;block++) {
+        if((receipts[block/32u]&(1u<<(block%32u)))==0u)continue;
+        QuantizedOctet transfer=quantizedOctet(0u,weight,format,channel,columns,block,lane),up;
+        if(operation==0u)up=quantizedOctet(0u,parameters[base+19u],upFormat,channel,D,block,lane);
+        for(uint group=0u;group<8u;group++) {
+            float representative=groupWeight(transfer,format,group,lane),upRepresentative=0.0;
+            uvec4 members=subgroupPartitionNV(materialKey(representative)),upMembers;
+            bool first=lane==subgroupBallotFindLSB(members),upFirst=false;
+            if(operation==0u) {
+                upRepresentative=groupWeight(up,upFormat,group,lane);
+                upMembers=subgroupPartitionNV(materialKey(upRepresentative));
+                upFirst=lane==subgroupBallotFindLSB(upMembers);
+            }
+            uint axis=block*256u+group*32u+lane;
+            for(uint r=0u;r<tokenRows;r++)if(firstRow+r<cfg.rows) {
+                float inputSignal=inputCoordinate(firstRow+r,axis);
+                vec2 total=memberSum(inputSignal,members);
+                if(first)receiveClass(signal[r],correction[r],total,representative);
+                if(operation==0u) {
+                    vec2 upTotal=memberSum(inputSignal,upMembers);
+                    if(upFirst)receiveClass(upSignal[r],upCorrection[r],upTotal,upRepresentative);
+                }
+            }
+        }
+    }
+    for(uint r=0u;r<tokenRows;r++)if(firstRow+r<cfg.rows) {
+        float received=finalSignal(signal[r],correction[r]);
+        float upReceived=finalSignal(upSignal[r],upCorrection[r]);
+        if(lane==0u) {
+            uint row=firstRow+r;
+            if(operation==0u) {
+                feedForward[row*W+channel]=received*detectorSigmoid(received)*upReceived;
+                atomicAdd(featureWork[featureBase(row)],1u);
+                atomicAdd(featureWork[featureGlobal()+8u],1u);
+                atomicAdd(featureWork[featureGlobal()+9u],1u);
+            }else state[row*D+channel]+=received;
+        }
+    }
+}

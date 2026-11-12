@@ -1,6 +1,8 @@
 # Ray Tracing Attention
 
-![Ray Tracing Attention operator architecture](docs/images/ray_tracing_attention_workflow.png)
+[English](README.en.md) · 中文
+
+![Ray Tracing Attention BF16 operator architecture](docs/images/ray_tracing_attention_bf16_spatial_workflow.png)
 
 **把大模型的注意力、MLP 与词表寻址接入原生光追管线，让命中的因果光路直接输出 token。**
 
@@ -57,9 +59,11 @@ $$
 
 各通道汇合得到 gate 与 up 信号，探测响应完成 SwiGLU，再由 down 光学系数还原输出。编译器保留源模型的系数载荷，特征 Tree 返回参与读出的特征身份；同一套算子接入不同模型的维度与权重。
 
-![Ray Tracing Attention and MLP operators](docs/images/ray_tracing_attention_layer_detail.png)
+![Ray Tracing Attention operators](docs/images/ray_tracing_attention_bf16_spatial_layer_detail.png)
 
-算子图展开完整注意力的光强探测、递推光场的衰减与校正，以及 MLP 的 gate/up、SiLU 和 down 传输。立体张量表示高维信号与场状态，嵌套包围盒表示几何查询空间；每层读出恢复完整高维状态。
+算子图展开 Attention 的 K/V 完整成员归属、历史 BVH 查询与光强探测，以及 MLP 的 RT 权重寻址、BF16 Tensor 乘加、SiLU 和 down 传输。立体张量表示高维信号与状态，嵌套包围盒表示几何查询空间；每层读出恢复完整高维状态。
+
+![RT and BF16 Tensor MLP operators](docs/images/ray_tracing_attention_bf16_spatial_mlp_detail.png)
 
 ### 词表与因果 Tree 直接输出 token
 
@@ -72,7 +76,7 @@ $$
 
 每个输出位置先查询一次 Tree。已有路径命中时直接返回 token，并推进下一步地址；新路径进入 RT 层计算，再把结果写入 Tree。输入与生成终点保存共享块引用、高维读出行和光路地址；连续命中沿地址输出，新光路通过原生传播形成当前递归场。
 
-![Blockwise vocabulary geometry and optical readout](docs/images/ray_tracing_attention_output_detail.png)
+![Blockwise vocabulary geometry and optical readout](docs/images/ray_tracing_attention_bf16_spatial_output_detail.png)
 
 词表算子图展开完整坐标分块、局部角度与幅度、BVH 求交身份、光学系数响应和词元贡献汇合。各块保持原始通道身份，完整高维分数连接最强光信号选词。
 
@@ -80,7 +84,7 @@ $$
 
 - **统一模型编译。** GGUF 文件和 Hugging Face safetensors 目录共用一个入口。模型规格描述词表、头维度、GQA、层顺序、RoPE 与递推状态；同一套 Shader 根据规格生成原生管线。
 - **Ray Tracing Attention 与 Ray Tracing MLP。** 光线通过透镜查询历史 Tree、MLP 特征 Tree 和词表 Tree，探测器根据真实命中回执聚合贡献。Q4_K / Q6_K 按 256 系数块并行解码，小型参数沿用源精度。
-- **Ray Tracing Attention 与 Ray Tracing MLP。** 光线查询历史 Tree、MLP 固定系数块 Tree 和词表 Tree，探测器根据真实命中回执聚合贡献。Q4_K / Q6_K 按 256 系数块并行解码，小型参数沿用源精度。
+- **BF16 Tensor MLP。** `--mlp-backend rt_bfloat` 保留固定系数块的 RT 寻址，17 行及以上使用 BF16 操作数、FP32 Tensor 累加；小批量与逐 token decode 使用 FP32 RT 传输。QKV 投影使用 FP16 计算、FP32 输出，Attention 聚合与层状态使用 FP32。
 - **因果 token Tree。** 每个预测位置查询一次 Tree，命中直接返回 token，再沿下一步地址继续。解码地址由高维信号、递归场、有效历史光路、位置和停止设置共同验证；命中返回词元与后继地址。公共历史按内容共享，批次和输出预算可自由调整。
 - **GPU 常驻执行。** 模型中间信号留在 GPU，原生 worker 连续执行生成。共享词嵌入与 LM Head 只保存一份原始载荷。
 - **真正逐 token 流式。** 模型生成一个 token，CLI 立即接收并刷新。底部状态行展示 RT 查询计时与占时、GPU 传感器、生成速度和显存；输入 `/fx` 展开详细报告。
@@ -111,34 +115,37 @@ rt-build .local/models/chat
 rt-chat --prompt "请写一个 Python 二分查找函数" --max-tokens 256
 rt-chat --prompt-file task.txt --jsonl
 rt-chat --capacity 1024 --profile --no-cache
+rt-chat --mlp-backend rt_bfloat --attention-backend grouped_rt_local --attention-v-members
 ```
 
 `--activate` 设置本机默认模型；`RT_MODEL` 指定模型目录，`RT_HOME` 指定本地资产与编译缓存目录。原生构建按模型规格和源码指纹复用。默认生成预算为 **65536 token**。
 
 ## 实测表现
 
+2026-11-12，RTX 5060 Ti，32 层 QwenFlash 9B 原始权重，`rt_bfloat` MLP、`grouped_rt_local` Attention、完整 V 成员、512-token prefill 批次。重放使用 CLI 的逐 token 流式管线，prefill 与重放取三次热运行中位数。
 
 | 工作负载 | 实测结果 |
 |---|---:|
-| 二分查找任务，128 token，普通生成 GPU | 38.48 token/s |
-| 128-token 因果 Tree 重放，CLI 逐 token 生成 | 11960 token/s |
-| 同一重放，包含前缀恢复的完整请求 | 10014 token/s |
-| 128 次 Tree 命中，生成 GPU 合计 | 1.473 ms |
-| 25-token prefill，GPU | 70.53 ms |
-| 256-token prefill，GPU | 91.18 ms · 2808 token/s |
-| 1024-token prefill，GPU | 375.40 ms · 2728 token/s |
+| 二分查找任务，128 token，普通生成 GPU | 23.03 token/s |
+| 128-token 因果 Tree 重放，逐 token 流式管线 | 13287 token/s |
+| 同一重放，包含前缀恢复的完整请求 | 11279 token/s |
+| 128 次 Tree 命中，生成 GPU 合计 | 0.958 ms |
+| 25-token prefill，GPU | 407.81 ms |
+| 256-token prefill，GPU | 1077.29 ms · 238 token/s |
+| 1024-token prefill，GPU | 4064.63 ms · 252 token/s |
+
 四轮真实任务读取当前项目的运行时、构建器、Attention 求交与等价判重、因果缓存源码，依次分析启动与构建复用、查询粒度、完整包与列等价、缓存分支并 review。每轮核验回执进入下一轮上下文，输入由实际源码与前轮回复组成。请求耗时包含前缀处理和完整生成，词元化在请求前完成。
 
 | 轮次 | 实际代码分析任务 | 输入词元 | 输出词元 | 首次分支请求 ms | 同分支缓存重放 ms |
 |---:|---|---:|---:|---:|---:|
-| 1 | 启动与构建复用 | 1058 | 115 | 5569.80 | 3.18 |
-| 2 | Attention 查询粒度 | 2558 | 120 | 7526.86 | 3.60 |
-| 3 | 完整包与列等价 | 4096 | 85 | 11424.91 | 3.41 |
-| 4 | 因果缓存分支 review | 5792 | 121 | 20799.59 | 4.56 |
+| 1 | 启动与构建复用 | 1118 | 114 | 13775.70 | 3.13 |
+| 2 | Attention 查询粒度 | 2680 | 140 | 27246.39 | 3.74 |
+| 3 | 完整包与列等价 | 4015 | 122 | 35991.58 | 4.25 |
+| 4 | 因果缓存分支 review | 6469 | 138 | 55219.63 | 5.03 |
 
 
 
-![Shared causal BVHs and compact boundary states](docs/images/ray_tracing_attention_cache_detail.png)
+![Shared causal BVHs and compact boundary states](docs/images/ray_tracing_attention_bf16_spatial_cache_detail.png)
 
 
 ## 长上下文与显存
@@ -147,17 +154,20 @@ rt-chat --capacity 1024 --profile --no-cache
 
 | 历史槽位 | RTA 历史包 MiB | BF16 KV 载荷 MiB（公式） | RTA 设备分配 MiB（cache 开/关） | 驱动新增峰值 MiB（cache 开/关） | 同源 Vulkan 新增峰值 MiB |
 |---:|---:|---:|---:|---:|---:|
-| 512 | 5.53 | 16.00 | 5909.94 / 5909.94 | 6341 / 6387 | 5203 |
-| 1024 | 11.06 | 32.00 | 5909.94 / 5909.94 | 6438 / 6367 | 5090 |
-| 2048 | 22.12 | 64.00 | 5932.06 / 5932.06 | 6473 / 6452 | 5076 |
-| 4096 | 44.25 | 128.00 | 5954.19 / 5954.19 | 6442 / 6388 | 5159 |
+| 512 | 5.53 | 16.00 | 5964.71 / 5965.87 | 6502 / 6633 | 5195 |
+| 1024 | 11.06 | 32.00 | 5964.71 / 5965.87 | 6587 / 6424 | 5053 |
+| 2048 | 22.12 | 64.00 | 5986.83 / 5987.99 | 6643 / 6544 | 5086 |
+| 4096 | 44.25 | 128.00 | 6008.96 / 6010.12 | 6683 / 6654 | 5154 |
 
 
+边界表使用四轮 clamp 任务，列出每轮输入词元和轮末已保存的边界状态、共享历史包载荷。
+
+| 四轮任务输入 | RTA 边界状态 | 共享历史包载荷 |
 |---:|---:|---:|
-| 203 token | 49,152 bytes · 3 个边界 | 3.88 MiB |
-| 472 token | 131,072 bytes · 8 个边界 | 9.32 MiB |
-| 959 token | 229,376 bytes · 14 个边界 | 19.00 MiB |
-| 1228 token | 311,296 bytes · 19 个边界 | 24.26 MiB |
+| 53 token | 49,152 bytes · 3 个边界 | 1.61 MiB |
+| 306 token | 131,072 bytes · 8 个边界 | 6.00 MiB |
+| 368 token | 196,608 bytes · 12 个边界 | 8.29 MiB |
+| 642 token | 278,528 bytes · 17 个边界 | 14.30 MiB |
 
 
 ## 模型与算子
@@ -185,6 +195,7 @@ CLI、Python 和原生 worker 默认开启 cache。完整命中复用已经验�
 ```text
 Ray Tracing Attention/
   README.md                     原理、使用方式与实测表现
+  README.en.md                  英文版，与中文版互链
   pyproject.toml                安装配置与命令入口
   LICENSE / NOTICE              Apache-2.0 与版权声明
   THIRD_PARTY.md                第三方组件声明

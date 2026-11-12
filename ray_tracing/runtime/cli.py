@@ -436,7 +436,7 @@ class ChatSession:
         rows.extend([f"RT 状态：{'硬件查询 + 命中回执' if self.native.metadata['routing'] == 'rt_full' else self.native.metadata['routing']}",
                      f"Attention：{self.native.metadata['attention_backend']} · 历史分组 {self.native.metadata['attention_block']} · "
                      f"{'V 成员分发开启' if self.native.metadata.get('attention_v_members') else 'V 成员分发关闭' if self.native.metadata.get('attention_backend')=='grouped_rt_local' else '保留全部因果贡献'}",
-                     f"MLP：{self.native.metadata['mlp_backend']} · prefill {self.native.metadata['mlp_prefill_compute']} · decode {self.native.metadata['mlp_decode_compute']} · 同批共享 {self.native.metadata['mlp_token_tile']} token",
+                     f"MLP：{self.native.metadata['mlp_backend_effective']} · prefill {self.native.metadata['mlp_prefill_compute']} · decode {self.native.metadata['mlp_decode_compute']} · 同批共享 {self.native.metadata['mlp_token_tile']} token",
                      f"Prefill 并行位置 {self.native.metadata['prefill_batch']} · 权重共享 {self.native.metadata['matrix_token_tile']} token",
                      f"历史 BVH {r['history_blas_count']} BLAS / {r['history_tlas_count']} TLAS · "
                      f"词表查询 {r['word_rays']:,} 条 · 每块词 / 特征 {r['word_tile']}/{r['feature_tile']}",
@@ -592,8 +592,8 @@ def parser():
                    help="共享一组量化权重的 token 数")
     p.add_argument("--attention-backend", choices=("standard","standard_fp32","grouped_rt","grouped_rt_dense","grouped_rt_local","grouped_rt_tc"), default="standard",
                    help="Attention 算法：原版、FP32 对照或 RT 全贡献分组聚合")
-    p.add_argument("--mlp-backend", choices=("standard","rt_transmission"), default="standard",
-                   help="MLP 算法：原矩阵通路或 RT Core 固定透射通路")
+    p.add_argument("--mlp-backend", choices=("standard","rt_transmission","rt_material","rt_tensor","rt_bfloat"), default="standard",
+                   help="MLP 算法：矩阵、RT 透射、材质分组实验、RT + FP16 Tensor 或 RT + BF16 Tensor 批量乘加")
     p.add_argument("--attention-block", type=int, choices=(128,256,512), default=128,
                    help="每个完整 attention 回执覆盖的历史位置数")
     p.add_argument("--attention-v-members", action=argparse.BooleanOptionalAction, default=False,
