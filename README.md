@@ -74,6 +74,9 @@ $$
 
 Each output position queries the Tree once. An existing path hit returns the token directly and advances the address for the next step; a new path runs through the RT layers and writes its result into the Tree. Input and generation endpoints store shared block references, high-dimensional readout rows, and light-path addresses; consecutive hits stream tokens along the addresses, and new light paths form the current recurrent field through native propagation.
 
+
+![Ray Tracing Attention Cache](docs/images/ray_tracing_attention_compact_detail.png)
+
 ## Key capabilities
 
 - **Unified model compilation.** GGUF files and Hugging Face safetensors directories share one entry point. The model spec describes the vocabulary, head dimensions, GQA, layer order, RoPE, and recurrent state; the same shaders build the native pipeline from the spec.
