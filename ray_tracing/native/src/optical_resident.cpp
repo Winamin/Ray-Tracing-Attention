@@ -192,7 +192,14 @@ public:
     }
     void initializeMarker(OpticalStateMarker& snapshot,bool reply){
         snapshot.add(e,state,MODEL_D*4);
-        (void)reply;
+        // Boundary markers retain the resident optical encoding, including the
+        // recurrent field and convolution history. Batch scratch is transient.
+        // The live reply marker still needs only its detector row: its matching
+        // field remains resident and is validated by gpuFieldAddress.
+        if(!reply&&MODEL_RECURRENT){
+            uint64_t bytes=uint64_t(MODEL_RECURRENT)*(MODEL_STATE_HEADS*128u*128u+MODEL_S*9u)*4u;
+            snapshot.add(e,propagation,bytes);
+        }
     }
     void growTree(uint32_t next){
         if(next<=capacity||next>HISTORY_SLOT_MASK+1u||capacity<32u)throw std::runtime_error("Invalid tree growth request");
@@ -386,7 +393,7 @@ cfg.stage=6;launch(c,math,cfg,1,cfg.rows);
         }
     }
     void saveBoundary(VkCommandBuffer c,const std::shared_ptr<SharedHistoryCache::Entry>& entry,uint32_t row,bool fieldCaptured=true){
-        for(auto& item:entry->snapshot.items){if(fieldCaptured&&item.source==propagation)continue;VkBufferCopy copy{item.offset+(item.source==state?size_t(row)*MODEL_D*4u:0u),0,item.bytes};vkCmdCopyBuffer(c,item.source->handle,item.saved->handle,1,&copy);}
+        for(auto& item:entry->snapshot.items){VkBufferCopy copy{item.offset+(item.source==state?size_t(row)*MODEL_D*4u:0u),0,item.bytes};vkCmdCopyBuffer(c,item.source->handle,item.saved->handle,1,&copy);}
         for(auto& b:entry->blocks)if(!b->ready){
             for(uint32_t layer=0;layer<MODEL_FULL;layer++){
                 VkBufferCopy packet{(size_t(layer)*capacity+b->first)*HISTORY_BYTES,size_t(layer)*b->count*HISTORY_BYTES,size_t(b->count)*HISTORY_BYTES};
@@ -484,23 +491,32 @@ cfg.stage=6;launch(c,math,cfg,1,cfg.rows);
             for(uint32_t i=256u;i<count;i+=256u)boundaries[i]|=8u;
             boundaries[count]|=17u;
         }
-        uint32_t reused=hit?uint32_t(hit->input.size()):0u;bool addressHit=hit&&reused==count&&hit->addressReady&&hit->stops==stops;uint32_t rows=addressHit?0u:count,rebuildTokens=hit&&!addressHit?reused:0u;
+        uint32_t reused=hit?uint32_t(hit->input.size()):0u;bool addressHit=hit&&reused==count&&hit->addressReady&&hit->stops==stops;
+        // A matched boundary carries both its shared history Tree and encoded
+        // optical field, so only the suffix is new computation.
+        uint32_t rows=count-reused,rebuildTokens=0u;
+        uint64_t boundaryBytes=uint64_t(MODEL_D)*4u+uint64_t(MODEL_RECURRENT)*(MODEL_STATE_HEADS*128u*128u+MODEL_S*9u)*4u;
         uint32_t snapshotKind=hit?(reused==count?1u:reused==boundary?2u:3u):0u;
         // Plan bounded storage before recording GPU commands. Entries and blocks
         // stay pinned until the command buffer has completed.
         std::map<uint32_t,std::shared_ptr<SharedHistoryCache::Entry>> pending;
-        if(useCache){uint32_t maximum=sharedHistory->maxEntries(uint64_t(MODEL_D)*4u),selected=0;
+        if(useCache){uint32_t maximum=sharedHistory->maxEntries(boundaryBytes),selected=0;
             std::set<uint32_t> wanted;
-            for(auto it=boundaries.rbegin();it!=boundaries.rend();it++)if(it->first>reused&&(it->second&7u)&&selected<maximum){wanted.insert(it->first);selected++;}
-            for(auto it=boundaries.rbegin();it!=boundaries.rend();it++)if(it->first>reused&&selected<maximum&&wanted.insert(it->first).second)selected++;
-            for(auto position:wanted){auto entry=sharedHistory->reserve(ids,position,boundaries[position],keys[position],uint64_t(MODEL_D)*4u);if(entry){prepareBoundary(entry,keys);pending[position]=entry;}}
+            // A recurrent batch exposes its terminal field, not intermediate
+            // row fields. Save only actual batch ends without changing the
+            // source operator's batching or allocating a field per token.
+            for(uint32_t end=count;end>reused&&selected<maximum;){wanted.insert(end);selected++;
+                uint32_t previous=reused+((end-reused-1u)/workRows)*workRows;
+                if(previous<=reused)break;end=previous;}
+            for(auto position:wanted){uint32_t kind=position==count?17u:4u;
+                auto entry=sharedHistory->reserve(ids,position,kind,keys[position],boundaryBytes);if(entry){prepareBoundary(entry,keys);pending[position]=entry;}}
         }
         uint32_t initial[8]{0,0,1,0,stops[0],stops[1],0,0};
         historyRevision++;
-        if(rows)e.upload(prompt,ids.data(),rows*4u);e.upload(control,initial,32);inboundBytes+=rows*4u+40u;setup();
-        prepareAttachment(addressHit?hit:std::shared_ptr<SharedHistoryCache::Entry>{});e.release(e.uploadStaging);
+        if(rows)e.upload(prompt,ids.data(),count*4u);e.upload(control,initial,32);inboundBytes+=(rows?count*4u:0u)+40u;setup();
+        prepareAttachment(hit);e.release(e.uploadStaging);
         std::vector<std::pair<uint32_t,uint32_t>> spans;
-        for(uint32_t offset=0;offset<rows;){uint32_t end=std::min(count,offset+workRows);
+        for(uint32_t offset=reused;offset<count;){uint32_t end=std::min(count,offset+workRows);
             uint32_t length=end-offset;spans.push_back({offset,length});offset+=length;}
         uint32_t batches=uint32_t(spans.size()),queryCount=profile?2u+batches*(depth*7u+4u):2u;e.ensureTimestamps(queryCount);
         double splitGPU=attentionSplitGPU,splitWait=attentionSplitWait;
@@ -508,7 +524,7 @@ cfg.stage=6;launch(c,math,cfg,1,cfg.rows);
         if(attentionBackend==4u&&rows){resizeAttentionClasses(count,false);prepareStaticAttentionClassScene();}
         if(attentionBackend>=2u&&rows){uint32_t activeRows=std::min(count,workRows);prepareAttention(activeRows,count-activeRows);}
         auto c=e.command();begin(c);vkCmdResetQueryPool(c,e.timestamps,0,queryCount);vkCmdWriteTimestamp(c,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,e.timestamps,0);
-        if(addressHit)attachBoundary(c,hit);else{pendingAttentionClasses.fill(0u);vkCmdFillBuffer(c,slots->handle,0,slots->size,0u);vkCmdFillBuffer(c,propagation->handle,0,propagation->size,0u);sync(c);}
+        if(hit)attachBoundary(c,hit);else{pendingAttentionClasses.fill(0u);vkCmdFillBuffer(c,slots->handle,0,slots->size,0u);vkCmdFillBuffer(c,propagation->handle,0,propagation->size,0u);sync(c);}
         uint32_t lastRows=0;
         for(uint32_t batch=0;batch<batches;batch++){uint32_t offset=spans[batch].first;lastRows=spans[batch].second;uint32_t position=offset;
             ResidentConfig cfg{0,lastRows,0,position,batch,position?2u:0u,offset,capacity,depth,debug,0,0,0};forward(c,cfg);
@@ -526,7 +542,7 @@ cfg.stage=6;launch(c,math,cfg,1,cfg.rows);
         attachedBlocks.clear();if(hit)attachedBlocks=hit->blocks;
         prefixTokens=count;currentGenerated.clear();stateCursor=0;attentionDiagnosticDirty=false;
         if(cacheEnabled){if(addressHit)pathAddress=hit->address;else std::memcpy(&pathAddress,static_cast<char*>(readback->map)+bytes,sizeof(pathAddress));prefixPathKey=pathAddress.key;}
-        lazyField=addressHit;
+        lazyField=false;
         if(!lazyField&&cacheEnabled){gpuFieldAddress=pathAddress;gpuFieldPosition=count;gpuFieldReady=true;}
         if(useCache){for(auto& entry:sharedHistory->entries)if(entry&&entry->input==ids){entry->address=pathAddress;entry->addressReady=true;entry->stops=stops;}}
 
@@ -573,7 +589,8 @@ cfg.stage=6;launch(c,math,cfg,1,cfg.rows);
             // Persist precisely the prefix whose state has been computed.
             if(ids.back()==stops[0]||ids.back()==stops[1])ids.pop_back();
             tokens=uint32_t(ids.size());auto keys=SharedHistoryCache::identities(ids,cacheEpoch);
-            auto entry=sharedHistory->reserve(ids,tokens,2u,keys[tokens],uint64_t(MODEL_D)*4u);
+            uint64_t boundaryBytes=uint64_t(MODEL_D)*4u+uint64_t(MODEL_RECURRENT)*(MODEL_STATE_HEADS*128u*128u+MODEL_S*9u)*4u;
+            auto entry=sharedHistory->reserve(ids,tokens,2u,keys[tokens],boundaryBytes);
             if(entry){prepareBoundary(entry,keys);auto c=e.command();begin(c);saveBoundary(c,entry,0u,false);
                 check(vkEndCommandBuffer(c),"end output boundary capture");e.submit(c);vkFreeCommandBuffers(e.device,e.pool,1,&c);sharedHistory->publish();saved=1;}
         }
