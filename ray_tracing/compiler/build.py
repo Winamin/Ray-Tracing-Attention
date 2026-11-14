@@ -42,6 +42,9 @@ def build(spec, output=None):
     commands=[]
     shader_names=('resident_math','resident_mlp','resident_batch2','resident_pack','resident_attention','resident_attention_receipt','resident_attention_dense','resident_attention_local','resident_attention_classes','resident_auxiliary','resident_state','resident_ray','reply_cache','optical_path_key','history_cache')
     local_split_names=()
+    if spec.full_layers and 0<spec.attention_head_dim<=256:
+        shader_names+=('resident_detector_ordered_scores',
+                       'resident_detector_ordered_normalize','resident_detector_ordered_value')
     if spec.full_layers and spec.attention_head_dim==256 and spec.query_width==4*spec.kv_width:
         local_split_names=('resident_attention_local_key','resident_attention_local_value',
                            'resident_attention_local_trace','resident_attention_local_key_fallback')

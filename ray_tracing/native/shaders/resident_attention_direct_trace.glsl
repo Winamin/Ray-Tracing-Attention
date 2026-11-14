@@ -1,3 +1,4 @@
+shared uint groupMissSlots[BLOCK],groupMissCount;
 bool finiteValue(float value){return !isnan(value)&&!isinf(value);}
 void accurateAdd(inout float sum,inout float correction,float value){
     precise float adjusted=value-correction,next=sum+adjusted;
@@ -41,6 +42,19 @@ uint recordIndex(uint row,uint group,uint head){
 }
 bool recordFits(uint record){return record<uint(attentionReceipts.length())/RECORD_WORDS;}
 
+// A K workgroup owns disjoint historical slots and finishes every KV/head
+// before publishing their stamps. Local RT's shared gaps need no global queue
+// or a later V-side scan; the native K-to-V barrier publishes these receipts.
+void finishPathScoreGroup(uint row,uint count,uint lane){
+    if(row!=0u||!pathTargetReady(0u))return;
+    memoryBarrierBuffer();barrier();
+    if(groupFailure!=0u)return;
+    bool sameQuery=pathScoreWork[3u]==1u;
+    uint filled=sameQuery?groupMissCount:count;
+    for(uint i=lane;i<filled;i+=gl_WorkGroupSize.x)
+        publishPathScoreStamp(sameQuery?groupMissSlots[i]:localSlots[i]);
+}
+
 void startReceiptLens(vec3 origin,vec3 direction){
     atomicAdd(rayInitializations,1u);
     rayQueryInitializeEXT(receiptRay,lensAS[0],gl_RayFlagsOpaqueEXT,1u,origin,.00001,direction,8.0);
@@ -78,7 +92,7 @@ void traceGroup(uint row,uint group,uint count,uint lane){
     uint first=group*BLOCK,time=absolute(row);
     for(uint i=lane;i<BLOCK;i+=gl_WorkGroupSize.x)localSlots[i]=0xffffffffu;
     for(uint i=lane;i<COVERAGE_WORDS;i+=gl_WorkGroupSize.x)coverage[i]=0u;
-    if(lane==0u){groupFailure=0u;uniqueHits=0u;rayInitializations=0u;}
+    if(lane==0u){groupFailure=0u;uniqueHits=0u;rayInitializations=0u;groupMissCount=0u;}
     barrier();
     if(lane==0u){
         vec3 origin,direction;
@@ -87,6 +101,7 @@ void traceGroup(uint row,uint group,uint count,uint lane){
     }
     barrier();
     if(groupFailure!=0u)return;
+    beginPathScoreTraversal(row);
     uint subrays=(count+15u)/16u;
     if(lane<subrays){
         uint rayFirst=first+lane*16u,rayCount=min(16u,count-lane*16u);
@@ -112,11 +127,18 @@ void traceGroup(uint row,uint group,uint count,uint lane){
             if(relative<rayFirst||relative>=rayFirst+rayCount){attentionFailure();continue;}
             uint local=relative-first,word=local/32u,bit=1u<<(local%32u);
             if((atomicOr(coverage[word],bit)&bit)!=0u)continue;
+            bool cached=publishPathScores(row,global);
+            if(pathTraversalSame&&!cached){
+                uint missing=atomicAdd(groupMissCount,1u);
+                if(missing<BLOCK)groupMissSlots[missing]=global;
+                else attentionFailure();
+            }
             localSlots[local]=global;atomicAdd(uniqueHits,1u);
             uint old=atomicOr(slots[global].y,1u);
             if((old&3u)==0u){uint queue=atomicAdd(control[6],1u);control[8u+queue]=global;}
         }
     }
+    memoryBarrierBuffer();
     barrier();
     for(uint word=lane;word<COVERAGE_WORDS;word+=gl_WorkGroupSize.x){
         uint firstBit=word*32u,n=firstBit<count?min(32u,count-firstBit):0u;
@@ -124,7 +146,7 @@ void traceGroup(uint row,uint group,uint count,uint lane){
         if(coverage[word]!=expected)attentionFailure();
     }
     if(lane==0u){
-        if(uniqueHits!=count)attentionFailure();
+        if(uniqueHits!=count||groupMissCount>count)attentionFailure();
         atomicAdd(hits[row*(cfg.capacity+1u)],uniqueHits);
     }
     barrier();

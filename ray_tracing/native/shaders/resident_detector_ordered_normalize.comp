@@ -1,0 +1,95 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#include "resident_common.glsl"
+
+// Ordered detector pass 2. Each Q head uses the original 128-thread maximum
+// and sum128 reductions, then the original sequential online (m,Z) update.
+// Dispatch (heads, 1, 1), local size 128; storage barrier after the scores pass.
+// Persistent score planes are consumed directly; only weights and tile metadata
+// use the original scratch records. BLOCK keeps the original 256-position width.
+layout(constant_id=1) const uint BLOCK=256u;
+layout(std430,binding=42) buffer OrderedDetectorCache {uint orderedDetectorCache[];};
+const uint RECORD_WORDS=4u+BLOCK,DETECTOR_ERROR=65536u;
+shared float tileMaximum,tileReference,previousScale;
+shared uint groupFailure;
+
+bool orderedFinite(float value){return !isnan(value)&&!isinf(value);}
+void orderedFailure(){atomicOr(groupFailure,1u);atomicOr(control[3],DETECTOR_ERROR);}
+bool orderedRecordFits(uint tile,uint head,uint heads){
+    return tile*heads+head<uint(orderedDetectorCache.length())/RECORD_WORDS;
+}
+uint orderedRecord(uint tile,uint head,uint heads){return (tile*heads+head)*RECORD_WORDS;}
+
+void main(){
+    if(stopped())return;
+    uint lane=gl_LocalInvocationID.x,c=gl_SubgroupInvocationID,head=gl_WorkGroupID.x;
+    uint heads=headCount(),historyBase=parameters[blockBase()+41u]*cfg.capacity;
+    if(cfg.rows!=1u||gl_WorkGroupSize.x!=128u||gl_SubgroupSize!=32u||BLOCK!=256u){
+        if(lane==0u)atomicOr(control[3],DETECTOR_ERROR);return;
+    }
+    if((control[3]&DETECTOR_ERROR)!=0u||head>=heads)return;
+    uint count=hits[0],visible=min(absolute(0u)+1u,cfg.capacity);
+    if(count!=visible||count==0u){if(lane==0u)atomicOr(control[3],DETECTOR_ERROR);return;}
+    bool persistent=pathTargetReady(head);
+    bool sameQ=persistent&&pathScoreWork[3u]!=0u;
+    uint scorePlane=persistent?pathScorePlane(head):0u;
+    float reference=0.0,maximum=-1.0/0.0;
+    if(lane==0u)groupFailure=0u;
+    barrier();
+    // All heads completed the score dispatch before this pass. Only the owner
+    // publishes newly filled occurrence stamps; unchanged hits need no writes.
+    if(sameQ&&head==0u){
+        for(uint i=lane;i<pathScoreWork[4u];i+=128u){
+            uint position=pathMissIndex(i);
+            if(position>=count)orderedFailure();
+            else publishPathScoreStamp(hits[position+1u]);
+        }
+        barrier();if(groupFailure!=0u)return;
+    }
+    for(uint first=0u;first<count;first+=256u){
+        uint n=min(256u,count-first),tile=first/256u;
+        if(lane==0u){
+            if(!orderedRecordFits(tile,head,heads))orderedFailure();
+            else orderedDetectorCache[orderedRecord(tile,head,heads)+3u]=n;
+        }
+        barrier();if(groupFailure!=0u)return;
+        uint at=orderedRecord(tile,head,heads);
+        float localMax=-1.0/0.0;
+        for(uint j=lane;j<n;j+=128u){
+            uint slot=persistent?hits[first+j+1u]:0u;
+            float score=uintBitsToFloat(persistent?pathScoreCache[scorePlane+(slot-historyBase)]:orderedDetectorCache[at+4u+j]);
+            if(!orderedFinite(score))orderedFailure();
+            else if(persistent&&!sameQ&&head==0u)publishPathScoreStamp(slot);
+            localMax=max(localMax,score);
+        }
+        localMax=subgroupMax(localMax);
+        if(c==0u)reduction[gl_SubgroupID]=localMax;
+        barrier();if(groupFailure!=0u)return;
+        if(lane==0u){
+            tileMaximum=max(max(reduction[0],reduction[1]),max(reduction[2],reduction[3]));
+            tileMaximum=max(maximum,tileMaximum);previousScale=exp(maximum-tileMaximum);
+        }
+        barrier();
+        float localRef=0.0;
+        for(uint j=lane;j<n;j+=128u){
+            uint slot=persistent?hits[first+j+1u]:0u;
+            float score=uintBitsToFloat(persistent?pathScoreCache[scorePlane+(slot-historyBase)]:orderedDetectorCache[at+4u+j]);
+            float weight=exp(score-tileMaximum);
+            // Every tile score has crossed the maximum-reduction barriers.
+            // Its sole j owner can now replace this scratch word with weight.
+            orderedDetectorCache[at+4u+j]=floatBitsToUint(weight);localRef+=weight;
+        }
+        tileReference=sum128(localRef);
+        reference=reference*previousScale+tileReference;maximum=tileMaximum;
+        barrier();
+        if(lane==0u){
+            if(!orderedFinite(maximum)||!orderedFinite(reference)||reference<=0.0)orderedFailure();
+            orderedDetectorCache[at]=floatBitsToUint(tileMaximum);
+            orderedDetectorCache[at+1u]=floatBitsToUint(tileReference);
+            orderedDetectorCache[at+2u]=floatBitsToUint(previousScale);
+        }
+        barrier();if(groupFailure!=0u)return;
+    }
+    if(lane==0u){physical[head*2u]=maximum+20.0;physical[head*2u+1u]=reference;}
+}

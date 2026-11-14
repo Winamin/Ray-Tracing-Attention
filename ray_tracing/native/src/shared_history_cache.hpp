@@ -7,15 +7,25 @@ public:
     static constexpr uint32_t limit=64u,blockTokens=16u;
     using Key=std::array<uint32_t,8>;
     struct Block {
+        struct AttentionLayer {
+            Buffer* payload{};
+            // One [relative payload word offset, representative count] per
+            // token/K-or-V/KV-head, in the existing compact directory order.
+            std::vector<std::array<uint32_t,2>> directory;
+        };
         Engine& e;uint32_t first,count;bool ready=false;std::unique_ptr<ShapeMesh> scene;Buffer *packets{},*marks{};
+        bool attentionReady=false;uint32_t attentionDomains{},attentionHeadDim{},attentionKVWidth{},attentionPacketBytes{};
+        std::vector<uint32_t> attentionFullLayers;
+        std::vector<AttentionLayer> attentionLayers;
         Block(Engine& engine,uint32_t begin,uint32_t n):e(engine),first(begin),count(n) {
             scene=std::make_unique<ShapeMesh>(e,std::max(1u,MODEL_FULL),96u,1u);
             auto usage=VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT;
             packets=e.buffer(size_t(std::max(1u,MODEL_FULL))*n*HISTORY_BYTES,usage);
             marks=e.buffer(size_t(std::max(1u,MODEL_FULL))*n*8u,usage);
         }
-        uint64_t bytes()const{return packets->size+marks->size+scene->sceneBytes();}
-        ~Block(){e.release(packets);e.release(marks);}
+        uint64_t attentionBytes()const{uint64_t bytes=0u;for(const auto& layer:attentionLayers)if(layer.payload)bytes+=layer.payload->allocationSize;return bytes;}
+        uint64_t bytes()const{return packets->size+marks->size+scene->sceneBytes()+attentionBytes();}
+        ~Block(){for(auto& layer:attentionLayers)e.release(layer.payload);e.release(packets);e.release(marks);}
     };
     struct Entry {
         Engine& e;uint32_t slot,kind;uint64_t touched;Key key;
@@ -26,7 +36,7 @@ public:
     Engine& e;ShapeMesh directory;Buffer *nodes{},*queries{},*results{},*readback{};
     VkDescriptorSetLayout setLayout{};VkPipelineLayout layout{};VkDescriptorPool pool{};VkDescriptorSet set{};VkPipeline pipeline{};
     std::array<std::shared_ptr<Entry>,limit> entries{};
-    std::map<Key,std::weak_ptr<Block>> blocks;std::vector<uint32_t> previousInput;
+    std::map<Key,std::weak_ptr<Block>> blocks;
     uint64_t clock{},evictions{},budget=512ull*1024u*1024u,lookupRays{};double lookupMs{};uint32_t entryLimit=limit;
     SharedHistoryCache(Engine& engine):e(engine),directory(e,limit/16u,96u,1u) {
         if(auto* value=std::getenv("RT_HISTORY_CACHE_MIB"))budget=std::max(64ull,std::stoull(value))*1024ull*1024ull;
@@ -63,9 +73,9 @@ public:
         for(uint32_t k=0;k<2;k++){float chart=float(key[k]&0xffffffu)/float(0x1000000u);std::memcpy(&n[8+k],&chart,4);}
         n[10]=count;n[11]=valid;return n;
     }
-    std::shared_ptr<Entry> find(const std::vector<uint32_t>& input,const std::vector<Key>& keys) {
+    std::shared_ptr<Entry> find(const std::vector<uint32_t>& input,const std::vector<Key>& keys,uint32_t minimum=0u) {
         auto start=Clock::now();lookupRays=0;lookupMs=0;std::set<uint32_t> lengths;
-        for(auto& entry:entries)if(entry&&entry->input.size()<=input.size())lengths.insert(uint32_t(entry->input.size()));
+        for(auto& entry:entries)if(entry&&entry->input.size()>=minimum&&entry->input.size()<=input.size())lengths.insert(uint32_t(entry->input.size()));
         if(lengths.empty())return {};
         std::vector<std::array<uint32_t,12>> q;for(auto length:lengths)q.push_back(node(keys[length],length,true));
         e.upload(queries,q.data(),q.size()*48u);auto c=e.command();e.begin(c);
@@ -79,10 +89,6 @@ public:
         for(uint32_t i=0;i<count;i++)if(hits[i]<limit){auto entry=entries[hits[i]];
             if(entry&&entry->key==keys[entry->input.size()]&&std::equal(entry->input.begin(),entry->input.end(),input.begin())&&(!best||entry->input.size()>best->input.size()))best=entry;}
         if(best)best->touched=++clock;lookupRays=count;lookupMs=ms(start);return best;
-    }
-    uint32_t common(const std::vector<uint32_t>& input)const {
-        uint32_t best=0;auto match=[&](const auto& old){uint32_t n=0;while(n<input.size()&&n<old.size()&&input[n]==old[n])n++;if(n<input.size())best=std::max(best,n);};
-        match(previousInput);for(auto& entry:entries)if(entry)match(entry->input);return best;
     }
     uint64_t snapshotBytes()const {uint64_t n=0;for(auto& entry:entries)if(entry)n+=entry->snapshot.bytes;return n;}
     uint64_t blockBytes()const {uint64_t n=0;for(auto& pair:blocks)if(auto b=pair.second.lock())n+=b->bytes();return n;}

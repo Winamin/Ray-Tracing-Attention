@@ -35,6 +35,7 @@ void valueAttentionWindow(uint row,uint kv,uint lane){
     uint heads=headCount(),c=gl_SubgroupInvocationID,tile=gl_SubgroupID;
     uint available=availablePositions(row),groups=groupCount(row);
     bool diagnostics=(cfg.debug&(65536u|131072u))!=0u;
+    bool persistentScores=pathScoresEnabled()&&pathScoreWork[2u]==1u;
     for(uint headOffset=0u;headOffset<Q_PER_KV;headOffset+=4u){
         uint firstHead=kv*Q_PER_KV+headOffset;
         if(firstHead>=heads)return;
@@ -49,11 +50,13 @@ void valueAttentionWindow(uint row,uint kv,uint lane){
                 for(uint h=0u;h<4u;h++)if(headEnabled[h]){
                     uint record=at+h*RECORD_WORDS;
                     if(attentionReceipts[record+2u]!=count||attentionReceipts[record+7u]!=3u)invalid=true;
-                    if(c==0u){attentionReceipts[record+4u]=0u;attentionReceipts[record+5u]=0u;}
+                    if(diagnostics&&c==0u){attentionReceipts[record+4u]=0u;attentionReceipts[record+5u]=0u;}
                 }
                 for(uint j=c;j<count;j+=32u){
                     vec4 score=vec4(-1.0/0.0);
-                    for(uint h=0u;h<4u;h++)if(headEnabled[h])score[h]=uintBitsToFloat(attentionReceipts[at+h*RECORD_WORDS+SCORE_OFFSET+j]);
+                    uint slot=persistentScores?hits[row*(cfg.capacity+1u)+group*BLOCK+j+1u]:0u;
+                    for(uint h=0u;h<4u;h++)if(headEnabled[h])score[h]=persistentScores?readPathScore(firstHead+h,slot):
+                        uintBitsToFloat(attentionReceipts[at+h*RECORD_WORDS+SCORE_OFFSET+j]);
                     maximum=max(maximum,score);
                 }
             }
@@ -64,7 +67,9 @@ void valueAttentionWindow(uint row,uint kv,uint lane){
                 for(uint j=c;j<count;j+=32u){
                     vec4 weight=vec4(0.0);
                     for(uint h=0u;h<4u;h++)if(headEnabled[h]){
-                        weight[h]=exp(uintBitsToFloat(attentionReceipts[at+h*RECORD_WORDS+SCORE_OFFSET+j])-maximum[h]);
+                        float score=persistentScores?readPathScore(firstHead+h,hits[row*(cfg.capacity+1u)+group*BLOCK+j+1u]):
+                            uintBitsToFloat(attentionReceipts[at+h*RECORD_WORDS+SCORE_OFFSET+j]);
+                        weight[h]=exp(score-maximum[h]);
                         attentionReceipts[weightAddress(at,j,h)]=floatBitsToUint(weight[h]);
                     }
                     accurateAdd4(reference,referenceError,weight);
@@ -132,8 +137,8 @@ void valueAttentionWindow(uint row,uint kv,uint lane){
             if(c==0u)for(uint h=0u;h<4u;h++)if(headEnabled[h]){
                 uint record=at+h*RECORD_WORDS;
                 if(diagnostics){atomicAdd(attentionReceipts[record+4u],products);atomicAdd(attentionReceipts[record+5u],decodes);statisticAdd(3u,products);}
-                if(tile==0u){attentionReceipts[record+6u]=count;attentionReceipts[record+7u]=15u;
-                    if(diagnostics){statisticAdd(7u,count);statisticAdd(8u,count);}}
+                if(tile==0u){attentionReceipts[record+7u]=15u;
+                    if(diagnostics){attentionReceipts[record+6u]=count;statisticAdd(7u,count);statisticAdd(8u,count);}}
             }
         }
         if(lane==0u)for(uint h=0u;h<4u;h++)if(headEnabled[h]){

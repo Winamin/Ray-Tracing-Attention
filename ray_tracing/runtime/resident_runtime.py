@@ -55,6 +55,11 @@ class ResidentRuntime:
         self.metadata.update(attention_backend=attention_backend,attention_block=attention_block,
                              attention_compute='fused RT / FP32 grouped softmax' if mode&512 else 'original FP32' if mode&1024 else 'original',
                              attention_rt_timing='includes score and weighted aggregation' if mode&512 else 'RT traversal only')
+        self.metadata['detector_mode']='ordered' if mode&131072 else 'split' if mode&262144 else 'legacy'
+        self.metadata['detector_precision']='fp32'
+        self.metadata['detector_history_policy']='complete_rt_hits'
+        self.metadata['detector_min_history']=512 if mode&(131072|262144) else None
+        self.metadata['detector_accumulation_order']='local_tile_merge' if self.metadata['detector_mode']=='split' else 'original'
         self.metadata['attention_receipt_format']='compact_columns' if mode&2048 else 'dense'
         self.metadata['attention_stats']=bool(attention_stats)
         if mode&2048:self.metadata['attention_compute']='RT hit classification / compact FP32 grouped softmax'
@@ -147,6 +152,9 @@ class ResidentRuntime:
         if len(payload)>=optical+104:
             result.update(zip(('history_state_rebuilt_tokens','history_address_hit'),
                               map(int,np.frombuffer(payload,'<u8',count=2,offset=optical+88))))
+        if profile and len(payload)>=optical+120:
+            result['profile_gpu_ms'].update(zip(('attention_detector','recurrent_detector'),
+                map(float,np.frombuffer(payload,'<f8',count=2,offset=optical+104))))
         self.position=len(ids);self._attention_diagnostic_dirty=False
         return result
 
@@ -214,6 +222,9 @@ class ResidentRuntime:
             result.update(zip(('cache_candidates','cache_rejected_candidates'),map(int,np.frombuffer(payload,'<u4',count=2,offset=offset+88))))
         if len(payload)>=offset+112:
             result.update(zip(('mlp_route_rt_rows','mlp_route_cached_rows'),map(int,np.frombuffer(payload,'<u8',count=2,offset=offset+96))))
+        if profile and len(payload)>=offset+128:
+            result['profile_gpu_ms'].update(zip(('attention_detector','recurrent_detector'),
+                map(float,np.frombuffer(payload,'<f8',count=2,offset=offset+112))))
         return result
 
     def codec(self,values):

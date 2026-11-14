@@ -1,0 +1,104 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#include "resident_common.glsl"
+
+// Ordered detector pass 1: independent QK scores. Fresh targets use the original
+// 256-position tile. An existing target dispatches only four missing positions
+// per workgroup and KV head; verified score hits never enter this pass.
+// No precise/NoContraction qualifiers: match resident_ray operation 3's
+// total += query * pathCoordinate expression and per-lane reduction order.
+// Scratch records are (tile * heads + head) * (4 + BLOCK) uint words:
+//   0 online tile maximum; 1 tile Z; 2 previousScale; 3 count;
+//   4..4+BLOCK-1 scores, overwritten by weights after the maximum reduction.
+// Active path scores remain in their persistent plane. Pass 2 supplies record
+// counts, fields 0..2 and weights. BLOCK remains 256 to match op 3.
+// Dispatch is dense or a GPU-produced miss queue, local size 128.
+layout(constant_id=1) const uint BLOCK=256u;
+layout(std430,binding=42) buffer OrderedDetectorCache {uint orderedDetectorCache[];};
+const uint Q_PER_KV=RT_QUERY_WIDTH/RT_GQA_WIDTH,MAX_DH=256u;
+const uint RECORD_WORDS=4u+BLOCK,DETECTOR_ERROR=65536u;
+shared vec4 queryTile[MAX_DH];
+shared uint groupFailure;
+
+bool orderedFinite(float value){return !isnan(value)&&!isinf(value);}
+void orderedFailure(){atomicOr(groupFailure,1u);atomicOr(control[3],DETECTOR_ERROR);}
+bool orderedRecordFits(uint tile,uint head,uint heads){
+    return tile*heads+head<uint(orderedDetectorCache.length())/RECORD_WORDS;
+}
+uint orderedRecord(uint tile,uint head,uint heads){return (tile*heads+head)*RECORD_WORDS;}
+
+void main(){
+    if(stopped())return;
+    uint lane=gl_LocalInvocationID.x,c=gl_SubgroupInvocationID;
+    uint heads=headCount(),dh=headWidth(),historyBase=parameters[blockBase()+41u]*cfg.capacity;
+    if(cfg.rows!=1u||gl_WorkGroupSize.x!=128u||gl_SubgroupSize!=32u||
+       dh==0u||dh>MAX_DH||Q_PER_KV==0u||BLOCK!=256u){
+        if(lane==0u)atomicOr(control[3],DETECTOR_ERROR);return;
+    }
+    uint count=hits[0],visible=min(absolute(0u)+1u,cfg.capacity);
+    uint kvHeads=(heads+Q_PER_KV-1u)/Q_PER_KV;
+    if(kvHeads==0u||count!=visible||count==0u){
+        if(lane==0u)atomicOr(control[3],DETECTOR_ERROR);return;
+    }
+    bool persistent=pathTargetReady(0u);
+    bool sparse=persistent&&pathScoreWork[3u]!=0u;
+    uint job=gl_WorkGroupID.x+gl_WorkGroupID.y*65535u;
+    if(persistent&&job>=pathScoreWork[5u])return;
+    uint tile=job/kvHeads,kv=job%kvHeads;
+    uint first=tile*BLOCK;
+    if(!sparse&&first>=count)return;
+    uint queueFirst=tile*4u,missCount=sparse?pathScoreWork[4u]:0u;
+    uint n=sparse?min(4u,missCount-queueFirst):min(BLOCK,count-first);
+    uint time=absolute(0u);
+    if(lane==0u)groupFailure=0u;
+    barrier();
+    if(!sparse)for(uint j=lane;j<n;j+=128u){
+        uint slot=hits[first+j+1u],age=time-first-j;
+        uint expected=historyBase+age%cfg.capacity;
+        if(slot!=expected||slot>=uint(slots.length()))orderedFailure();
+        else if(slots[slot].x!=age)orderedFailure();
+    }
+    barrier();if(groupFailure!=0u)return;
+    for(uint offset=0u;offset<Q_PER_KV;offset+=4u){
+        uint firstHead=kv*Q_PER_KV+offset;
+        if(firstHead>=heads)break;
+        bvec4 enabled=bvec4(false);
+        for(uint h=0u;h<4u;h++)enabled[h]=firstHead+h<heads&&offset+h<Q_PER_KV;
+        uvec4 scorePlanes=uvec4(0u);
+        if(persistent)for(uint h=0u;h<4u;h++)if(enabled[h])
+            scorePlanes[h]=pathScorePlane(firstHead+h);
+        if(!persistent&&lane==0u)for(uint h=0u;h<4u;h++)if(enabled[h]){
+            if(!orderedRecordFits(tile,firstHead+h,heads))orderedFailure();
+        }
+        for(uint axis=lane;axis<dh;axis+=128u){
+            vec4 q=vec4(0.0);
+            for(uint h=0u;h<4u;h++)if(enabled[h]){
+                q[h]=queries[(firstHead+h)*dh+axis];
+                if(!orderedFinite(q[h]))orderedFailure();
+            }
+            queryTile[axis]=q;
+        }
+        barrier();if(groupFailure!=0u)return;
+        for(uint j=gl_SubgroupID;j<n;j+=4u){
+            uint position=sparse?pathMissIndex(queueFirst+j):first+j;
+            if(position>=count){orderedFailure();continue;}
+            uint slot=hits[position+1u];vec4 total=vec4(0.0),score=vec4(0.0);
+            for(uint axis=c;axis<dh;axis+=32u){
+                float k=pathCoordinate(slot,firstHead*dh+axis,false);
+                if(!orderedFinite(k))orderedFailure();
+                for(uint h=0u;h<4u;h++)if(enabled[h])total[h]+=queryTile[axis][h]*k;
+            }
+            total=subgroupAdd(total);
+            for(uint h=0u;h<4u;h++)if(enabled[h])score[h]=total[h]/sqrt(float(dh));
+            if(c==0u)for(uint h=0u;h<4u;h++)if(enabled[h]){
+                if(!orderedFinite(score[h]))orderedFailure();
+                if(persistent){
+                    if(orderedFinite(score[h])&&control[3]==0u)
+                        pathScoreCache[scorePlanes[h]+(slot-historyBase)]=floatBitsToUint(score[h]);
+                }else orderedDetectorCache[orderedRecord(tile,firstHead+h,heads)+4u+j]=floatBitsToUint(score[h]);
+            }
+        }
+        barrier();if(groupFailure!=0u)return;
+    }
+}

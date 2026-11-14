@@ -45,17 +45,25 @@ void keyAttention(uint row,uint group,uint lane){
     uint c=gl_SubgroupInvocationID,subgroup=gl_SubgroupID;
     uint qLane=subgroup%Q_BATCH,slice=subgroup/Q_BATCH,heads=headCount();
     uint kvHeads=(heads+Q_PER_KV-1u)/Q_PER_KV;
+    bool diagnostics=(cfg.debug&(65536u|131072u))!=0u;
+    bool persistentScores=pathScoresEnabled()&&pathScoreWork[2u]==1u;
+    bool sameQuery=persistentScores&&pathScoreWork[3u]==1u;
+    uint scoreCount=sameQuery?groupMissCount:count;
     for(uint kv=0u;kv<kvHeads;kv++)for(uint headOffset=0u;headOffset<Q_PER_KV;headOffset+=Q_BATCH){
         uint head=kv*Q_PER_KV+headOffset+qLane;
         bool headActive=head<heads&&headOffset+qLane<Q_PER_KV;
-        if(slice==0u)for(uint axis=c;axis<DH;axis+=32u)
+        if(scoreCount!=0u&&slice==0u)for(uint axis=c;axis<DH;axis+=32u)
             localWork[qLane*WORK_STRIDE+axis]=headActive?queries[row*A+head*DH+axis]:0.0;
         barrier();
         uint products=0u,decodes=0u;
-        for(uint firstToken=0u;firstToken<count;firstToken+=KEY_SLICES){
-            uint n=min(KEY_SLICES,count-firstToken);
+        for(uint firstToken=0u;firstToken<scoreCount;firstToken+=KEY_SLICES){
+            uint n=min(KEY_SLICES,scoreCount-firstToken);
+            uint slot=slice<n?(sameQuery?groupMissSlots[firstToken+slice]:localSlots[firstToken+slice]):0u;
+            bool scoreMiss=headActive&&slice<n;
+            // The RT winner queue contains only absent whole-Q path receipts.
+            // Its order affects no dot product or final historical reduction.
             for(uint i=lane;i<n*(DH/4u);i+=gl_WorkGroupSize.x){
-                uint j=i/(DH/4u),p=i%(DH/4u),slot=localSlots[firstToken+j];
+                uint j=i/(DH/4u),p=i%(DH/4u),slot=sameQuery?groupMissSlots[firstToken+j]:localSlots[firstToken+j];
                 uint packedBase=j*DH+4u*p;
                 classTile[packedBase]=compactMember(slot,kv,4u*p,false);
                 classTile[packedBase+1u]=compactMember(slot,kv,4u*p+1u,false);
@@ -64,14 +72,13 @@ void keyAttention(uint row,uint group,uint lane){
             }
             barrier();if(groupFailure!=0u)return;
             precise float sum=0.0,error=0.0;
-            uint slot=slice<n?localSlots[firstToken+slice]:0u;
-            uint roots=slice<n?compactCount(slot,kv,false):0u;
+            uint roots=scoreMiss?compactCount(slot,kv,false):0u;
             if(roots>DH){attentionFailure();roots=0u;}
-            if(headActive&&slice<n)for(uint rank=c;rank<roots;rank+=32u){
+            if(scoreMiss)for(uint rank=c;rank<roots;rank+=32u){
                 uint descriptor=compactDescriptor(slot,kv,rank,false),axis=compactAxis(descriptor),base=slice*DH;
                 uint offset=compactMemberOffset(descriptor),members=compactMemberCount(descriptor);
                 if(axis>=DH||members==0u||offset+members>DH){attentionFailure();continue;}
-                decodes++;float value=classValue(slot,kv,rank,false);
+                if(diagnostics)decodes++;float value=classValue(slot,kv,rank,false);
                 if(!finiteValue(value)){attentionFailure();continue;}if(value==0.0)continue;
                 precise float qsum=localWork[qLane*WORK_STRIDE+axis],qerror=0.0;
                 for(uint m=1u;m<members;m++){
@@ -80,42 +87,57 @@ void keyAttention(uint row,uint group,uint lane){
                 }
                 qsum-=qerror;
                 if(qsum!=0.0){precise float product=qsum*value;
-                    accurateAdd(sum,error,product);accurateAdd(sum,error,fma(qsum,value,-product));products++;}
+                    accurateAdd(sum,error,product);accurateAdd(sum,error,fma(qsum,value,-product));if(diagnostics)products++;}
             }
-            float total=accurateKeyReduce(sum,error),score=total/sqrt(float(DH));
+            float score=0.0;
+            if(scoreMiss)score=accurateKeyReduce(sum,error)/sqrt(float(DH));
             if(headActive&&slice<n){
                 if(!finiteValue(score))attentionFailure();
-                if(c==0u)attentionReceipts[recordIndex(row,group,head)*RECORD_WORDS+SCORE_OFFSET+firstToken+slice]=floatBitsToUint(score);
+                if(c==0u){
+                    if(persistentScores){
+                        if(finiteValue(score)&&groupFailure==0u)savePathScore(row,head,slot,score);
+                    }else attentionReceipts[recordIndex(row,group,head)*RECORD_WORDS+SCORE_OFFSET+firstToken+slice]=floatBitsToUint(score);
+                }
             }
             barrier();if(groupFailure!=0u)return;
         }
-        products=subgroupAdd(products);decodes=subgroupAdd(decodes);
-        if(c==0u){keyWork[subgroup*2u]=products;keyWork[subgroup*2u+1u]=decodes;}
+        if(diagnostics){
+            products=subgroupAdd(products);decodes=subgroupAdd(decodes);
+            if(c==0u){keyWork[subgroup*2u]=products;keyWork[subgroup*2u+1u]=decodes;}
+        }
         barrier();
         if(slice==0u&&headActive){
             uint at=recordIndex(row,group,head)*RECORD_WORDS;
             if(c==0u){
-                products=0u;decodes=0u;
-                for(uint p=0u;p<KEY_SLICES;p++){products+=keyWork[(p*Q_BATCH+qLane)*2u];decodes+=keyWork[(p*Q_BATCH+qLane)*2u+1u];}
-                attentionReceipts[at]=products;attentionReceipts[at+1u]=decodes;attentionReceipts[at+2u]=count;
-                attentionReceipts[at+3u]=head==0u?rayInitializations:0u;attentionReceipts[at+7u]=3u;
-                statisticAdd(0u,count);statisticAdd(1u,count);statisticAdd(2u,products);
-                statisticAdd(6u,decodes);statisticAdd(9u,head==0u?rayInitializations:0u);statisticAdd(10u,1u);
+                attentionReceipts[at+2u]=count;attentionReceipts[at+7u]=3u;
+                if(diagnostics){
+                    products=0u;decodes=0u;
+                    for(uint p=0u;p<KEY_SLICES;p++){products+=keyWork[(p*Q_BATCH+qLane)*2u];decodes+=keyWork[(p*Q_BATCH+qLane)*2u+1u];}
+                    attentionReceipts[at]=products;attentionReceipts[at+1u]=decodes;
+                    attentionReceipts[at+3u]=head==0u?rayInitializations:0u;
+                    statisticAdd(0u,count);statisticAdd(1u,count);statisticAdd(2u,products);
+                    statisticAdd(6u,decodes);statisticAdd(9u,head==0u?rayInitializations:0u);statisticAdd(10u,1u);
+                }
             }
-            for(uint w=c;w<COVERAGE_WORDS;w+=32u)attentionReceipts[at+8u+w]=coverage[w];
-            for(uint j=c;j<BLOCK;j+=32u){
-                if(j>=count)attentionReceipts[at+SCORE_OFFSET+j]=floatBitsToUint(-1.0/0.0);
-                attentionReceipts[at+WEIGHT_OFFSET+j]=0u;
+            if(diagnostics){
+                for(uint w=c;w<COVERAGE_WORDS;w+=32u)attentionReceipts[at+8u+w]=coverage[w];
+                for(uint j=c;j<BLOCK;j+=32u)if(j>=count){
+                    attentionReceipts[at+SCORE_OFFSET+j]=floatBitsToUint(-1.0/0.0);
+                    attentionReceipts[at+WEIGHT_OFFSET+j]=0u;
+                }
             }
         }
         barrier();if(groupFailure!=0u)return;
     }
+    finishPathScoreGroup(row,count,lane);
 }
 
 void valueAttention(uint row,uint kv,uint lane){
     uint heads=headCount();if(kv*Q_PER_KV>=heads)return;
     uint c=gl_SubgroupInvocationID,qLane=gl_SubgroupID;
     uint available=availablePositions(row),groups=groupCount(row);
+    bool diagnostics=(cfg.debug&(65536u|131072u))!=0u;
+    bool persistentScores=pathScoresEnabled()&&pathScoreWork[2u]==1u;
     if(lane==0u)groupFailure=0u;
     barrier();
     for(uint headOffset=0u;headOffset<Q_PER_KV;headOffset+=Q_BATCH){
@@ -125,7 +147,14 @@ void valueAttention(uint row,uint kv,uint lane){
         if(headActive)for(uint group=0u;group<groups;group++){
             uint at=recordIndex(row,group,head)*RECORD_WORDS,count=min(BLOCK,available-group*BLOCK);
             if(attentionReceipts[at+2u]!=count||attentionReceipts[at+7u]!=3u)attentionFailure();
-            for(uint j=c;j<count;j+=32u)maximum=max(maximum,uintBitsToFloat(attentionReceipts[at+SCORE_OFFSET+j]));
+            for(uint j=c;j<count;j+=32u){
+                float score;
+                if(persistentScores){
+                    uint slot=hits[row*(cfg.capacity+1u)+group*BLOCK+j+1u];
+                    score=readPathScore(head,slot);
+                }else score=uintBitsToFloat(attentionReceipts[at+SCORE_OFFSET+j]);
+                maximum=max(maximum,score);
+            }
         }
         maximum=subgroupMax(maximum);
         precise float reference=0.0,referenceError=0.0;
@@ -133,7 +162,9 @@ void valueAttention(uint row,uint kv,uint lane){
         if(headActive)for(uint group=0u;group<groups;group++){
             uint at=recordIndex(row,group,head)*RECORD_WORDS,count=min(BLOCK,available-group*BLOCK);
             for(uint j=c;j<count;j+=32u){
-                float weight=exp(uintBitsToFloat(attentionReceipts[at+SCORE_OFFSET+j])-maximum);
+                float score=persistentScores?readPathScore(head,hits[row*(cfg.capacity+1u)+group*BLOCK+j+1u]):
+                    uintBitsToFloat(attentionReceipts[at+SCORE_OFFSET+j]);
+                float weight=exp(score-maximum);
                 attentionReceipts[at+WEIGHT_OFFSET+j]=floatBitsToUint(weight);
                 accurateAdd(reference,referenceError,weight);
             }
@@ -167,7 +198,7 @@ void valueAttention(uint row,uint kv,uint lane){
                     uint offset=compactMemberOffset(descriptor),members=compactMemberCount(descriptor);
                     float value=addressTile[rank];
                     if(root>=DH||members==0u||offset+members>DH){attentionFailure();continue;}
-                    uint consumed=DISTRIBUTE_V_MEMBERS!=0u?members:1u;decodes+=consumed;
+                    uint consumed=DISTRIBUTE_V_MEMBERS!=0u?members:1u;if(diagnostics)decodes+=consumed;
                     if(value!=0.0){
                         precise float product=weight*value,residual=fma(weight,value,-product);
                         if(DISTRIBUTE_V_MEMBERS!=0u)for(uint m=0u;m<members;m++){
@@ -178,7 +209,7 @@ void valueAttention(uint row,uint kv,uint lane){
                             localWork[qLane*WORK_STRIDE+root]=product;
                             localWork[WORK_PLANE+qLane*WORK_STRIDE+root]=residual;
                         }
-                        products+=consumed;
+                        if(diagnostics)products+=consumed;
                     }
                 }
                 subgroupMemoryBarrierShared();subgroupBarrier();
@@ -190,18 +221,19 @@ void valueAttention(uint row,uint kv,uint lane){
                 }
                 barrier();
             }
-            products=subgroupAdd(products);decodes=subgroupAdd(decodes);
+            if(diagnostics){products=subgroupAdd(products);decodes=subgroupAdd(decodes);}
             if(headActive&&c==0u){
-                attentionReceipts[at+4u]=products;attentionReceipts[at+5u]=decodes;
-                attentionReceipts[at+6u]=count;attentionReceipts[at+7u]=15u;
-                statisticAdd(3u,products);statisticAdd(7u,count);statisticAdd(8u,count);
+                attentionReceipts[at+7u]=15u;
+                if(diagnostics){attentionReceipts[at+4u]=products;attentionReceipts[at+5u]=decodes;
+                    attentionReceipts[at+6u]=count;
+                    statisticAdd(3u,products);statisticAdd(7u,count);statisticAdd(8u,count);}
             }
         }
         if(headActive){
             if(!finiteValue(reference)||reference<=0.0||!finiteValue(maximum))attentionFailure();
             if(c==0u){uint p=(row*max(H,uint(RT_ATTENTION_HEADS))+head)*2u;
                 physical[p]=maximum+20.0;physical[p+1u]=reference;
-                statisticAdd(4u,DH);statisticAdd(5u,DH);statisticAdd(15u,DH);statisticAdd(11u,DH);}
+                if(diagnostics){statisticAdd(4u,DH);statisticAdd(5u,DH);statisticAdd(15u,DH);statisticAdd(11u,DH);}}
             for(uint k=0u;k<LANE_AXES;k++){uint axis=c+k*32u;
                 if(axis<DH)detector[row*A+head*DH+axis]=finalHeadSignal(row,head*DH+axis,signal[k]-correction[k],reference);}
         }
