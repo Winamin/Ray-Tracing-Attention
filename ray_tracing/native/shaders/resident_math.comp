@@ -1,6 +1,9 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_control_flow_attributes : require
+#ifdef RT_MLP_BFLOAT16
+#extension GL_EXT_bfloat16 : require
+#endif
 #include "resident_common.glsl"
 layout(constant_id=1) const uint matrixRows=1u;
 layout(constant_id=2) const uint projectionKind=0xffffffffu;
@@ -52,10 +55,25 @@ return;}
         for(uint block=0u;block<cols/256u;block++){
             QuantizedOctet transfer=quantizedOctet(0u,weight,metadata,coefficientChannel,cols,block,thread),up;
             if(matrixIndex==3u)up=quantizedOctet(0u,parameters[base+19u],parameters[base+20u],channel,cols,block,thread);
+#ifdef RT_MLP_BFLOAT16
+            transfer.low=vec4(bf16vec4(transfer.low));transfer.high=vec4(bf16vec4(transfer.high));
+            if(matrixIndex==3u){up.low=vec4(bf16vec4(up.low));up.high=vec4(bf16vec4(up.high));}
+#endif
             [[unroll]] for(uint r=0u;r<matrixRows;r++)if(row+r<cfg.rows){
                 vec4 x=projectionVector(matrixIndex,row+r,transfer.axis.x),y=projectionVector(matrixIndex,row+r,transfer.axis.y);
+#ifdef RT_MLP_BFLOAT16
+                x=vec4(bf16vec4(x));y=vec4(bf16vec4(y));
+#endif
                 received[r*2u]+=x*transfer.low;received[r*2u+1u]+=y*transfer.high;
-                if(matrixIndex==3u){upReceived[r*2u]+=x*up.low;upReceived[r*2u+1u]+=y*up.high;}
+                if(matrixIndex==3u){
+#ifdef RT_MLP_BFLOAT16
+                    vec4 upX=vec4(bf16vec4(projectionVector(matrixIndex,row+r,up.axis.x)));
+                    vec4 upY=vec4(bf16vec4(projectionVector(matrixIndex,row+r,up.axis.y)));
+                    upReceived[r*2u]+=upX*up.low;upReceived[r*2u+1u]+=upY*up.high;
+#else
+                    upReceived[r*2u]+=x*up.low;upReceived[r*2u+1u]+=y*up.high;
+#endif
+                }
             }
         }
         [[unroll]] for(uint r=0u;r<matrixRows;r++){if(row+r>=cfg.rows)continue;
@@ -75,7 +93,9 @@ return;}
         return;}
     if(operation==3u){uint pair=job*128u+lane;if(pair>=P)return;uint c=row*A+pair*2u,slot=keySlot(row);float phase=coordinatePhase(pair,absolute(row));
         vec2 q=rotation(vec2(queries[c],queries[c+1u]),phase),k=rotation(vec2(keys[c],keys[c+1u]),phase+pf(parameters[base+2u]+pair));queries[c]=q.x;queries[c+1u]=q.y;keys[c]=k.x;keys[c+1u]=k.y;
-        if(pair==0u)slots[slot]=uvec2(absolute(row),0u);return;}
+        // The upper bits identify this immutable packet occurrence. Existing
+        // shared marks preserve the identity when its BLAS is reattached.
+        if(pair==0u)slots[slot]=uvec2(absolute(row),cfg.checkpoint==0u?0u:(cfg.checkpoint+row)<<2u);return;}
     if(operation==6u){row=gl_WorkGroupID.y;uint bank=job;vec2 center=vec2(0),a=vec2(0),extent=vec2(1);float height=0;
         if(lane==0u){rays[row*rayStride()+bank]=vec4(.125,.25,0,0);}
         if(lane<6u){vec2 xy=center+corners[lane]*extent;uint slot=absolute(row)%cfg.capacity,instance=chunkIndex(cfg.layer,bank,slot/16u),p=(instance*96u+(slot%16u)*6u+lane)*3u;historyVertices[p]=xy.x;historyVertices[p+1u]=xy.y;historyVertices[p+2u]=-4.0*float(absolute(row));}return;}
@@ -102,7 +122,12 @@ return;}
             rays[block]=vec4(chart(coordinates,sqrt(float(WORD_BLOCK_WIDTH))/max(norm,1e-20)),0,0);}
         return;}
     if(operation==12u){uint c=job*128u+lane;if(c<D)for(uint r=0u;r<cfg.rows;r++)audit[(cfg.layer*cfg.capacity+absolute(r))*D+c]=state[r*D+c];return;}
-    if(operation==13u){uint pair=job*128u+lane;if(pair*2u>=cfg.rows)return;vec2 value=vec2(state[pair*2u],state[pair*2u+1u]);uvec4 encoded=encodePair(value);keyGeometry[pair]=encodePathPair(value);vec2 restored=restorePair(encoded);detector[pair*2u]=restored.x;detector[pair*2u+1u]=restored.y;return;}
+    if(operation==13u){uint pair=job*128u+lane;
+        // The codec diagnostic writes packet storage directly. Its affected
+        // history must not retain the immutable-source identity of a snapshot.
+        uint workers=((cfg.rows/2u+127u)/128u)*128u;
+        for(uint slot=pair;slot<uint(slots.length());slot+=workers)slots[slot].y&=3u;
+        if(pair*2u>=cfg.rows)return;vec2 value=vec2(state[pair*2u],state[pair*2u+1u]);uvec4 encoded=encodePair(value);keyGeometry[pair]=encodePathPair(value);vec2 restored=restorePair(encoded);detector[pair*2u]=restored.x;detector[pair*2u+1u]=restored.y;return;}
     if(operation==14u){uint head=job,hd=headWidth();float qs=0,ks=0;for(uint c=lane;c<hd;c+=128u){float q=queries[row*A+head*hd+c],k=keys[row*A+head*hd+c];qs+=q*q;ks+=k*k;}qs=sum128(qs);ks=sum128(ks);float factor=parameters[base+30u]==1u?float(hd):1.0;qs=inversesqrt(qs/factor+float(RT_NORM_EPSILON));ks=inversesqrt(ks/factor+float(RT_NORM_EPSILON));
         for(uint c=lane;c<hd;c+=128u){uint at=row*A+head*hd+c;queries[at]*=qs*pf(parameters[base+24u]+head*hd+c);keys[at]*=ks*pf(parameters[base+25u]+head*hd+c);}return;}
     if(operation==15u){uint head=job,hd=headWidth();float square=0;for(uint c=lane;c<hd;c+=128u){float v=detector[row*A+head*hd+c];square+=v*v;}float inv=inversesqrt(sum128(square)/float(hd)+float(RT_NORM_EPSILON));for(uint c=lane;c<hd;c+=128u){uint at=row*A+head*hd+c;float gate=feedForward[row*W+head*hd+c];detector[at]*=inv*pf(parameters[base+31u]+head*hd+c)*gate*detectorSigmoid(gate);}return;}

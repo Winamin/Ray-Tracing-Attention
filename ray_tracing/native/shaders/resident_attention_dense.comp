@@ -18,7 +18,7 @@
 // cfg.checkpoint is an inclusive history lower bound, zero in production.
 // cfg.index==1 forces record storage even when only one group is needed.
 layout(constant_id=1) const uint BLOCK=256u;
-// Bindings 39--41 belong to the independent MLP implementation.
+// Binding 39 is MLP geometry; 40--41 are persistent path-score receipts.
 layout(std430,binding=42) buffer AttentionReceipts {uint attentionReceipts[];};
 const uint DH=RT_ATTENTION_HEAD_DIM;
 // RT history segments remain aligned to their 16-position BLAS layout.

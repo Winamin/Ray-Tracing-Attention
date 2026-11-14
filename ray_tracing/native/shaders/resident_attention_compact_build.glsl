@@ -1,11 +1,12 @@
 // Operations 0--2 use one fixed scratch record per row/K-or-V/KV-head.
 // Operation 3 copies only the D live descriptors and D live FP32 values into
-// the host-allocated variable payload. Operation 4 reconstructs the legacy
+// a GPU-allocated variable payload. Operation 4 reconstructs the legacy
 // per-axis diagnostic map from the compact persistent record.
 shared uint compactWords[RT_ATTENTION_HEAD_DIM];
 shared uint compactMembers[RT_ATTENTION_HEAD_DIM];
 shared uint compactEntries[RT_ATTENTION_HEAD_DIM];
 shared uint compactRootTotals[4],compactMemberTotals[4];
+shared uint compactStoreOffset,compactStoreCount;
 
 void buildCompactClasses(){
     uint domain=gl_WorkGroupID.x,domains=CLASS_DOMAINS;
@@ -61,14 +62,36 @@ void storeCompactClasses(){
     if(row>=cfg.rows)return;
     bool content=kind>=CLASS_KV_HEADS;uint kv=kind%CLASS_KV_HEADS;
     uint lane=gl_LocalInvocationID.x,slot=parameters[blockBase()+41u]*cfg.capacity+(cfg.position+row)%cfg.capacity;
-    uint source=tempDomainAddress(row,kind),count=compactCount(slot,kv,content),target=classDomainAddress(slot,kv,content);
-    if(count==0u||count>RT_ATTENTION_HEAD_DIM){if(lane==0u)atomicOr(control[3],65536u);return;}
+    uint source=tempDomainAddress(row,kind),directory=classDirectoryAddress(slot,kv,content);
+    if(lane==0u){
+        uint count=attentionClassScratch[source+CLASS_TEMP_COUNT_OFFSET];
+        uint oldOffset=attentionClasses[directory],oldCount=attentionClasses[directory+1u];
+        uint arena=attentionClasses[2u],words=2u*count+CLASS_PACKED_MEMBER_WORDS;
+        compactStoreOffset=0u;compactStoreCount=count;
+        if(count==0u||count>RT_ATTENTION_HEAD_DIM){
+            atomicOr(control[3],65536u);compactStoreCount=0u;
+        }else{
+            // An existing record can hold a smaller D without another arena
+            // allocation. Larger records append only their actual live words.
+            bool reuse=oldCount>=count&&oldCount<=RT_ATTENTION_HEAD_DIM&&
+                oldOffset<=arena&&2u*oldCount+CLASS_PACKED_MEMBER_WORDS<=arena-oldOffset;
+            uint offset=reuse?oldOffset:atomicAdd(attentionClasses[1u],words);
+            if(offset>arena||words>arena-offset){
+                atomicOr(control[3],65536u);compactStoreCount=0u;
+            }else compactStoreOffset=offset;
+        }
+    }
+    barrier();
+    uint count=compactStoreCount,target=classPayloadBase()+compactStoreOffset;
+    if(count==0u)return;
     for(uint i=lane;i<count;i+=gl_WorkGroupSize.x){
         attentionClasses[target+i]=attentionClassScratch[source+CLASS_TEMP_DESCRIPTOR_OFFSET+i];
         attentionClasses[target+count+i]=attentionClassScratch[source+CLASS_TEMP_VALUE_OFFSET+i];
     }
     for(uint i=lane;i<CLASS_PACKED_MEMBER_WORDS;i+=gl_WorkGroupSize.x)
         attentionClasses[target+2u*count+i]=attentionClassScratch[source+CLASS_TEMP_MEMBER_OFFSET+i];
+    memoryBarrierBuffer();barrier();
+    if(lane==0u){attentionClasses[directory]=compactStoreOffset;attentionClasses[directory+1u]=count;}
 }
 
 void expandCompactClasses(){

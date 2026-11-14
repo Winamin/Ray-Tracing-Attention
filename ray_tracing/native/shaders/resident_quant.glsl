@@ -44,8 +44,7 @@ uvec2 q4ScaleMin(uint kind,uint at,uint group){
 // One subgroup covers a 256-coefficient GGUF block. Each lane decodes
 // four packed bytes into eight transfers, sharing their header and scales.
 struct QuantizedOctet {uvec2 axis;vec4 low;vec4 high;};
-QuantizedOctet quantizedOctet(uint kind,uint offset,uint metadata,uint row,uint cols,uint block,uint thread){
-    if(coefficientFormat!=0xffffffffu)metadata=coefficientFormat;
+QuantizedOctet quantizedOctetTyped(uint kind,uint offset,uint metadata,uint row,uint cols,uint block,uint thread){
     uint type=metadata&255u,mode=metadata>>8u;
     uint first=type==12u?(thread/8u)*64u+(thread%8u)*4u:(thread/16u)*128u+(thread%16u)*4u;
     uint second=first+(type==12u?32u:64u);QuantizedOctet result;
@@ -91,6 +90,9 @@ QuantizedOctet quantizedOctet(uint kind,uint offset,uint metadata,uint row,uint 
         result.high=(scale*float(s1))*qHigh;
     }
     return result;
+}
+QuantizedOctet quantizedOctet(uint kind,uint offset,uint metadata,uint row,uint cols,uint block,uint thread){
+    return quantizedOctetTyped(kind,offset,coefficientFormat!=0xffffffffu?coefficientFormat:metadata,row,cols,block,thread);
 }
 // Adjacent coefficients share block scales, header and packed word loads.
 vec2 ggufPair(uint kind,uint at,uint type,uint index){

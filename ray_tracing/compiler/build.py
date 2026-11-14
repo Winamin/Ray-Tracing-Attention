@@ -43,17 +43,22 @@ def build(spec, output=None):
     (target/'rt_layer_map.hpp').write_text(cpp,encoding='utf8')
     commands=[]
     shader_names=('resident_math','resident_mlp','resident_mlp_material','resident_mlp_tensor','resident_batch2','resident_pack','resident_attention','resident_attention_receipt','resident_attention_dense','resident_attention_local','resident_attention_classes','resident_auxiliary','resident_state','resident_ray','reply_cache','optical_path_key','history_cache')
-    if bfloat_shader:shader_names+=('resident_mlp_bfloat',)
+    shader_names+=('resident_matvec',)
+    if bfloat_shader:shader_names+=('resident_mlp_bfloat','resident_batch2_bfloat','resident_pack_bfloat','resident_math_bfloat','resident_matvec_bfloat')
     local_split_names=()
+    if spec.full_layers and 0<spec.attention_head_dim<=256:
+        shader_names+=('resident_detector_ordered_scores',
+                       'resident_detector_ordered_normalize','resident_detector_ordered_value')
     if spec.full_layers and spec.attention_head_dim==256 and spec.query_width==4*spec.kv_width:
         local_split_names=('resident_attention_local_key','resident_attention_local_value',
                            'resident_attention_local_trace','resident_attention_local_key_fallback')
         shader_names+=local_split_names
     for name in shader_names:
-        environment='vulkan1.3' if name in ('resident_batch2','resident_attention','resident_auxiliary','resident_mlp_tensor','resident_mlp_bfloat') else 'vulkan1.2'
+        environment='vulkan1.3' if name in ('resident_batch2','resident_attention','resident_auxiliary','resident_mlp_tensor','resident_mlp_bfloat','resident_batch2_bfloat','resident_pack_bfloat','resident_math_bfloat','resident_matvec','resident_matvec_bfloat') else 'vulkan1.2'
         defines=[]
         source='resident_attention_direct.comp' if name=='resident_attention_local' else name+'.comp'
         if name=='resident_mlp_bfloat':source='resident_mlp_tensor.comp';defines=['-DRT_MLP_BFLOAT16=1']
+        elif name.endswith('_bfloat'):source=name.removesuffix('_bfloat')+'.comp';defines=['-DRT_MLP_BFLOAT16=1']
         optimization=['-Os'] if name in local_split_names else []
         commands += [[shader_compiler,'-V',*optimization,'--target-env',environment,'-DRT_VECTOR_DECODE='+str(int(vector_decode)),'-I'+str(target),'-I'+str(NATIVE/'shaders'),*defines,str(NATIVE/'shaders'/source),'-o',str(target/(name+'.spv'))],
                      [validator,'--target-env',environment,str(target/(name+'.spv'))]]

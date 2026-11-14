@@ -14,6 +14,16 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_shader_16bit_storage : require
+#ifdef RT_MLP_BFLOAT16
+#extension GL_EXT_bfloat16 : require
+#define MATRIX_OPERAND bfloat16_t
+#define MATRIX_VECTOR bf16vec4
+#define MATRIX_ACCUMULATOR float
+#else
+#define MATRIX_OPERAND float16_t
+#define MATRIX_VECTOR f16vec4
+#define MATRIX_ACCUMULATOR float16_t
+#endif
 #include "resident_common.glsl"
 layout(constant_id=2) const uint projectionKind=5u;
 layout(constant_id=9) const uint upFormat=0xffffffffu;
@@ -24,7 +34,7 @@ const uint BM=min(64u,uint(RT_ATTENTION_HEAD_DIM)),BN=operation==2u&&projectionK
 
 layout(std430,binding=6) readonly buffer CoefficientHeaders {uvec4 values[];} coefficientHeaders[RT_LAYER_COUNT];
 shared vec2 blockScales[8u*(BM+2u)],upScales[8u*(BM+2u)];
-layout(std430,binding=22) readonly buffer MatrixInput {float16_t matrixInput[];};
+layout(std430,binding=22) readonly buffer MatrixInput {MATRIX_OPERAND matrixInput[];};
 
 uint channelBlock(){return (gl_WorkGroupID.x+gl_WorkGroupID.y*gl_NumWorkGroups.x)/gl_NumWorkGroups.y;}
 uint tokenBlock(){return (gl_WorkGroupID.x+gl_WorkGroupID.y*gl_NumWorkGroups.x)%gl_NumWorkGroups.y;}
@@ -44,35 +54,40 @@ uint sourceWeightRow(uint row){
     return row;
 }
 float mappedWeight(uint row,uint axis){uint kind=matrixKind(channelBlock()*BM);uint metadata=weightMetadata();if((metadata>>8u)==4u)metadata&=255u;return quantizedWeight(0u,weightOffset(),metadata,row,matrixColumns(),axis);}
-float16_t decodeQ4(const in DecodeQ4 block,const in uint bc[2],const in uint ci[2]){
+MATRIX_OPERAND decodeQ4(const in DecodeQ4 block,const in uint bc[2],const in uint ci[2]){
     uint metadata=weightMetadata(),i=ci[1];
     DecodeQ4 source=DecodeQ4(uint64_t(block)+uint64_t(int64_t(sourceWeightRow(bc[0]))-int64_t(bc[0]))*uint64_t(matrixColumns()/256u*144u));
     vec2 d=blockScales[(i/32u)*(BM+2u)+bc[0]%BM];uint packed=source.raw[4u+(i/64u)*8u+(i%32u)/4u];uint q=(packed>>((i%4u)*8u+(i%64u)/32u*4u))&15u;
-    return float16_t(d.x*float(q)-d.y);
+    return MATRIX_OPERAND(d.x*float(q)-d.y);
 }
-float16_t decodeQ6(const in DecodeQ6 block,const in uint bc[2],const in uint ci[2]){
+MATRIX_OPERAND decodeQ6(const in DecodeQ6 block,const in uint bc[2],const in uint ci[2]){
     uint metadata=weightMetadata(),i=ci[1];
     DecodeQ6 source=DecodeQ6(uint64_t(block)+uint64_t(int64_t(sourceWeightRow(bc[0]))-int64_t(bc[0]))*uint64_t(matrixColumns()/256u*210u));
     uint part=i/128u,local=i%128u;
     uint low=uint(source.raw[(part*64u+local%64u)/2u])>>((local%2u)*8u+(local/64u)*4u);
     uint high=uint(source.raw[(128u+part*32u+local%32u)/2u])>>((local%2u)*8u+(local/32u)*2u);
     int scale=bitfieldExtract(int(uint(source.raw[(192u+i/16u)/2u])>>(((i/16u)%2u)*8u)),0,8);
-    float16_t d=float16_t(unpackHalf2x16(uint(source.raw[104])).x);
-    return (d*float16_t(scale))*float16_t(int((low&15u)|((high&3u)<<4u))-32);
+#ifdef RT_MLP_BFLOAT16
+    float d=unpackHalf2x16(uint(source.raw[104])).x;
+    return MATRIX_OPERAND(d*float(scale)*float(int((low&15u)|((high&3u)<<4u))-32));
+#else
+    MATRIX_OPERAND d=MATRIX_OPERAND(unpackHalf2x16(uint(source.raw[104])).x);
+    return (d*MATRIX_OPERAND(scale))*MATRIX_OPERAND(int((low&15u)|((high&3u)<<4u))-32);
+#endif
 }
-float16_t decodeFloat(const in DecodeFloat block,const in uint bc[2],const in uint ci[2]){
-    return float16_t(mappedWeight(bc[0],bc[1]*256u+ci[1]));
+MATRIX_OPERAND decodeFloat(const in DecodeFloat block,const in uint bc[2],const in uint ci[2]){
+    return MATRIX_OPERAND(mappedWeight(bc[0],bc[1]*256u+ci[1]));
 }
-float16_t decodeHalf(const in DecodeHalf block,const in uint bc[2],const in uint ci[2]){
-    return float16_t(mappedWeight(bc[0],bc[1]*256u+ci[1]));
+MATRIX_OPERAND decodeHalf(const in DecodeHalf block,const in uint bc[2],const in uint ci[2]){
+    return MATRIX_OPERAND(mappedWeight(bc[0],bc[1]*256u+ci[1]));
 }
-f16vec4 decodeQ4Vector(const in DecodeQ4 block,const in uint bc[2],const in uint ci[2]){
+MATRIX_VECTOR decodeQ4Vector(const in DecodeQ4 block,const in uint bc[2],const in uint ci[2]){
     uint m=weightMetadata(),i=ci[1],mode=m>>8u;
     DecodeQ4 source=DecodeQ4(uint64_t(block)+uint64_t(int64_t(sourceWeightRow(bc[0]))-int64_t(bc[0]))*uint64_t(matrixColumns()/256u*144u));
     vec2 d=blockScales[(i/32u)*(BM+2u)+bc[0]%BM];uint packed=source.raw[4u+(i/64u)*8u+(i%32u)/4u];uvec4 q=(uvec4(packed)>>uvec4(0,8,16,24)>>((i%64u)/32u*4u))&15u;
-    return f16vec4(d.x*vec4(q)-d.y);
+    return MATRIX_VECTOR(d.x*vec4(q)-d.y);
 }
-f16vec4 decodeQ6Vector(const in DecodeQ6 block,const in uint bc[2],const in uint ci[2]){
+MATRIX_VECTOR decodeQ6Vector(const in DecodeQ6 block,const in uint bc[2],const in uint ci[2]){
     uint m=weightMetadata(),i=ci[1],mode=m>>8u;
     DecodeQ6 source=DecodeQ6(uint64_t(block)+uint64_t(int64_t(sourceWeightRow(bc[0]))-int64_t(bc[0]))*uint64_t(matrixColumns()/256u*210u));
     uint part=i/128u,local=i%128u,lo=(part*64u+local%64u)/2u,hi=(128u+part*32u+local%32u)/2u;
@@ -80,27 +95,32 @@ f16vec4 decodeQ6Vector(const in DecodeQ6 block,const in uint bc[2],const in uint
     uvec4 ql=(uvec4(low)>>uvec4(0,8,16,24)>>((local/64u)*4u))&15u;
     uvec4 qh=(uvec4(high)>>uvec4(0,8,16,24)>>((local/32u)*2u))&3u;
     int scale=bitfieldExtract(int(uint(source.raw[(192u+i/16u)/2u])>>(((i/16u)%2u)*8u)),0,8);
-    float16_t d=float16_t(unpackHalf2x16(uint(source.raw[104])).x);
-    return (d*float16_t(scale))*f16vec4(ivec4(ql|(qh<<4u))-32);
+#ifdef RT_MLP_BFLOAT16
+    float d=unpackHalf2x16(uint(source.raw[104])).x;
+    return MATRIX_VECTOR((d*float(scale))*vec4(ivec4(ql|(qh<<4u))-32));
+#else
+    MATRIX_OPERAND d=MATRIX_OPERAND(unpackHalf2x16(uint(source.raw[104])).x);
+    return (d*MATRIX_OPERAND(scale))*MATRIX_VECTOR(ivec4(ql|(qh<<4u))-32);
+#endif
 }
-f16vec4 decodeFloatVector(const in DecodeFloat block,const in uint bc[2],const in uint ci[2]){
-    uint i=ci[1],axis=bc[1]*256u+i;return f16vec4(mappedWeight(bc[0],axis),mappedWeight(bc[0],axis+1u),mappedWeight(bc[0],axis+2u),mappedWeight(bc[0],axis+3u));
+MATRIX_VECTOR decodeFloatVector(const in DecodeFloat block,const in uint bc[2],const in uint ci[2]){
+    uint i=ci[1],axis=bc[1]*256u+i;return MATRIX_VECTOR(mappedWeight(bc[0],axis),mappedWeight(bc[0],axis+1u),mappedWeight(bc[0],axis+2u),mappedWeight(bc[0],axis+3u));
 }
-f16vec4 decodeHalfVector(const in DecodeHalf block,const in uint bc[2],const in uint ci[2]){
-    uint axis=bc[1]*256u+ci[1];return f16vec4(mappedWeight(bc[0],axis),mappedWeight(bc[0],axis+1u),mappedWeight(bc[0],axis+2u),mappedWeight(bc[0],axis+3u));
+MATRIX_VECTOR decodeHalfVector(const in DecodeHalf block,const in uint bc[2],const in uint ci[2]){
+    uint axis=bc[1]*256u+ci[1];return MATRIX_VECTOR(mappedWeight(bc[0],axis),mappedWeight(bc[0],axis+1u),mappedWeight(bc[0],axis+2u),mappedWeight(bc[0],axis+3u));
 }
 uint upMetadata(){return upFormat==0xffffffffu?parameters[blockBase()+20u]:upFormat;}
-float16_t decodeUpQ4(const in DecodeQ4 block,const in uint bc[2],const in uint ci[2]){
-    uint i=ci[1];vec2 d=upScales[(i/32u)*(BM+2u)+bc[0]%BM];uint packed=block.raw[4u+(i/64u)*8u+(i%32u)/4u];uint q=(packed>>((i%4u)*8u+(i%64u)/32u*4u))&15u;return float16_t(d.x*float(q)-d.y);
+MATRIX_OPERAND decodeUpQ4(const in DecodeQ4 block,const in uint bc[2],const in uint ci[2]){
+    uint i=ci[1];vec2 d=upScales[(i/32u)*(BM+2u)+bc[0]%BM];uint packed=block.raw[4u+(i/64u)*8u+(i%32u)/4u];uint q=(packed>>((i%4u)*8u+(i%64u)/32u*4u))&15u;return MATRIX_OPERAND(d.x*float(q)-d.y);
 }
-f16vec4 decodeUpQ4Vector(const in DecodeQ4 block,const in uint bc[2],const in uint ci[2]){
-    uint i=ci[1];vec2 d=upScales[(i/32u)*(BM+2u)+bc[0]%BM];uint packed=block.raw[4u+(i/64u)*8u+(i%32u)/4u];uvec4 q=(uvec4(packed)>>uvec4(0,8,16,24)>>((i%64u)/32u*4u))&15u;return f16vec4(d.x*vec4(q)-d.y);
+MATRIX_VECTOR decodeUpQ4Vector(const in DecodeQ4 block,const in uint bc[2],const in uint ci[2]){
+    uint i=ci[1];vec2 d=upScales[(i/32u)*(BM+2u)+bc[0]%BM];uint packed=block.raw[4u+(i/64u)*8u+(i%32u)/4u];uvec4 q=(uvec4(packed)>>uvec4(0,8,16,24)>>((i%64u)/32u*4u))&15u;return MATRIX_VECTOR(d.x*vec4(q)-d.y);
 }
 float upWeight(uint row,uint axis){return quantizedWeight(0u,parameters[blockBase()+19u],upMetadata(),row,D,axis);}
-float16_t decodeUpFloat(const in DecodeFloat block,const in uint bc[2],const in uint ci[2]){return float16_t(upWeight(bc[0],bc[1]*256u+ci[1]));}
-f16vec4 decodeUpFloatVector(const in DecodeFloat block,const in uint bc[2],const in uint ci[2]){uint i=bc[1]*256u+ci[1];return f16vec4(upWeight(bc[0],i),upWeight(bc[0],i+1u),upWeight(bc[0],i+2u),upWeight(bc[0],i+3u));}
-float16_t decodeUpHalf(const in DecodeHalf block,const in uint bc[2],const in uint ci[2]){return float16_t(upWeight(bc[0],bc[1]*256u+ci[1]));}
-f16vec4 decodeUpHalfVector(const in DecodeHalf block,const in uint bc[2],const in uint ci[2]){uint i=bc[1]*256u+ci[1];return f16vec4(upWeight(bc[0],i),upWeight(bc[0],i+1u),upWeight(bc[0],i+2u),upWeight(bc[0],i+3u));}
+MATRIX_OPERAND decodeUpFloat(const in DecodeFloat block,const in uint bc[2],const in uint ci[2]){return MATRIX_OPERAND(upWeight(bc[0],bc[1]*256u+ci[1]));}
+MATRIX_VECTOR decodeUpFloatVector(const in DecodeFloat block,const in uint bc[2],const in uint ci[2]){uint i=bc[1]*256u+ci[1];return MATRIX_VECTOR(upWeight(bc[0],i),upWeight(bc[0],i+1u),upWeight(bc[0],i+2u),upWeight(bc[0],i+3u));}
+MATRIX_OPERAND decodeUpHalf(const in DecodeHalf block,const in uint bc[2],const in uint ci[2]){return MATRIX_OPERAND(upWeight(bc[0],bc[1]*256u+ci[1]));}
+MATRIX_VECTOR decodeUpHalfVector(const in DecodeHalf block,const in uint bc[2],const in uint ci[2]){uint i=bc[1]*256u+ci[1];return MATRIX_VECTOR(upWeight(bc[0],i),upWeight(bc[0],i+1u),upWeight(bc[0],i+2u),upWeight(bc[0],i+3u));}
 #if RT_VECTOR_DECODE
 #define DECODE_UpQ4 decodeUpQ4,decodeUpQ4Vector
 #define DECODE_UpFloat decodeUpFloat,decodeUpFloatVector
@@ -110,7 +130,7 @@ f16vec4 decodeUpHalfVector(const in DecodeHalf block,const in uint bc[2],const i
 #define DECODE_UpFloat decodeUpFloat
 #define DECODE_UpHalf decodeUpHalf
 #endif
-float16_t storeActivation(const in uint c,const in uint r,const in float16_t gateValue,const in float16_t upValue,const in uint firstChannel,const in uint firstRow){
+MATRIX_ACCUMULATOR storeActivation(const in uint c,const in uint r,const in MATRIX_ACCUMULATOR gateValue,const in MATRIX_ACCUMULATOR upValue,const in uint firstChannel,const in uint firstRow){
     uint row=firstRow+r;if(row<cfg.rows){float gate=float(gateValue),signal=float(upValue);feedForward[row*W+firstChannel+c]=sign(gate)*sign(signal)*abs(gate)*abs(signal)*detectorSigmoid(gate);}return gateValue;
 }
 #if RT_VECTOR_DECODE
@@ -158,8 +178,8 @@ void main(){
     tensorLayoutNV<2> bLayout=createTensorLayoutNV(2);
     bLayout=setTensorLayoutDimensionNV(bLayout,cfg.rows,cols);bLayout=setTensorLayoutStrideNV(bLayout,cols,1);
     tensorViewNV<2,false,1,0> transpose=createTensorViewNV(2,false,1,0);
-    coopmat<float16_t,gl_ScopeWorkgroup,BM,BN,gl_MatrixUseAccumulator> sum=coopmat<float16_t,gl_ScopeWorkgroup,BM,BN,gl_MatrixUseAccumulator>(0.0);
-    coopmat<float16_t,gl_ScopeWorkgroup,BM,BN,gl_MatrixUseAccumulator> upSum=coopmat<float16_t,gl_ScopeWorkgroup,BM,BN,gl_MatrixUseAccumulator>(0.0);
+    coopmat<MATRIX_ACCUMULATOR,gl_ScopeWorkgroup,BM,BN,gl_MatrixUseAccumulator> sum=coopmat<MATRIX_ACCUMULATOR,gl_ScopeWorkgroup,BM,BN,gl_MatrixUseAccumulator>(0.0);
+    coopmat<MATRIX_ACCUMULATOR,gl_ScopeWorkgroup,BM,BN,gl_MatrixUseAccumulator> upSum=coopmat<MATRIX_ACCUMULATOR,gl_ScopeWorkgroup,BM,BN,gl_MatrixUseAccumulator>(0.0);
     uint upWeightOffset=parameters[blockBase()+19u],upType=upMetadata()&255u;
     uint localRow=lane/(gl_WorkGroupSize.x/BM),firstGroup=(lane%(gl_WorkGroupSize.x/BM))*(8u/(gl_WorkGroupSize.x/BM));
     uint headerBase=weight+sourceWeightRow(firstWeightRow+localRow)*(cols/256u)*36u;
@@ -184,8 +204,8 @@ void main(){
         }barrier();if(block+256u<cols)upHeader=coefficientHeaders[cfg.layer].values[upHeaderBase/4u+(block/256u+1u)*9u];
       }
       [[unroll]] for(uint part=0u;part<256u;part+=BK){uint k=block+part;
-        coopmat<float16_t,gl_ScopeWorkgroup,BM,BK,gl_MatrixUseA> a;
-        coopmat<float16_t,gl_ScopeWorkgroup,BK,BN,gl_MatrixUseB> b;
+        coopmat<MATRIX_OPERAND,gl_ScopeWorkgroup,BM,BK,gl_MatrixUseA> a;
+        coopmat<MATRIX_OPERAND,gl_ScopeWorkgroup,BK,BN,gl_MatrixUseB> b;
         if((metadata&255u)==12u)coopMatLoadTensorNV(a,matrices[cfg.layer].values,weight,sliceTensorLayoutNV(aLayout,firstWeightRow,BM,k,BK),DECODE_Q4);
         else if((metadata&255u)==14u)coopMatLoadTensorNV(a,matrices[cfg.layer].values,weight,sliceTensorLayoutNV(aLayout,firstWeightRow,BM,k,BK),DECODE_Q6);
         else if((metadata&255u)==0u)coopMatLoadTensorNV(a,matrices[cfg.layer].values,weight,sliceTensorLayoutNV(aLayout,firstWeightRow,BM,k,BK),DECODE_Float);
@@ -193,7 +213,7 @@ void main(){
         coopMatLoadTensorNV(b,matrixInput,0,sliceTensorLayoutNV(bLayout,firstRow,BN,k,BK),transpose);
         sum=coopMatMulAdd(a,b,sum);
         if(operation==28u){
-          coopmat<float16_t,gl_ScopeWorkgroup,BM,BK,gl_MatrixUseA> upWeights;
+          coopmat<MATRIX_OPERAND,gl_ScopeWorkgroup,BM,BK,gl_MatrixUseA> upWeights;
           if(upType==12u)coopMatLoadTensorNV(upWeights,matrices[cfg.layer].values,upWeightOffset,sliceTensorLayoutNV(aLayout,firstWeightRow,BM,k,BK),DECODE_UpQ4);
           else if(upType==14u)coopMatLoadTensorNV(upWeights,matrices[cfg.layer].values,upWeightOffset,sliceTensorLayoutNV(aLayout,firstWeightRow,BM,k,BK),DECODE_Q6);
           else if(upType==0u)coopMatLoadTensorNV(upWeights,matrices[cfg.layer].values,upWeightOffset,sliceTensorLayoutNV(aLayout,firstWeightRow,BM,k,BK),DECODE_UpFloat);

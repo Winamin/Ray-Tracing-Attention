@@ -1,0 +1,116 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#include "resident_common.glsl"
+
+// Ordered detector pass 3. A workgroup owns one Q head and 32 output axes.
+// Each active lane preserves the complete original tile/j accumulation order:
+// signal *= previousScale; signal += weight * pathCoordinate; then gate.
+// Axis parallelism raises the number of resident workgroups without changing
+// the FP32 summation tree or explicitly introducing FMA/NoContraction.
+// Dispatch (heads * ceil(headWidth()/32), 1, 1), local size 32. Storage barrier
+// after ordered normalization; BLOCK must match the original width of 256.
+layout(constant_id=1) const uint BLOCK=256u;
+layout(std430,binding=42) buffer OrderedDetectorCache {uint orderedDetectorCache[];};
+layout(std430,binding=12) readonly buffer OrderedPackedHistory {uint orderedPackedHistory[];};
+const uint RECORD_WORDS=4u+BLOCK,DETECTOR_ERROR=65536u;
+shared float weights[BLOCK],previousScale;
+shared uint slotTile[BLOCK];
+shared uint groupFailure;
+
+// Packed layout, invariant address calculations and cooperative staging are
+// adapted from llama.cpp at 9d25e0014c4b4b316873c01f4938c0e3c687287d:
+// https://github.com/ggml-org/llama.cpp/blob/9d25e0014c4b4b316873c01f4938c0e3c687287d/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_dequant.glsl#L17-L39
+// https://github.com/ggml-org/llama.cpp/blob/9d25e0014c4b4b316873c01f4938c0e3c687287d/ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs.glsl#L738-L752
+// https://github.com/ggml-org/llama.cpp/blob/9d25e0014c4b4b316873c01f4938c0e3c687287d/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q6_k.comp#L91-L100
+// https://github.com/ggml-org/llama.cpp/blob/9d25e0014c4b4b316873c01f4938c0e3c687287d/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_decode_phase_1.comp#L148-L178
+// Only data supply is adapted: no cooperative-matrix arithmetic is imported.
+// Each channel retains the original scalar FP32 decode and tile/j accumulation.
+struct OrderedQ6Plan {
+    uint qlWord,qlShift,qhWord,qhShift,scaleWord,scaleShift,dWord,dShift;
+};
+OrderedQ6Plan orderedQ6Plan(uint channel){
+    uint compact=sharedAxis(channel),index=compact%256u;
+    uint blockByte=((RT_GQA_WIDTH+255u)/256u)*144u+(compact/256u)*210u;
+    uint part=index/128u,local=index%128u;
+    uint qlByte=blockByte+part*64u+local%64u;
+    uint qhByte=blockByte+128u+part*32u+local%32u;
+    uint scaleByte=blockByte+192u+index/16u,dByte=blockByte+208u;
+    OrderedQ6Plan plan;
+    plan.qlWord=qlByte/4u;plan.qlShift=(qlByte%4u)*8u+(local/64u)*4u;
+    plan.qhWord=qhByte/4u;plan.qhShift=(qhByte%4u)*8u+(local/32u)*2u;
+    plan.scaleWord=scaleByte/4u;plan.scaleShift=(scaleByte%4u)*8u;
+    plan.dWord=dByte/4u;plan.dShift=(dByte%4u)*8u;
+    return plan;
+}
+float orderedQ6Coordinate(uint slot,OrderedQ6Plan plan){
+    // HISTORY_RECORD_BYTES is eight-byte aligned. Flattening the existing
+    // uvec2 view to uint preserves each packed word and its original bit fields.
+    uint baseWord=(slot*HISTORY_RECORD_BYTES)/4u;
+    uint ql=(orderedPackedHistory[baseWord+plan.qlWord]>>plan.qlShift)&15u;
+    uint qh=(orderedPackedHistory[baseWord+plan.qhWord]>>plan.qhShift)&3u;
+    int scale=int((orderedPackedHistory[baseWord+plan.scaleWord]>>plan.scaleShift)&255u);
+    if(scale>=128)scale-=256;
+    float d=unpackHalf2x16(orderedPackedHistory[baseWord+plan.dWord]>>plan.dShift).x;
+    return (d*float(scale))*float(int(ql|(qh<<4u))-32);
+}
+
+bool orderedFinite(float value){return !isnan(value)&&!isinf(value);}
+void orderedFailure(){atomicOr(groupFailure,1u);atomicOr(control[3],DETECTOR_ERROR);}
+bool orderedRecordFits(uint tile,uint head,uint heads){
+    return tile*heads+head<uint(orderedDetectorCache.length())/RECORD_WORDS;
+}
+uint orderedRecord(uint tile,uint head,uint heads){return (tile*heads+head)*RECORD_WORDS;}
+
+void main(){
+    if(stopped())return;
+    uint lane=gl_LocalInvocationID.x,heads=headCount(),dh=headWidth();
+    if(cfg.rows!=1u||gl_WorkGroupSize.x!=32u||gl_SubgroupSize!=32u||
+       dh==0u||dh>256u||BLOCK!=256u){
+        if(lane==0u)atomicOr(control[3],DETECTOR_ERROR);return;
+    }
+    if((control[3]&DETECTOR_ERROR)!=0u)return;
+    uint axisGroups=(dh+31u)/32u,head=gl_WorkGroupID.x/axisGroups;
+    uint axis=(gl_WorkGroupID.x%axisGroups)*32u+lane;
+    if(head>=heads)return;
+    bool axisActive=axis<dh;
+    uint channel=head*dh+axis;
+    OrderedQ6Plan q6Plan=orderedQ6Plan(axisActive?channel:0u);
+    uint count=hits[0],visible=min(absolute(0u)+1u,cfg.capacity);
+    if(count!=visible||count==0u){if(lane==0u)atomicOr(control[3],DETECTOR_ERROR);return;}
+    float signal=0.0;
+    if(lane==0u)groupFailure=0u;
+    barrier();
+    for(uint first=0u;first<count;first+=256u){
+        uint n=min(256u,count-first),tile=first/256u;
+        if(lane==0u){
+            if(!orderedRecordFits(tile,head,heads))orderedFailure();
+            else{
+                uint at=orderedRecord(tile,head,heads);
+                if(orderedDetectorCache[at+3u]!=n)orderedFailure();
+                previousScale=uintBitsToFloat(orderedDetectorCache[at+2u]);
+                if(!orderedFinite(previousScale))orderedFailure();
+            }
+        }
+        barrier();if(groupFailure!=0u)return;
+        uint at=orderedRecord(tile,head,heads);
+        for(uint j=lane;j<n;j+=32u){
+            weights[j]=uintBitsToFloat(orderedDetectorCache[at+4u+j]);
+            slotTile[j]=hits[first+j+1u];
+            if(!orderedFinite(weights[j]))orderedFailure();
+        }
+        barrier();if(groupFailure!=0u)return;
+        signal*=previousScale;
+        for(uint j=0u;j<n;j++){
+            uint slot=slotTile[j];
+            if(axisActive)signal+=weights[j]*orderedQ6Coordinate(slot,q6Plan);
+        }
+        barrier();
+    }
+    if(axisActive){
+        float reference=physical[head*2u+1u];
+        float headSignal=signal/max(reference,1e-30)*(RT_ATTENTION_GATE==1?detectorSigmoid(feedForward[channel]):1.0);
+        if(!orderedFinite(headSignal))orderedFailure();
+        detector[channel]=headSignal;
+    }
+}

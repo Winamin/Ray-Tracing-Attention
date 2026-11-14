@@ -143,3 +143,4 @@ vec2 fieldPair(uint at){return restorePathPair(uvec2(opticalMemory[at],opticalMe
 void writeField(uint at,vec2 value){uvec2 packet=encodePathPair(value);opticalMemory[at]=packet.x;opticalMemory[at+1u]=packet.y;}
 float frame(uint row,uint coord){return uintBitsToFloat(opticalMemory[frameOffset(row)+coord]);}
 float rawProjection(uint row,uint coord){return coord<S?queries[row*A+coord]:coord<2u*S?keys[row*A+coord-S]:feedForward[row*W+S+coord-2u*S];}
+#include "resident_path_scores.glsl"

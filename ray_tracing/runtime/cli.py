@@ -592,8 +592,8 @@ def parser():
                    help="共享一组量化权重的 token 数")
     p.add_argument("--attention-backend", choices=("standard","standard_fp32","grouped_rt","grouped_rt_dense","grouped_rt_local","grouped_rt_tc"), default="standard",
                    help="Attention 算法：原版、FP32 对照或 RT 全贡献分组聚合")
-    p.add_argument("--mlp-backend", choices=("standard","rt_transmission","rt_material","rt_tensor","rt_bfloat"), default="standard",
-                   help="MLP 算法：矩阵、RT 透射、材质分组实验、RT + FP16 Tensor 或 RT + BF16 Tensor 批量乘加")
+    p.add_argument("--mlp-backend", choices=("standard","standard_bfloat","rt_transmission","rt_material","rt_tensor","rt_bfloat"), default="standard",
+                   help="MLP 算法：矩阵、BF16 矩阵、RT 透射、材质分组实验、RT + FP16 Tensor 或 RT + BF16 Tensor 批量乘加")
     p.add_argument("--attention-block", type=int, choices=(128,256,512), default=128,
                    help="每个完整 attention 回执覆盖的历史位置数")
     p.add_argument("--attention-v-members", action=argparse.BooleanOptionalAction, default=False,

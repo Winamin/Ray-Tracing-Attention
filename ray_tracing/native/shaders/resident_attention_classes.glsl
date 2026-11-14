@@ -2,7 +2,8 @@ layout(std430,binding=45) buffer AttentionClasses {uint attentionClasses[];};
 
 const uint CLASS_KV_HEADS=RT_GQA_WIDTH/RT_ATTENTION_HEAD_DIM;
 const uint CLASS_DOMAINS=2u*CLASS_KV_HEADS;
-const uint CLASS_DIRECTORY_HEADER_WORDS=1u;
+// Per-layer slots, append cursor and arena capacity precede the directory.
+const uint CLASS_DIRECTORY_HEADER_WORDS=3u;
 const uint CLASS_DIRECTORY_ENTRY_WORDS=2u;
 const uint CLASS_PACKED_MEMBER_WORDS=RT_ATTENTION_HEAD_DIM/4u;
 

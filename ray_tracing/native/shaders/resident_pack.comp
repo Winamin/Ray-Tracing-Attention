@@ -1,5 +1,8 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
+#ifdef RT_MLP_BFLOAT16
+#extension GL_EXT_bfloat16 : require
+#endif
 #include "resident_common.glsl"
 uint originalToDetector(uint axis){uint local=axis%RT_ATTENTION_HEAD_DIM;return local<RT_ROTARY_DIM?axis-local+(local%(RT_ROTARY_DIM/2u))*2u+local/(RT_ROTARY_DIM/2u):axis;}
 void main(){
@@ -11,5 +14,12 @@ void main(){
     if(cfg.index==0u)value=vec2(normalized[row*D+axis],normalized[row*D+axis+1u]);
     else if(cfg.index==1u){uint first=axis,second=axis+1u;if(parameters[blockBase()+26u]==1u){first=originalToDetector(first);second=originalToDetector(second);}value=vec2(detector[row*A+first],detector[row*A+second]);}
     else value=vec2(feedForward[row*W+axis],feedForward[row*W+axis+1u]);
+#ifdef RT_MLP_BFLOAT16
+    // Preserve native BF16 rounding and its exponent range in the shared
+    // 16-bit matrix-input storage; no FP16 conversion precedes the MMA.
+    uvec2 bits=floatBitsToUint(vec2(float(bfloat16_t(value.x)),float(bfloat16_t(value.y))));
+    wordDecoded[pair]=uintBitsToFloat((bits.x>>16u)|(bits.y&0xffff0000u));
+#else
     wordDecoded[pair]=uintBitsToFloat(packHalf2x16(value));
+#endif
 }

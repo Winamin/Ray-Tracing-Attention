@@ -21,8 +21,8 @@ class ResidentRuntime:
             raise ValueError('Attention backend must be standard, standard_fp32, grouped_rt, grouped_rt_dense, grouped_rt_local or grouped_rt_tc')
         if attention_backend=='grouped_rt_local' and spec.attention_head_dim!=256:
             raise ValueError('grouped_rt_local requires a 256-dimensional attention head')
-        if mlp_backend not in ('standard','rt_transmission','rt_material','rt_tensor','rt_bfloat'):
-            raise ValueError('MLP backend must be standard, rt_transmission, rt_material, rt_tensor or rt_bfloat')
+        if mlp_backend not in ('standard','standard_bfloat','rt_transmission','rt_material','rt_tensor','rt_bfloat'):
+            raise ValueError('MLP backend must be standard, standard_bfloat, rt_transmission, rt_material, rt_tensor or rt_bfloat')
         if attention_block not in (128,256,512):raise ValueError('Attention block must be 128, 256 or 512')
         self.hidden_size=spec.hidden_size
         self.vocabulary_size=spec.vocabulary_size
@@ -44,7 +44,8 @@ class ResidentRuntime:
             if magic not in (0x52545239,0x5254523a):raise RuntimeError('Resident optical protocol mismatch')
             if attention_backend in ('grouped_rt','grouped_rt_dense','grouped_rt_local','grouped_rt_tc') and not mode&512:raise RuntimeError('Worker did not activate grouped RT attention')
             if attention_backend=='standard_fp32' and not mode&1024:raise RuntimeError('Worker did not activate FP32 attention')
-            if (mlp_backend=='standard')!=bool(mode&4096):raise RuntimeError('Worker did not activate the requested MLP backend')
+            if (mlp_backend in ('standard','standard_bfloat'))!=bool(mode&4096):raise RuntimeError('Worker did not activate the requested MLP backend')
+            if mlp_backend=='standard_bfloat' and not mode&65536:raise RuntimeError('Worker did not activate native BF16 matrix MLP')
         except BaseException:
             self.close()
             raise
@@ -55,6 +56,11 @@ class ResidentRuntime:
         self.metadata.update(attention_backend=attention_backend,attention_block=attention_block,
                              attention_compute='fused RT / FP32 grouped softmax' if mode&512 else 'original FP32' if mode&1024 else 'original',
                              attention_rt_timing='includes score and weighted aggregation' if mode&512 else 'RT traversal only')
+        self.metadata['detector_mode']='ordered' if mode&1048576 else 'legacy'
+        self.metadata['detector_precision']='fp32'
+        self.metadata['detector_history_policy']='complete_rt_hits'
+        self.metadata['detector_min_history']=512 if mode&1048576 else None
+        self.metadata['detector_accumulation_order']='original'
         self.metadata['attention_receipt_format']='compact_columns' if mode&2048 else 'dense'
         self.metadata['attention_stats']=bool(attention_stats)
         if mode&2048:self.metadata['attention_compute']='RT hit classification / compact FP32 grouped softmax'
@@ -78,7 +84,7 @@ class ResidentRuntime:
         self.metadata['mlp_decode_compute']='subgroup' if mode&4096 else 'rt_transmission'
         self.metadata['mlp_token_tile']=256 if mode&4096 and mode&256 else matrix_rows
         if not mode&4096:self.metadata['mlp_material_receipts']='shared within token tile'
-        self.metadata['mlp_backend_effective']=('rt_bfloat' if mode&32768 else 'rt_tensor' if mode&16384 else 'rt_material' if mode&8192 else
+        self.metadata['mlp_backend_effective']=('standard_bfloat' if mode&65536 else 'rt_bfloat' if mode&32768 else 'rt_tensor' if mode&16384 else 'rt_material' if mode&8192 else
                                                'standard' if mode&4096 else 'rt_transmission')
         if mode&8192:
             self.metadata['mlp_compute']='RT weight-block receipts / complete FP32 material classes'
@@ -93,6 +99,20 @@ class ResidentRuntime:
             self.metadata['mlp_tensor_accumulator']='fp32'
             self.metadata['mlp_tensor_bfloat16']=bool(mode&32768)
             self.metadata['mlp_material_receipts']='direct block-address slots; no sorting pass'
+        if mode&65536:
+            self.metadata['mlp_compute']='full_matrix_bfloat16'
+            self.metadata['mlp_prefill_compute']='bf16_cooperative_matrix2' if mode&256 else 'bf16_subgroup'
+            self.metadata['mlp_decode_compute']='bf16_operands_fp32_subgroup'
+            self.metadata['mlp_tensor_min_rows']=8 if mode&256 else None
+            self.metadata['mlp_tensor_operands']='bf16'
+            self.metadata['mlp_tensor_accumulator']='fp32'
+            self.metadata['mlp_tensor_bfloat16']=True
+        if mode&131072:
+            self.metadata['decode_projection_compute']='column_parallel_matvec'
+            self.metadata['decode_output_rows']=4 if mode&524288 else 2 if mode&262144 else 1
+            self.metadata['decode_column_groups']=4
+            self.metadata['mlp_decode_compute']='bf16_operands_fp32_column_parallel' if mode&65536 else 'fp32_column_parallel'
+        self.metadata['mlp_rt_queries']=not bool(mode&4096)
         self.metadata['source_model']=config.get('source_model')
         self.metadata['coordinate_partition']=config['coordinate_partition']
         self.position=0;self._attention_diagnostic_dirty=False
@@ -162,6 +182,9 @@ class ResidentRuntime:
         if len(payload)>=optical+104:
             result.update(zip(('history_state_rebuilt_tokens','history_address_hit'),
                               map(int,np.frombuffer(payload,'<u8',count=2,offset=optical+88))))
+        if profile and len(payload)>=optical+120:
+            result['profile_gpu_ms'].update(zip(('attention_detector','recurrent_detector'),
+                map(float,np.frombuffer(payload,'<f8',count=2,offset=optical+104))))
         self.position=len(ids);self._attention_diagnostic_dirty=False
         return result
 
@@ -229,6 +252,9 @@ class ResidentRuntime:
             result.update(zip(('cache_candidates','cache_rejected_candidates'),map(int,np.frombuffer(payload,'<u4',count=2,offset=offset+88))))
         if len(payload)>=offset+112:
             result.update(zip(('mlp_route_rt_rows','mlp_route_cached_rows'),map(int,np.frombuffer(payload,'<u8',count=2,offset=offset+96))))
+        if profile and len(payload)>=offset+128:
+            result['profile_gpu_ms'].update(zip(('attention_detector','recurrent_detector'),
+                map(float,np.frombuffer(payload,'<f8',count=2,offset=offset+112))))
         return result
 
     def codec(self,values):
@@ -262,7 +288,7 @@ class ResidentRuntime:
         result={'output':values[:count].reshape(len(inputs),self.hidden_size),'activation':values[count:].reshape(len(inputs),self.metadata['middle']),'feature_hits':np.frombuffer(payload,'<u4',count=len(inputs),offset=size*4).copy()}
         offset=size*4+len(inputs)*4
         if len(payload)>=offset+24:
-            names=('setup','gate_up','down') if self.metadata['mlp_backend']=='standard' else ('setup','rt_gate_up','rt_down')
+            names=('setup','gate_up','down') if self.metadata['mlp_backend'] in ('standard','standard_bfloat') else ('setup','rt_gate_up','rt_down')
             result['profile_gpu_ms']=dict(zip(names,map(float,np.frombuffer(payload,'<f8',count=3,offset=offset))))
         return result
 

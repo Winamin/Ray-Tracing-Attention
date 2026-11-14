@@ -154,21 +154,25 @@ void keyAttention(uint firstRow,uint group,uint kv,uint lane){
                 if(head>=heads||headOffset+h>=Q_PER_KV)continue;
                 uint at=recordIndex(row,group,head)*RECORD_WORDS;
                 if(c==0u){
-                    uint p=0u,d=0u;
-                    if(diagnostics)for(uint s=0u;s<KEY_SLICES;s++){p+=keyWork[((r*KEY_SLICES+s)*Q_BATCH+h)*2u];d+=keyWork[((r*KEY_SLICES+s)*Q_BATCH+h)*2u+1u];}
-                    uint rays=head==0u?attentionReceipts[at+3u]:0u;
-                    attentionReceipts[at]=p;attentionReceipts[at+1u]=d;attentionReceipts[at+2u]=rowCount;
-                    attentionReceipts[at+3u]=rays;attentionReceipts[at+7u]=3u;
-                    if(diagnostics)statisticAdd(0u,rowCount);if(diagnostics)statisticAdd(1u,rowCount);if(diagnostics)statisticAdd(2u,p);
-                    if(diagnostics)statisticAdd(6u,d);if(diagnostics)statisticAdd(9u,rays);if(diagnostics)statisticAdd(10u,1u);
+                    attentionReceipts[at+2u]=rowCount;attentionReceipts[at+7u]=3u;
+                    if(diagnostics){
+                        uint p=0u,d=0u;
+                        for(uint s=0u;s<KEY_SLICES;s++){p+=keyWork[((r*KEY_SLICES+s)*Q_BATCH+h)*2u];d+=keyWork[((r*KEY_SLICES+s)*Q_BATCH+h)*2u+1u];}
+                        uint rays=head==0u?attentionReceipts[at+3u]:0u;
+                        attentionReceipts[at]=p;attentionReceipts[at+1u]=d;attentionReceipts[at+3u]=rays;
+                        statisticAdd(0u,rowCount);statisticAdd(1u,rowCount);statisticAdd(2u,p);
+                        statisticAdd(6u,d);statisticAdd(9u,rays);statisticAdd(10u,1u);
+                    }
                 }
-                for(uint w=c;w<COVERAGE_WORDS;w+=32u){
-                    uint bit=w*32u,n=bit<rowCount?min(32u,rowCount-bit):0u;
-                    attentionReceipts[at+8u+w]=n==32u?0xffffffffu:n==0u?0u:(1u<<n)-1u;
-                }
-                for(uint j=c;j<BLOCK;j+=32u){
-                    if(j>=rowCount)attentionReceipts[at+SCORE_OFFSET+j]=floatBitsToUint(-1.0/0.0);
-                    attentionReceipts[at+WEIGHT_OFFSET+j]=0u;
+                if(diagnostics){
+                    for(uint w=c;w<COVERAGE_WORDS;w+=32u){
+                        uint bit=w*32u,n=bit<rowCount?min(32u,rowCount-bit):0u;
+                        attentionReceipts[at+8u+w]=n==32u?0xffffffffu:n==0u?0u:(1u<<n)-1u;
+                    }
+                    for(uint j=c;j<BLOCK;j+=32u)if(j>=rowCount){
+                        attentionReceipts[at+SCORE_OFFSET+j]=floatBitsToUint(-1.0/0.0);
+                        attentionReceipts[at+WEIGHT_OFFSET+j]=0u;
+                    }
                 }
             }
         }

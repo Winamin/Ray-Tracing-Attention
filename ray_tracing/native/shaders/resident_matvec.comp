@@ -1,0 +1,126 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : require
+#ifdef RT_MLP_BFLOAT16
+#extension GL_EXT_bfloat16 : require
+#endif
+#include "resident_common.glsl"
+
+// Quantized matvec work distribution follows llama.cpp's Vulkan K-quant
+// kernels (MIT, copyright the ggml authors; see THIRD_PARTY.md). Four
+// subgroups distribute column blocks, then reduce each output row once.
+// Source coefficients and inputs are rounded individually for BF16 MLP;
+// block scales are never moved outside the dot product.
+layout(constant_id=1) const uint outputRows=1u;
+layout(constant_id=2) const uint projectionKind=0xffffffffu;
+layout(constant_id=9) const uint upCoefficientFormat=0xffffffffu;
+layout(std430,binding=9) readonly buffer MatvecNormalized {vec4 matvecNormalized4[];};
+layout(std430,binding=20) readonly buffer MatvecDetector {vec4 matvecDetector4[];};
+layout(std430,binding=27) readonly buffer MatvecFeedForward {vec4 matvecFeedForward4[];};
+shared float matvecGatePartial[outputRows*4u];
+shared float matvecUpPartial[outputRows*4u];
+
+vec4 matvecInput(uint kind,uint row,uint axis){
+    if(kind==2u)return matvecDetector4[(row*A+axis)/4u];
+    if(kind==4u)return matvecFeedForward4[(row*W+axis)/4u];
+    return matvecNormalized4[(row*D+axis)/4u];
+}
+vec4 matvecOperand(vec4 value){
+#ifdef RT_MLP_BFLOAT16
+    return vec4(bf16vec4(value));
+#else
+    return value;
+#endif
+}
+
+void main(){
+    if(stopped())return;
+    uint tokenRow=gl_WorkGroupID.y,base=blockBase(),width=parameters[2];
+    uint lane=gl_SubgroupInvocationID,subgroup=gl_SubgroupID;
+    uint requested=projectionKind==0xffffffffu?cfg.index:projectionKind;
+    bool full=parameters[base+26u]==1u;
+    uint queryWidth=full?Q:RT_STATE_KEY_HEADS*128u;
+    uint keyWidth=full?RT_GQA_WIDTH:RT_STATE_KEY_HEADS*128u;
+    uint currentWidth=full?Q:S;
+    uint gateWidth=full?(RT_ATTENTION_GATE==1?Q:0u):S;
+    uint sharedWidth=full?RT_GQA_WIDTH:S;
+    uint cols=requested==4u?width:requested==2u?currentWidth:D;
+    uint outWidth=requested==5u?queryWidth+keyWidth+gateWidth+sharedWidth:
+        requested==0u?queryWidth:requested==1u?keyWidth:
+        requested==6u?gateWidth:requested==8u?sharedWidth:requested==3u?width:D;
+    if(tokenRow>=cfg.rows||gl_WorkGroupID.x*outputRows>=outWidth)return;
+
+    [[unroll]] for(uint n=0u;n<outputRows;n++){
+        uint channel=gl_WorkGroupID.x*outputRows+n,matrixIndex=requested;
+        vec4 low=vec4(0),high=vec4(0),upLow=vec4(0),upHigh=vec4(0);
+        if(channel<outWidth){
+            if(matrixIndex==5u){
+                if(channel<queryWidth)matrixIndex=0u;
+                else if(channel<queryWidth+keyWidth){matrixIndex=1u;channel-=queryWidth;}
+                else if(channel<queryWidth+keyWidth+gateWidth){matrixIndex=6u;channel-=queryWidth+keyWidth;}
+                else{matrixIndex=8u;channel-=queryWidth+keyWidth+gateWidth;}
+            }
+            uint metadata=parameters[matrixIndex==8u?base+33u:base+10u+matrixIndex*2u];
+            uint offset=parameters[matrixIndex==8u?base+32u:base+9u+matrixIndex*2u];
+            if(coefficientFormat!=0xffffffffu)metadata=coefficientFormat;
+            uint upMetadata=upCoefficientFormat!=0xffffffffu?upCoefficientFormat:parameters[base+20u];
+            for(uint block=subgroup;block<cols/256u;block+=4u){
+                QuantizedOctet transfer=quantizedOctetTyped(0u,offset,metadata,channel,cols,block,lane);
+                vec4 x=matvecOperand(matvecInput(matrixIndex,tokenRow,transfer.axis.x));
+                vec4 y=matvecOperand(matvecInput(matrixIndex,tokenRow,transfer.axis.y));
+                low+=x*matvecOperand(transfer.low);
+                high+=y*matvecOperand(transfer.high);
+                if(matrixIndex==3u){
+                    QuantizedOctet up=quantizedOctetTyped(0u,parameters[base+19u],upMetadata,channel,cols,block,lane);
+                    // Mixed gate/up formats may use different lane coordinates.
+                    vec4 ux=up.axis.x==transfer.axis.x?x:matvecOperand(matvecInput(matrixIndex,tokenRow,up.axis.x));
+                    vec4 uy=up.axis.y==transfer.axis.y?y:matvecOperand(matvecInput(matrixIndex,tokenRow,up.axis.y));
+                    upLow+=ux*matvecOperand(up.low);
+                    upHigh+=uy*matvecOperand(up.high);
+                }
+            }
+        }
+        float signal=subgroupAdd(dot(low+high,vec4(1)));
+        float upSignal=subgroupAdd(dot(upLow+upHigh,vec4(1)));
+        if(lane==0u){
+            matvecGatePartial[n*4u+subgroup]=signal;
+            matvecUpPartial[n*4u+subgroup]=upSignal;
+        }
+    }
+    barrier();
+    if(gl_LocalInvocationID.x>=outputRows)return;
+    uint n=gl_LocalInvocationID.x,channel=gl_WorkGroupID.x*outputRows+n;
+    if(channel>=outWidth)return;
+    uint matrixIndex=requested;
+    if(matrixIndex==5u){
+        if(channel<queryWidth)matrixIndex=0u;
+        else if(channel<queryWidth+keyWidth){matrixIndex=1u;channel-=queryWidth;}
+        else if(channel<queryWidth+keyWidth+gateWidth){matrixIndex=6u;channel-=queryWidth+keyWidth;}
+        else{matrixIndex=8u;channel-=queryWidth+keyWidth+gateWidth;}
+    }
+    uint at=n*4u;
+    float signal=matvecGatePartial[at]+matvecGatePartial[at+1u]+matvecGatePartial[at+2u]+matvecGatePartial[at+3u];
+    if(matrixIndex==0u){
+        for(uint copy=0u;copy<(full?1u:RT_STATE_HEADS/RT_STATE_KEY_HEADS);copy++)
+            queries[tokenRow*A+channel+copy*queryWidth]=signal;
+    }else if(matrixIndex==1u){
+        uint target=full?(channel/RT_ATTENTION_HEAD_DIM)*(RT_QUERY_WIDTH/RT_GQA_WIDTH)*RT_ATTENTION_HEAD_DIM+channel%RT_ATTENTION_HEAD_DIM:channel;
+        for(uint copy=0u;copy<(full?RT_QUERY_WIDTH/RT_GQA_WIDTH:RT_STATE_HEADS/RT_STATE_KEY_HEADS);copy++)
+            keys[tokenRow*A+target+copy*(full?RT_ATTENTION_HEAD_DIM:keyWidth)]=signal;
+    }else if(matrixIndex==6u)feedForward[tokenRow*W+channel]=signal;
+    else if(matrixIndex==8u){
+        uint target=full?(channel/RT_ATTENTION_HEAD_DIM)*(RT_QUERY_WIDTH/RT_GQA_WIDTH)*RT_ATTENTION_HEAD_DIM+channel%RT_ATTENTION_HEAD_DIM:channel;
+        for(uint copy=0u;copy<(full?RT_QUERY_WIDTH/RT_GQA_WIDTH:1u);copy++)
+            feedForward[tokenRow*W+currentWidth+target+copy*RT_ATTENTION_HEAD_DIM]=signal;
+    }else if(matrixIndex==2u||matrixIndex==4u)state[tokenRow*D+channel]+=signal;
+    else{
+        float upSignal=matvecUpPartial[at]+matvecUpPartial[at+1u]+matvecUpPartial[at+2u]+matvecUpPartial[at+3u];
+        float amplitude=abs(signal)*abs(upSignal)*detectorSigmoid(signal);
+        feedForward[tokenRow*W+channel]=sign(signal)*sign(upSignal)*amplitude;
+        if(channel==0u){
+            featureWork[featureBase(tokenRow)]=FEATURE_WIDTH;
+            atomicAdd(featureWork[featureGlobal()+8u],FEATURE_WIDTH);
+            atomicAdd(featureWork[featureGlobal()+9u],FEATURE_WIDTH);
+        }
+    }
+}

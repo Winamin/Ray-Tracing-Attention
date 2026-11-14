@@ -32,24 +32,38 @@ void main(){
         vec4 emission=rays[row*rayStride()];vec3 o,d;float total;uvec2 lens;
         if(!throughLens(0u,cfg.layer,emission,o,d,total,lens)){atomicOr(control[3],1u);return;}
         o.z-=4.0*float(time)+2.0;o+=d*(4.0*float(first)/d.z);
-        startHistory(0u,o,d,4.0*float(min(16u,available-first))/d.z);uint count=0u;
+        uint segmentSize=min(16u,available-first);
+        beginPathScoreTraversal(row);
+        startHistory(0u,o,d,4.0*float(segmentSize)/d.z);uint count=0u,seen=0u;
         while(rayQueryProceedEXT(ray)){
             if(rayQueryGetIntersectionTypeEXT(ray,false)!=gl_RayQueryCandidateIntersectionTriangleEXT)continue;
             uint primitive=rayQueryGetIntersectionPrimitiveIndexEXT(ray,false),instance=rayQueryGetIntersectionInstanceCustomIndexEXT(ray,false),slot=(instance&RT_SLOT_MASK)+primitive/2u;
             if(primitive>=32u||slot>=cfg.capacity){atomicOr(control[3],2u);return;}
-            uint global=(parameters[base+41u])*cfg.capacity+slot,age=slots[global].x;if(age>time||time-age>=cfg.capacity){atomicOr(control[3],4u);return;}
-            hits[at+1u+time-age]=global;count++;
+            uint global=(parameters[base+41u])*cfg.capacity+slot,age=slots[global].x;
+            if(age>time||time-age>=cfg.capacity||slot!=age%cfg.capacity){atomicOr(control[3],4u);return;}
+            uint relative=time-age;
+            if(relative<first||relative>=first+segmentSize){atomicOr(control[3],4u);return;}
+            // A quad can expose two triangle candidates. Segment ranges are
+            // disjoint; one local bit owns the sole receipt and gap enqueue.
+            uint bit=1u<<(relative-first);if((seen&bit)!=0u)continue;seen|=bit;
+            hits[at+1u+relative]=global;count++;
+            publishPathScores(row,global);
             uint old=atomicOr(slots[global].y,1u);if((old&3u)==0u){uint queue=atomicAdd(control[6],1u);control[8u+queue]=global;}
         }
         atomicAdd(hits[at],count);return;}
-    if(operation==1u)return;
-    if(operation==2u){uint index=job*128u+lane;if(index<control[6])slots[control[8u+index]].y=2u;return;}
+    if(operation==1u){preparePathTarget(job,lane);return;}
+    if(operation==2u){uint index=job*128u+lane;if(index<control[6]){uint slot=control[8u+index];slots[slot].y=(slots[slot].y&~3u)|2u;}return;}
     if(operation==3u){uint head=job,c=gl_SubgroupInvocationID,hd=headWidth(),at=row*(cfg.capacity+1u),count=hits[at];
         float signal0=0,signal1=0,reference=0,maximum=-1.0/0.0;
         for(uint first=0u;first<count;first+=256u){uint n=min(256u,count-first);
-            for(uint j=gl_SubgroupID;j<n;j+=4u){uint hit=hits[at+first+j+1u];float total=0;
-                for(uint axis=c;axis<hd;axis+=32u)total+=queries[row*A+head*hd+axis]*pathCoordinate(hit,head*hd+axis,false);
-                total=subgroupAdd(total);if(c==0u)scores[j]=total/sqrt(float(hd));}barrier();
+            for(uint j=gl_SubgroupID;j<n;j+=4u){uint hit=hits[at+first+j+1u];float score;
+                if(!reusePathScore(row,head,hit,score)){
+                    float total=0;
+                    for(uint axis=c;axis<hd;axis+=32u)total+=queries[row*A+head*hd+axis]*pathCoordinate(hit,head*hd+axis,false);
+                    total=subgroupAdd(total);score=total/sqrt(float(hd));
+                    if(c==0u)savePathScore(row,head,hit,score);
+                }
+                if(c==0u)scores[j]=score;}barrier();
             float localMax=-1.0/0.0;for(uint j=lane;j<n;j+=128u)localMax=max(localMax,scores[j]);localMax=subgroupMax(localMax);
             if(c==0u)reduction[gl_SubgroupID]=localMax;barrier();
             if(lane==0u){tileMaximum=max(max(reduction[0],reduction[1]),max(reduction[2],reduction[3]));tileMaximum=max(maximum,tileMaximum);previousScale=exp(maximum-tileMaximum);}barrier();
@@ -63,9 +77,17 @@ void main(){
     if(operation==5u){if(row>=min(256u,wordResult[4096u]))return;uint pair=job*128u+lane,word=wordResult[WORD_QUEUE+row];if(pair>=D/2u)return;
         vec2 value=wordTransfer(word,pair);
         wordDecoded[row*D+pair*2u]=value.x;wordDecoded[row*D+pair*2u+1u]=value.y;return;}
-    if(operation==8u){for(uint q=lane;q<cfg.rows;q+=128u)if(hits[q*(cfg.capacity+1u)]!=min(absolute(q)+1u,cfg.capacity))atomicOr(control[3],8u);if(lane==0u){control[8u+cfg.capacity]=8u;control[9u+cfg.capacity]=control[6];control[10u+cfg.capacity]=1u;control[7]+=control[6]*SHARED_PAIRS;}return;}
+    if(operation==8u){for(uint q=lane;q<cfg.rows;q+=128u)if(hits[q*(cfg.capacity+1u)]!=min(absolute(q)+1u,cfg.capacity))atomicOr(control[3],8u);if(lane==0u){control[8u+cfg.capacity]=8u;control[9u+cfg.capacity]=control[6];control[10u+cfg.capacity]=1u;control[7]+=control[6]*SHARED_PAIRS;preparePathScoreDispatch();}return;}
     if(operation==9u){uint bits=job*128u+lane;if(bits<65536u){uint measured=floatBitsToUint(scalarValue(bits));measured=(measured+32767u+((measured>>16u)&1u))&0xffff0000u;control[scalarCacheOffset()+bits]=measured;}return;}
-    if(operation==10u||operation==11u)return;
+    if(operation==10u){
+        if(!pathTargetReady(0u)||control[3]!=0u)return;
+        uint index=job*128u+lane;
+        uint count=pathScoreWork[3u]!=0u?pathScoreWork[4u]:hits[0];
+        if(index<count){uint relative=pathScoreWork[3u]!=0u?pathMissIndex(index):index;
+            publishPathScoreStamp(hits[relative+1u]);}
+        return;
+    }
+    if(operation==11u)return;
     if(operation==12u){
         uint groups=(WORD_TILES+wordRayBatch-1u)/wordRayBatch,bank=job/groups,localJob=job%groups;
         if(lane==0u){float total;uvec2 lens;wordLensValid=throughLens(0u,cfg.depth,rays[bank],wordOrigin,wordDirection,total,lens)?1u:0u;}barrier();
