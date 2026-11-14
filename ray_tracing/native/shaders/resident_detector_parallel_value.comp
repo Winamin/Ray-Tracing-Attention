@@ -1,0 +1,85 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#include "resident_common.glsl"
+
+// Split history work as in llama.cpp's Vulkan split-KV attention. Every
+// causal occurrence is retained. The second pass merges tiles in their
+// original order with the online normalization scale produced by pass 2.
+layout(constant_id=1) const uint BLOCK=256u;
+layout(std430,binding=42) buffer OrderedDetectorCache {uint orderedDetectorCache[];};
+layout(std430,binding=12) readonly buffer OrderedPackedHistory {uint orderedPackedHistory[];};
+const uint RECORD_WORDS=4u+BLOCK+RT_ATTENTION_HEAD_DIM,DETECTOR_ERROR=65536u;
+const uint Q_PER_KV=RT_QUERY_WIDTH/RT_GQA_WIDTH;
+#include "resident_detector_value_common.glsl"
+shared vec4 tileWeights[BLOCK];
+shared uint tileSlots[BLOCK],groupFailure;
+
+uint valueRecord(uint tile,uint head,uint heads){return (tile*heads+head)*RECORD_WORDS;}
+bool valueFinite(float value){return !isnan(value)&&!isinf(value);}
+void valueFailure(){atomicOr(groupFailure,1u);atomicOr(control[3],DETECTOR_ERROR);}
+
+void main(){
+    if(stopped())return;
+    uint lane=gl_LocalInvocationID.x,heads=headCount(),dh=headWidth();
+    uint axisGroups=(dh+31u)/32u,kv=gl_WorkGroupID.x/axisGroups;
+    uint axis=(gl_WorkGroupID.x%axisGroups)*32u+lane;
+    uint firstHead=kv*Q_PER_KV,count=hits[0];
+    if(cfg.rows!=1u||gl_WorkGroupSize.x!=32u||gl_SubgroupSize!=32u||
+       dh==0u||dh>256u||Q_PER_KV==0u||Q_PER_KV>4u||BLOCK!=256u){
+        if(lane==0u)atomicOr(control[3],DETECTOR_ERROR);return;
+    }
+    if(firstHead>=heads||(control[3]&DETECTOR_ERROR)!=0u)return;
+    if(count==0u||count!=min(absolute(0u)+1u,cfg.capacity)){
+        if(lane==0u)atomicOr(control[3],DETECTOR_ERROR);return;
+    }
+    bool axisActive=axis<dh;
+    bvec4 enabled=bvec4(false);
+    for(uint h=0u;h<Q_PER_KV;h++)enabled[h]=firstHead+h<heads;
+    if(lane==0u)groupFailure=0u;
+    barrier();
+    if(operation==0u){
+        uint tile=gl_WorkGroupID.y,first=tile*BLOCK;
+        if(first>=count)return;
+        uint n=min(BLOCK,count-first);
+        for(uint h=0u;h<Q_PER_KV;h++)if(enabled[h]){
+            uint at=valueRecord(tile,firstHead+h,heads);
+            if(at+RECORD_WORDS>uint(orderedDetectorCache.length())||orderedDetectorCache[at+3u]!=n)valueFailure();
+        }
+        barrier();if(groupFailure!=0u)return;
+        for(uint j=lane;j<n;j+=32u){
+            vec4 weight=vec4(0.0);
+            for(uint h=0u;h<Q_PER_KV;h++)if(enabled[h]){
+                weight[h]=uintBitsToFloat(orderedDetectorCache[valueRecord(tile,firstHead+h,heads)+4u+j]);
+                if(!valueFinite(weight[h]))valueFailure();
+            }
+            tileWeights[j]=weight;tileSlots[j]=hits[first+j+1u];
+        }
+        barrier();if(groupFailure!=0u)return;
+        OrderedQ6Plan plan=orderedQ6Plan(axisActive?firstHead*dh+axis:0u);
+        vec4 signal=vec4(0.0);
+        if(axisActive)for(uint j=0u;j<n;j++)signal+=tileWeights[j]*orderedQ6Coordinate(tileSlots[j],plan);
+        if(axisActive)for(uint h=0u;h<Q_PER_KV;h++)if(enabled[h]){
+            if(!valueFinite(signal[h]))valueFailure();
+            orderedDetectorCache[valueRecord(tile,firstHead+h,heads)+4u+BLOCK+axis]=floatBitsToUint(signal[h]);
+        }
+        return;
+    }
+    if(!axisActive)return;
+    vec4 signal=vec4(0.0);
+    for(uint tile=0u;tile<(count+BLOCK-1u)/BLOCK;tile++){
+        for(uint h=0u;h<Q_PER_KV;h++)if(enabled[h]){
+            uint at=valueRecord(tile,firstHead+h,heads);
+            float scale=uintBitsToFloat(orderedDetectorCache[at+2u]);
+            float partial=uintBitsToFloat(orderedDetectorCache[at+4u+BLOCK+axis]);
+            signal[h]=signal[h]*scale+partial;
+        }
+    }
+    for(uint h=0u;h<Q_PER_KV;h++)if(enabled[h]){
+        uint channel=(firstHead+h)*dh+axis;
+        float reference=physical[(firstHead+h)*2u+1u];
+        float headSignal=signal[h]/max(reference,1e-30)*(RT_ATTENTION_GATE==1?detectorSigmoid(feedForward[channel]):1.0);
+        if(!valueFinite(headSignal))valueFailure();
+        detector[channel]=headSignal;
+    }
+}

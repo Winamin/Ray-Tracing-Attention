@@ -17,6 +17,7 @@ shared uint strongestTokens[128];
 // These aliases use the existing descriptors and keep the scalar storage layout.
 layout(std430,binding=9) readonly buffer NormalizedVectors {vec4 normalized4[];};
 layout(std430,binding=20) readonly buffer DetectorVectors {vec4 detector4[];};
+layout(std430,binding=26) readonly buffer BaseChartVectors {vec4 baseChart4[];};
 layout(std430,binding=27) readonly buffer FeedForwardVectors {vec4 feedForward4[];};
 vec4 projectionVector(uint kind,uint row,uint axis){
     if(kind==2u)return detector4[(row*A+axis)/4u];
@@ -134,11 +135,13 @@ return;}
 
     if(operation==16u){uint index=job*readoutWords+gl_SubgroupID,count=wordResult[4096u],word=index<count?wordResult[WORD_QUEUE+index]:0xffffffffu,c=gl_SubgroupInvocationID,target=cfg.rows-1u;
         float value=-1.0/0.0;
-        if(word<V){vec4 low=vec4(0),high=vec4(0);for(uint block=0u;block<WORD_BLOCKS;block++){
-            if(!wordBlockHit(word,block)){if(c==0u)atomicOr(control[3],2048u);}
-            QuantizedOctet transfer=quantizedOctet(1u,parameters[16u],parameters[15u],word,D,block,c);
-            [[unroll]] for(uint i=0u;i<4u;i++){low[i]+=restoredWordCoordinate(transfer.axis.x+i)*transfer.low[i];high[i]+=restoredWordCoordinate(transfer.axis.y+i)*transfer.high[i];}}
-            value=subgroupAdd(dot(low+high,vec4(1)));}
+        if(word<V){
+            vec4 low=vec4(0),high=vec4(0);for(uint block=0u;block<WORD_BLOCKS;block++){
+                if(!wordBlockHit(word,block)){if(c==0u)atomicOr(control[3],2048u);}
+                QuantizedOctet transfer=quantizedOctet(1u,parameters[16u],parameters[15u],word,D,block,c);
+                low+=baseChart4[transfer.axis.x/4u]*transfer.low;high+=baseChart4[transfer.axis.y/4u]*transfer.high;}
+            value=subgroupAdd(dot(low+high,vec4(1)));
+        }
         if(c==0u){strongestSignals[gl_SubgroupID]=value;strongestTokens[gl_SubgroupID]=word;}barrier();
         if(lane==0u){uint best=0u;for(uint i=1u;i<readoutWords;i++)if(strongestSignals[i]>strongestSignals[best]||(strongestSignals[i]==strongestSignals[best]&&strongestTokens[i]<strongestTokens[best]))best=i;wordResult[8192u+job]=floatBitsToUint(strongestSignals[best]);wordResult[8192u+(V+3u)/4u+job]=strongestTokens[best];}return;}
     if(operation==17u){float maximum=-1.0/0.0;uint token=0xffffffffu;for(uint part=job*128u+lane;part<(wordResult[4096u]+readoutWords-1u)/readoutWords;part+=16384u){float value=uintBitsToFloat(wordResult[8192u+part]);uint id=wordResult[8192u+(V+3u)/4u+part];if(value>maximum||(value==maximum&&id<token)){maximum=value;token=id;}}

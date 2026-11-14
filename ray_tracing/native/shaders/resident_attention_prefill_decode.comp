@@ -1,0 +1,52 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#include "resident_common.glsl"
+// Short-lived standard-prefill work only. Decode the immutable packed history
+// once per KV head after real RT receipt validation; no new history or BVH.
+layout(std430,binding=44) buffer PrefillDecoded {float16_t prefillDecoded[];};
+layout(std430,binding=45) buffer PrefillProvenance {uvec4 prefillHeader[4];uvec4 prefillRecords[];};
+const uint HISTORY_TILE=128u,DH=RT_ATTENTION_HEAD_DIM;
+shared uint tileReady;
+void main(){
+    if(stopped())return;
+    uint lane=gl_LocalInvocationID.x,first=gl_WorkGroupID.x*HISTORY_TILE;
+    uint visible=prefillHeader[1].w,tagBase=prefillHeader[2].x;
+    uint historyBase=parameters[blockBase()+41u]*cfg.capacity;
+    uint lastRow=cfg.rows-1u,time=absolute(lastRow),kvHead=gl_WorkGroupID.y;
+    if(lane==0u)tileReady=1u;
+    barrier();
+    if(lane<HISTORY_TILE){
+        uint history=first+lane;
+        if(history<visible){
+            uint global=historyBase+history,age=slots[global].x,source=slots[global].y>>2u;
+            bool receipt=age==history&&age<=time&&time-age<cfg.capacity&&
+                hits[lastRow*(cfg.capacity+1u)+1u+time-age]==global;
+            if(!receipt)atomicAnd(tileReady,0u);
+            if(kvHead==0u)prefillRecords[tagBase+history]=uvec4(cfg.checkpoint,age,source,uint(receipt));
+        }
+    }
+    barrier();
+    bool ready=tileReady!=0u;
+    if(ready){
+        uint addressHead=kvHead*(RT_QUERY_WIDTH/RT_GQA_WIDTH)*DH;
+        for(uint i=lane;i<HISTORY_TILE*DH;i+=gl_WorkGroupSize.x){
+            uint history=first+i/DH,axis=i%DH,compact=kvHead*DH+axis;
+            if(history>=cfg.capacity)continue;
+            float k=0.0,v=0.0;
+            if(history<visible){
+                // Exact original FP32 coefficient order and FP16 conversion.
+                k=pathCoordinate(historyBase+history,addressHead+axis,false);
+                v=pathCoordinate(historyBase+history,addressHead+axis,true);
+            }
+            uint at=history*RT_GQA_WIDTH+compact;
+            prefillDecoded[at]=float16_t(k);
+            prefillDecoded[cfg.capacity*RT_GQA_WIDTH+at]=float16_t(v);
+        }
+    }
+    if(lane==0u&&kvHead==0u)
+        prefillRecords[gl_WorkGroupID.x]=uvec4(cfg.checkpoint,uint(ready),cfg.layer,first);
+    // A host command-buffer storage barrier joins all KV-head workgroups
+    // before the paired attention consumer may observe its generation.
+}

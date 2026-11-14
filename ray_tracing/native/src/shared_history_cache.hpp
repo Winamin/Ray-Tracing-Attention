@@ -94,13 +94,30 @@ public:
     uint64_t blockBytes()const {uint64_t n=0;for(auto& pair:blocks)if(auto b=pair.second.lock())n+=b->bytes();return n;}
     uint32_t size()const {return uint32_t(std::count_if(entries.begin(),entries.end(),[](auto& x){return bool(x);}));}
     uint32_t maxEntries(uint64_t snapshotSize)const {uint64_t historyBytes=blockBytes();return uint32_t(std::max(1ull,std::min(uint64_t(entryLimit),(budget>historyBytes?budget-historyBytes:0u)/std::max(1ull,snapshotSize))));}
-    static uint32_t priority(uint32_t kind){return kind&20u?3u:kind&1u?2u:kind&2u?1u:0u;}
+    static uint32_t priority(uint32_t kind){return kind&18u?3u:kind&1u?2u:kind&4u?1u:0u;}
+    auto evictionCandidate() {
+        auto oldest=entries.end();
+        for(auto i=entries.begin();i!=entries.end();i++)if(*i&&
+            (oldest==entries.end()||priority((*i)->kind)<priority((*oldest)->kind)||
+             (priority((*i)->kind)==priority((*oldest)->kind)&&(*i)->touched<(*oldest)->touched)))oldest=i;
+        return oldest;
+    }
+    bool trim() {
+        bool changed=false;
+        // New immutable blocks are allocated after reservation. Reconcile the
+        // actual footprint once their command has completed; live attachments
+        // keep their references even when an optional boundary is evicted.
+        while(size()&&(size()>entryLimit||snapshotBytes()+blockBytes()>budget)){
+            auto oldest=evictionCandidate();oldest->reset();evictions++;changed=true;
+        }
+        return changed;
+    }
     std::shared_ptr<Entry> reserve(const std::vector<uint32_t>& input,uint32_t count,uint32_t kind,const Key& key,uint64_t snapshotSize) {
         for(auto& x:entries)if(x&&x->key==key&&x->input.size()==count&&std::equal(x->input.begin(),x->input.end(),input.begin())){x->kind|=kind;x->touched=++clock;return {};}
         uint32_t maximum=maxEntries(snapshotSize);
-        // Preserve request ends and common roots ahead of optional inner/output
-        // boundaries, so a returning branch still attaches its shared history.
-        while(size()>=maximum){auto oldest=entries.end();for(auto i=entries.begin();i!=entries.end();i++)if(*i&&(oldest==entries.end()||priority((*i)->kind)<priority((*oldest)->kind)||(priority((*i)->kind)==priority((*oldest)->kind)&&(*i)->touched<(*oldest)->touched)))oldest=i;
+        // Request and output ends both carry continuation state. Inner batch
+        // boundaries are optional and must not prevent saving a terminal state.
+        while(size()>=maximum){auto oldest=evictionCandidate();
             if(priority((*oldest)->kind)>priority(kind))return {};
             oldest->reset();evictions++;}
         uint32_t slot=0;while(entries[slot])slot++;

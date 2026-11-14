@@ -10,7 +10,7 @@
 // use the original scratch records. BLOCK keeps the original 256-position width.
 layout(constant_id=1) const uint BLOCK=256u;
 layout(std430,binding=42) buffer OrderedDetectorCache {uint orderedDetectorCache[];};
-const uint RECORD_WORDS=4u+BLOCK,DETECTOR_ERROR=65536u;
+const uint RECORD_WORDS=4u+BLOCK+RT_ATTENTION_HEAD_DIM,DETECTOR_ERROR=65536u;
 shared float tileMaximum,tileReference,previousScale;
 shared uint groupFailure;
 

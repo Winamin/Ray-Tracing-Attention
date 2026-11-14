@@ -147,6 +147,12 @@ void traceGroup(uint row,uint group,uint count,uint lane){
     }
     if(lane==0u){
         if(uniqueHits!=count||groupMissCount>count)attentionFailure();
+        // Invalidate before K writes scores: same Q retains its generation
+        // even when an immutable source has changed. One atomic per miss
+        // group supplies local's verdict without a global occurrence queue.
+        if(pathTraversalSame&&groupMissCount!=0u&&pathAggregateAllocated()){
+            atomicOr(pathScoreWork[11u],1u);invalidatePathAggregate();
+        }
         atomicAdd(hits[row*(cfg.capacity+1u)],uniqueHits);
     }
     barrier();

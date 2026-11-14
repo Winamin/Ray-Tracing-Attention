@@ -5,6 +5,7 @@
 #extension GL_KHR_shader_subgroup_ballot : require
 #extension GL_KHR_shader_subgroup_shuffle : require
 #include "resident_common.glsl"
+#define RT_ATTENTION_CLASSES_ACCESS readonly restrict
 #include "resident_attention_classes.glsl"
 #define headCount() parameters[blockBase()+23u]
 
@@ -178,48 +179,27 @@ void valueAttention(uint row,uint kv,uint lane){
             uint products=0u,decodes=0u;
             for(uint j=0u;j<count;j++){
                 uint slot=hits[row*(cfg.capacity+1u)+group*BLOCK+j+1u];
-                uint roots=compactCount(slot,kv,true);
+                uvec2 directory=classDirectory(slot,kv,true);
+                uint roots=directory.y,payload=classPayloadBase()+directory.x;
                 if(roots==0u||roots>DH){attentionFailure();roots=0u;}
-                for(uint rank=lane;rank<roots;rank+=gl_WorkGroupSize.x){
-                    classTile[rank]=compactDescriptor(slot,kv,rank,true);
-                    addressTile[rank]=classValue(slot,kv,rank,true);
-                    if(!finiteValue(addressTile[rank]))attentionFailure();
-                }
-                barrier();if(groupFailure!=0u)return;
                 float weight=headActive?uintBitsToFloat(attentionReceipts[at+WEIGHT_OFFSET+j]):0.0;
                 for(uint k=0u;k<LANE_AXES;k++){
-                    uint axis=c+k*32u;
-                    if(axis<DH){localWork[qLane*WORK_STRIDE+axis]=0.0;
-                        localWork[WORK_PLANE+qLane*WORK_STRIDE+axis]=0.0;}
-                }
-                subgroupMemoryBarrierShared();subgroupBarrier();
-                if(headActive)for(uint rank=c;rank<roots;rank+=32u){
-                    uint descriptor=classTile[rank],root=compactAxis(descriptor);
-                    uint offset=compactMemberOffset(descriptor),members=compactMemberCount(descriptor);
-                    float value=addressTile[rank];
-                    if(root>=DH||members==0u||offset+members>DH){attentionFailure();continue;}
-                    uint consumed=DISTRIBUTE_V_MEMBERS!=0u?members:1u;if(diagnostics)decodes+=consumed;
-                    if(value!=0.0){
-                        precise float product=weight*value,residual=fma(weight,value,-product);
-                        if(DISTRIBUTE_V_MEMBERS!=0u)for(uint m=0u;m<members;m++){
-                            uint axis=compactMember(slot,kv,offset+m,true);
-                            localWork[qLane*WORK_STRIDE+axis]=product;
-                            localWork[WORK_PLANE+qLane*WORK_STRIDE+axis]=residual;
-                        }else{
-                            localWork[qLane*WORK_STRIDE+root]=product;
-                            localWork[WORK_PLANE+qLane*WORK_STRIDE+root]=residual;
+                    uint axis=c+k*32u;if(!headActive||axis>=DH)continue;
+                    precise float product=0.0,residual=0.0;
+                    if(roots!=0u){
+                        uint rank=compactValueRankAt(payload,roots,axis);
+                        if(rank>=roots){attentionFailure();continue;}
+                        bool present=DISTRIBUTE_V_MEMBERS!=0u||compactAxis(attentionClasses[payload+rank])==axis;
+                        if(present){
+                            float value=uintBitsToFloat(attentionClasses[payload+roots+rank]);
+                            if(!finiteValue(value)){attentionFailure();continue;}
+                            if(diagnostics)decodes++;
+                            if(value!=0.0){product=weight*value;residual=fma(weight,value,-product);if(diagnostics)products++;}
                         }
-                        if(diagnostics)products+=consumed;
                     }
+                    accurateAdd(signal[k],correction[k],product);
+                    accurateAdd(signal[k],correction[k],residual);
                 }
-                subgroupMemoryBarrierShared();subgroupBarrier();
-                for(uint k=0u;k<LANE_AXES;k++){
-                    uint axis=c+k*32u;if(headActive&&axis<DH){
-                        accurateAdd(signal[k],correction[k],localWork[qLane*WORK_STRIDE+axis]);
-                        accurateAdd(signal[k],correction[k],localWork[WORK_PLANE+qLane*WORK_STRIDE+axis]);
-                    }
-                }
-                barrier();
             }
             if(diagnostics){products=subgroupAdd(products);decodes=subgroupAdd(decodes);}
             if(headActive&&c==0u){

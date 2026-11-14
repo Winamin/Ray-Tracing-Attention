@@ -14,6 +14,9 @@
 layout(constant_id=1) const uint outputRows=1u;
 layout(constant_id=2) const uint projectionKind=0xffffffffu;
 layout(constant_id=9) const uint upCoefficientFormat=0xffffffffu;
+// llama.cpp K-quant matvec assigns sixteen coefficients to each of sixteen
+// block lanes. Keep the old 32-lane specialization for numeric comparison.
+layout(constant_id=10) const uint blockLanes=16u;
 layout(std430,binding=9) readonly buffer MatvecNormalized {vec4 matvecNormalized4[];};
 layout(std430,binding=20) readonly buffer MatvecDetector {vec4 matvecDetector4[];};
 layout(std430,binding=27) readonly buffer MatvecFeedForward {vec4 matvecFeedForward4[];};
@@ -32,7 +35,6 @@ vec4 matvecOperand(vec4 value){
     return value;
 #endif
 }
-
 void main(){
     if(stopped())return;
     uint tokenRow=gl_WorkGroupID.y,base=blockBase(),width=parameters[2];
@@ -64,19 +66,22 @@ void main(){
             uint offset=parameters[matrixIndex==8u?base+32u:base+9u+matrixIndex*2u];
             if(coefficientFormat!=0xffffffffu)metadata=coefficientFormat;
             uint upMetadata=upCoefficientFormat!=0xffffffffu?upCoefficientFormat:parameters[base+20u];
-            for(uint block=subgroup;block<cols/256u;block+=4u){
-                QuantizedOctet transfer=quantizedOctetTyped(0u,offset,metadata,channel,cols,block,lane);
+            for(uint block=gl_LocalInvocationID.x/blockLanes;block<cols/256u;block+=128u/blockLanes){
+                [[unroll]] for(uint part=0u;part<32u/blockLanes;part++){
+                uint blockLane=gl_LocalInvocationID.x%blockLanes+part*blockLanes;
+                QuantizedOctet transfer=quantizedOctetTyped(0u,offset,metadata,channel,cols,block,blockLane);
                 vec4 x=matvecOperand(matvecInput(matrixIndex,tokenRow,transfer.axis.x));
                 vec4 y=matvecOperand(matvecInput(matrixIndex,tokenRow,transfer.axis.y));
                 low+=x*matvecOperand(transfer.low);
                 high+=y*matvecOperand(transfer.high);
                 if(matrixIndex==3u){
-                    QuantizedOctet up=quantizedOctetTyped(0u,parameters[base+19u],upMetadata,channel,cols,block,lane);
+                    QuantizedOctet up=quantizedOctetTyped(0u,parameters[base+19u],upMetadata,channel,cols,block,blockLane);
                     // Mixed gate/up formats may use different lane coordinates.
                     vec4 ux=up.axis.x==transfer.axis.x?x:matvecOperand(matvecInput(matrixIndex,tokenRow,up.axis.x));
                     vec4 uy=up.axis.y==transfer.axis.y?y:matvecOperand(matvecInput(matrixIndex,tokenRow,up.axis.y));
                     upLow+=ux*matvecOperand(up.low);
                     upHigh+=uy*matvecOperand(up.high);
+                }
                 }
             }
         }

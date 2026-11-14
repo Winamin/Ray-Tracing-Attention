@@ -18,6 +18,15 @@ The quantized matvec input aliases and packed coefficient decoding follow its
 [Vulkan matvec](https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec.comp) and
 [Q6_K word masks](https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q6_k.comp).
 
+Decode history partitioning and sixteen-lane K-quant block distribution follow
+llama.cpp commit `7d7f02875`:
+[split-KV dispatch](https://github.com/ggml-org/llama.cpp/blob/7d7f02875/ggml/src/ggml-vulkan/ggml-vulkan.cpp#L8414-L8455),
+[Q4_K distribution](https://github.com/ggml-org/llama.cpp/blob/7d7f02875/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q4_k.comp),
+and [Q6_K distribution](https://github.com/ggml-org/llama.cpp/blob/7d7f02875/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q6_k.comp).
+RTA keeps its compact class records, per-coefficient BF16 rounding and complete
+history contributions. Parallel FP32 value reductions merge tiles in order;
+their addition grouping can differ from the sequential fallback.
+
 MIT License
 
 Copyright (c) 2023-2026 The ggml authors

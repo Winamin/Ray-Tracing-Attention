@@ -14,6 +14,7 @@
 const uint BR=64u,BC=128u,DH=RT_ATTENTION_HEAD_DIM;
 shared float16_t queryTile[BR*DH];
 layout(buffer_reference,std430,buffer_reference_align=8) readonly buffer HistoryRecord {uint raw[HISTORY_RECORD_BYTES/4u];};
+#include "resident_attention_history_vector.glsl"
 uint historyBase(){return parameters[blockBase()+41u]*cfg.capacity;}
 float16_t decodeAddress(const in HistoryRecord record,const in uint bc[2],const in uint ci[2]){
     return float16_t(pathCoordinate(historyBase()+bc[0],gl_WorkGroupID.x*DH+ci[1],false));
@@ -22,12 +23,10 @@ float16_t decodeContent(const in HistoryRecord record,const in uint bc[2],const 
     return float16_t(pathCoordinate(historyBase()+bc[0],gl_WorkGroupID.x*DH+ci[1],true));
 }
 f16vec4 decodeAddressVector(const in HistoryRecord record,const in uint bc[2],const in uint ci[2]){
-    uint slot=historyBase()+bc[0],axis=gl_WorkGroupID.x*DH+ci[1];
-    return f16vec4(pathCoordinate(slot,axis,false),pathCoordinate(slot,axis+1u,false),pathCoordinate(slot,axis+2u,false),pathCoordinate(slot,axis+3u,false));
+    return f16vec4(historyVector(record,gl_WorkGroupID.x*DH+ci[1],false));
 }
 f16vec4 decodeContentVector(const in HistoryRecord record,const in uint bc[2],const in uint ci[2]){
-    uint slot=historyBase()+bc[0],axis=gl_WorkGroupID.x*DH+ci[1];
-    return f16vec4(pathCoordinate(slot,axis,true),pathCoordinate(slot,axis+1u,true),pathCoordinate(slot,axis+2u,true),pathCoordinate(slot,axis+3u,true));
+    return f16vec4(historyVector(record,gl_WorkGroupID.x*DH+ci[1],true));
 }
 #if RT_VECTOR_DECODE
 #define ADDRESS_DECODE decodeAddress,decodeAddressVector

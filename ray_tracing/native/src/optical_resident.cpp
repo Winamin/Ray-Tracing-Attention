@@ -86,10 +86,11 @@ public:
     uint32_t captureRows{};bool rtMaterialMLP=false,rtTensorMLP=false,rtBfloatMLP=false,standardBfloatMLP=false;VkPipeline tensorMlp[2]{};
     bool matvecDecoding=false;uint32_t decodeOutputRows=4u;
     std::vector<std::array<VkPipeline,7>> decodeMatvec;
-    uint32_t attentionBackend=0u,attentionBlock=128u;bool rtTransmissionMLP=false,attentionDiagnosticDirty=false,attentionStatsEnabled=false,attentionVMemberDistribution=false,attentionLocalSplit=false;Buffer* attentionReceipts{};VkPipeline attentionReceiptPipelines[5]{};
-    bool detectorOrdered=false;static constexpr uint32_t detectorBlock=256u,detectorThreshold=512u;VkPipeline detectorPipelines[3]{};
+    uint32_t attentionBackend=0u,attentionBlock=128u;bool rtTransmissionMLP=false,attentionDiagnosticDirty=false,attentionStatsEnabled=false,attentionVMemberDistribution=false,attentionLocalSplit=false;Buffer* attentionReceipts{};VkPipeline attentionReceiptPipelines[12]{};
+    uint32_t attentionLocalParallelNormalize=2u;
+    bool detectorOrdered=false;static constexpr uint32_t detectorBlock=256u,detectorThreshold=512u;VkPipeline detectorPipelines[5]{};bool parallelDetectorValue=true;
     Buffer *pathScoreDummy{},*pathScoreWork{};std::vector<Buffer*> pathScoreLayers;
-    uint32_t pathScorePages{};uint64_t pathScoreSource=1u;bool pathScoreExhausted=false;
+    uint32_t pathScorePages{},pathAggregatePolicy{};uint64_t pathScoreSource=1u;bool pathScoreExhausted=false;
     static constexpr uint32_t pathScoreMagic=0x52545053u,pathScoreSourceLimit=0x3fffffffu;
     std::unique_ptr<AttentionClassGeometry> attentionClassScene;
     Buffer *attentionClassDummy{},*attentionClassScratch{},*attentionClassCounts{};
@@ -143,6 +144,12 @@ public:
         rtBfloatMLP=rtBfloatMLP&&rtTensorMLP;
         attentionStatsEnabled=std::getenv("RT_ATTENTION_STATS")&&std::string(std::getenv("RT_ATTENTION_STATS"))=="1";
         attentionVMemberDistribution=std::getenv("RT_ATTENTION_V_MEMBERS")&&std::string(std::getenv("RT_ATTENTION_V_MEMBERS"))=="1";
+        if(const char* value=std::getenv("RT_LOCAL_PARALLEL_NORMALIZE")){
+            std::string mode(value);
+            if(mode=="0")attentionLocalParallelNormalize=0u;
+            else if(mode=="1")attentionLocalParallelNormalize=1u;
+            else if(mode!="auto")throw std::runtime_error("Local parallel normalization requires 0, 1 or auto");
+        }
         if(const char* block=std::getenv("RT_ATTENTION_BLOCK"))attentionBlock=uint32_t(std::stoul(block));
         if(attentionBlock!=128u&&attentionBlock!=256u&&attentionBlock!=512u)throw std::runtime_error("Invalid attention history block");
         if(attentionBackend>=2u&&sparse)throw std::runtime_error("Grouped attention requires complete contribution routing");
@@ -170,6 +177,7 @@ public:
         attentionClassScratch=e.buffer(attentionBackend==4u?uint64_t(workRows)*classDomains*classTempDomainWords*4u:4u,usage,true);
         attentionClassCounts=e.buffer(4u,VK_BUFFER_USAGE_TRANSFER_DST_BIT,true);
         attentionClassLayers.resize(std::max(1u,MODEL_FULL));
+        allocatePrefillDecodedHistory();
         readback=e.buffer(4*1024*1024,VK_BUFFER_USAGE_TRANSFER_DST_BIT,true);
         if(cacheEnabled){initializeMarker(liveMarker,true);}
         VkDescriptorSetLayoutBinding bindings[46]{};uint32_t bindingCount=0;for(uint32_t i=0;i<46;i++){bindings[bindingCount++]={i,((i<5&&i!=2)||i==32||i==39||i==43)?VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,i==6||i==32?depth:i==0||i==1||i==3?4u:1u,VK_SHADER_STAGE_COMPUTE_BIT,nullptr};}
@@ -204,6 +212,9 @@ public:
             }
         }
         if(matvecDecoding){
+            uint32_t blockLanes=16u;
+            if(const char* value=std::getenv("RT_DECODE_BLOCK_LANES"))blockLanes=uint32_t(std::stoul(value));
+            if(blockLanes!=16u&&blockLanes!=32u)throw std::runtime_error("Decode block lanes require 16 or 32");
             std::map<std::tuple<uint32_t,uint32_t,uint32_t>,VkPipeline> cached;
             const uint32_t projections[7]{0u,1u,2u,3u,4u,6u,8u},formats[7]{10u,12u,14u,16u,18u,22u,33u};
             for(uint32_t l=0;l<depth;l++){
@@ -212,8 +223,9 @@ public:
                     uint32_t kind=projections[part],format=p[base+formats[part]],up=kind==3u?p[base+20u]:0xffffffffu;
                     auto id=std::make_tuple(kind,format,up);
                     if(!cached.count(id)){
-                        const char* name=standardBfloatMLP&&(kind==3u||kind==4u)?"resident_matvec_bfloat":"resident_matvec";
-                        auto handle=e.pipeline(name,layout,2u,decodeOutputRows,kind,wordTile,128u,featureTile,1u,4u,format,up);
+                        bool bfloat=standardBfloatMLP&&(kind==3u||kind==4u);
+                        const char* name=bfloat?"resident_matvec_bfloat":"resident_matvec";
+                        auto handle=e.pipeline(name,layout,2u,decodeOutputRows,kind,wordTile,128u,featureTile,1u,4u,format,up,blockLanes);
                         cached[id]=handle;ownedCooperative.push_back(handle);
                     }
                     handles[part]=cached[id];
@@ -225,7 +237,12 @@ public:
             if(wideCooperative){
                 matrixPack=e.pipeline("resident_pack",layout,0u,1u,0xffffffffu,wordTile,128u,featureTile);
                 if(standardBfloatMLP){matrixBfloatPack=e.pipeline("resident_pack_bfloat",layout,0u,1u,0xffffffffu,wordTile,128u,featureTile);ownedCooperative.push_back(matrixBfloatPack);}
-                matrixAttention=e.pipeline("resident_attention",layout,0u,1u,0xffffffffu,wordTile,256u,featureTile);fastState=e.pipeline("resident_state",layout,21u,1u,0xffffffffu,wordTile,128u,featureTile);
+                matrixAttention=e.pipeline("resident_attention",layout,0u,1u,0xffffffffu,wordTile,256u,featureTile);
+                if(prefillDecodedData){
+                    prefillDecodePipeline=e.pipeline("resident_attention_prefill_decode",layout,0u,1u,0xffffffffu,wordTile,256u,featureTile);
+                    prefillScratchAttention=e.pipeline("resident_attention_prefill_scratch",layout,0u,64u,128u,wordTile,256u,featureTile);
+                    ownedCooperative.push_back(prefillDecodePipeline);ownedCooperative.push_back(prefillScratchAttention);
+                }fastState=e.pipeline("resident_state",layout,21u,1u,0xffffffffu,wordTile,128u,featureTile);
                 std::map<std::tuple<uint32_t,uint32_t,uint32_t,uint32_t,uint32_t>,VkPipeline> cache;
                 auto pipe=[&](uint32_t stage,uint32_t pass,uint32_t format,uint32_t projection=0xffffffffu,uint32_t up=0xffffffffu){auto id=std::make_tuple(stage,pass,format,projection,up);if(!cache.count(id)){auto handle=e.pipeline(standardBfloatMLP&&(stage==28u||stage==33u)?"resident_batch2_bfloat":"resident_batch2",layout,stage,pass,projection,wordTile,256u,featureTile,1u,4u,format,up);cache[id]=handle;ownedCooperative.push_back(handle);}return cache[id];};
                 for(uint32_t l=0;l<depth;l++){uint32_t base=32u+l*64u;cooperativeOutputs.push_back(pipe(2u,1u,p[base+14u],2u));if(!rtTransmissionMLP){cooperativeGates.push_back(pipe(28u,1u,p[base+16u],0xffffffffu,p[base+20u]));cooperativeDowns.push_back(pipe(33u,1u,p[base+18u]));}cooperativeQKV.push_back({pipe(2u,1u,p[base+10u],0u),pipe(2u,1u,p[base+12u],1u),pipe(2u,1u,p[base+22u],6u),pipe(2u,1u,p[base+33u],8u)});
@@ -296,7 +313,11 @@ public:
         keyGeometry=newPaths;slots=newSlots;hits=newHits;prompt=newPrompt;control=newControl;
         // Class maps have their own compact layer stride; enlarging the history
         // address space does not allocate unused derived records.
+        // Growing the ring cannot restore an overwritten prefix. Retain valid
+        // packets, but require saved provenance before reusing a whole prefix.
+        if(gpuFieldPosition>previous)gpuFieldReady=false;
         capacity=e.capacity=next;
+        allocatePrefillDecodedHistory();
         resizePathScores();
         if(cacheEnabled){opticalPath->rebind(state,propagation,keyGeometry,control,next);replyTree->rebind(control,wordResult);}
         for(uint32_t l=0;l<depth;l++)bind(layerSets[l],false,l);bind(initialSet,true);
@@ -317,7 +338,7 @@ public:
         if(!initial&&attentionBackend==4u&&fullLayer(layer)){
             auto* candidate=attentionClassLayers[fullIndex(layer)].buffer;if(candidate)classPayload=candidate;
         }
-        Buffer* buffers[46]{nullptr,nullptr,propagation,nullptr,nullptr,parameters,matrices,basis,state,normalized,query,key,keyGeometry,initial?words->vertices:history->vertices,decoded,geometry,slots,rays,hits,paths,detector,physical,wordDecoded,scalars->vertices,wordResult,lenses->vertices,baseChart,feedForward,auxiliary,prompt,control,audit,nullptr,features?features->vertices:scalars->vertices,featureWork,featureRays,featureDown,partialDown,words->vertices,nullptr,pathPayload,pathScoreWork?pathScoreWork:pathScoreDummy,attentionReceipts,nullptr,attentionClassScratch,classPayload};VkDescriptorBufferInfo infos[46]{};VkWriteDescriptorSet writes[46]{};
+        Buffer* buffers[46]{nullptr,nullptr,propagation,nullptr,nullptr,parameters,matrices,basis,state,normalized,query,key,keyGeometry,initial?words->vertices:history->vertices,decoded,geometry,slots,rays,hits,paths,detector,physical,wordDecoded,scalars->vertices,wordResult,lenses->vertices,baseChart,feedForward,auxiliary,prompt,control,audit,nullptr,features?features->vertices:scalars->vertices,featureWork,featureRays,featureDown,partialDown,words->vertices,nullptr,pathPayload,pathScoreWork?pathScoreWork:pathScoreDummy,attentionReceipts,nullptr,prefillDecodedData?prefillDecodedData:attentionClassScratch,prefillDecodedMeta?prefillDecodedMeta:classPayload};VkDescriptorBufferInfo infos[46]{};VkWriteDescriptorSet writes[46]{};
         uint32_t writeCount=0;for(uint32_t i=0;i<46;i++){auto& w=writes[writeCount++];w={VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};w.dstSet=target;w.dstBinding=i;w.descriptorCount=i==6||i==32?depth:i==0||i==1||i==3?4:1;w.descriptorType=((i<5&&i!=2)||i==32||i==39||i==43)?VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;if((i<5&&i!=2)||i==32||i==39||i==43){as[i]={VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};as[i].accelerationStructureCount=w.descriptorCount;as[i].pAccelerationStructures=i==32?featureHandles:i==43?(attentionClassScene?attentionClassScene->tops.data():handles[0]):i==39?(mlpSurfaces?mlpSurfaces->tops.data():handles[0]):handles[i];w.pNext=&as[i];}else{infos[i]={buffers[i]->handle,0,buffers[i]->size};w.pBufferInfo=i==6?layerMatrices.data():&infos[i];}}vkUpdateDescriptorSets(e.device,writeCount,writes,0,nullptr);
     }
     static void sync(VkCommandBuffer c){Engine::barrier(c,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_ACCESS_MEMORY_WRITE_BIT,VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT);}
@@ -362,7 +383,12 @@ public:
         // Narrow heads use the subgroup detector; its reduction is reliable for
         // the 32-channel shape, while matrix projections still share weights.
         if(attentionBackend==0u&&cfg.rows>=8u&&wideCooperative&&RT_ATTENTION_HEAD_DIM>=64u&&pipelines==ray&&cfg.stage==3u){
-            bindCompute(c,matrixAttention,target?target:layerSets[cfg.layer]);vkCmdDispatch(c,x,(cfg.rows+63u)/64u,1u);sync(c);return;
+            auto selectedSet=target?target:layerSets[cfg.layer];
+            uint32_t epoch=recordPrefillDecodedHistory(c,cfg,selectedSet);
+            if(epoch)cfg.checkpoint=epoch;
+            bindCompute(c,epoch?prefillScratchAttention:matrixAttention,selectedSet);
+            vkCmdPushConstants(c,layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(cfg),&cfg);
+            vkCmdDispatch(c,x,(cfg.rows+63u)/64u,1u);sync(c);return;
         }
         if(cfg.rows>=8u&&wideCooperative&&pipelines==math&&cfg.stage==21u){vkCmdDispatch(c,4u,MODEL_STATE_HEADS,1u);sync(c);return;}
         if(cfg.rows==1u&&projection&&cfg.index==5u){
@@ -391,11 +417,20 @@ public:
     void payload(VkCommandBuffer c,ResidentConfig cfg){cfg.stage=8;launch(c,ray,cfg,1);}
     void resizePathScores(){
         for(auto* buffer:pathScoreLayers)e.release(buffer);pathScoreLayers.clear();
-        e.release(pathScoreWork);pathScoreWork=nullptr;pathScorePages=0u;
+        e.release(pathScoreWork);pathScoreWork=nullptr;pathScorePages=0u;pathAggregatePolicy=0u;
         // Per-occurrence score arithmetic is stable in standard/ordered and
         // local-class decode. Other grouped producers have different policies.
         if(!cacheEnabled||pathScoreExhausted||!MODEL_FULL||
            (attentionBackend!=0u&&attentionBackend!=1u&&attentionBackend!=4u))return;
+        // Opt-in candidate: only local decode's existing exact-Q bank gains
+        // an ungated output suffix. Version, numerical format, producer,
+        // gate, V-member distribution and block policy share its namespace.
+        if(attentionBackend==4u&&RT_ATTENTION_HEAD_DIM==256u&&MODEL_Q==4u*MODEL_GQA&&
+           std::getenv("RT_PATH_AGGREGATE_CACHE")&&std::string(std::getenv("RT_PATH_AGGREGATE_CACHE"))=="1"){
+            uint32_t numfmt=standardBfloatMLP?2u:rtBfloatMLP?3u:1u;
+            pathAggregatePolicy=0x10000000u|(numfmt<<24u)|(2u<<20u)|
+                (uint32_t(RT_ATTENTION_GATE==1u)<<19u)|(uint32_t(attentionVMemberDistribution)<<18u)|attentionBlock;
+        }
         uint64_t budget=128ull*1024u*1024u;
         if(auto* value=std::getenv("RT_PATH_SCORE_CACHE_MIB"))budget=std::stoull(value)*1024ull*1024ull;
         VkPhysicalDeviceProperties properties{};vkGetPhysicalDeviceProperties(e.physical,&properties);
@@ -404,6 +439,7 @@ public:
         uint64_t workBytes=(16u+2ull*capacity)*4u;
         uint64_t bankWords=4u+uint64_t(RT_ATTENTION_HEADS)*RT_ATTENTION_HEAD_DIM+
             uint64_t(capacity)*(2u+RT_ATTENTION_HEADS),layerBytes=0u;
+        if(pathAggregatePolicy)bankWords+=8u+uint64_t(RT_ATTENTION_HEADS)*(RT_ATTENTION_HEAD_DIM+2u);
         for(uint32_t pages=2u;pages;pages--){
             uint64_t bytes=(8u+pages*bankWords)*4u;
             if(bytes<=properties.limits.maxStorageBufferRange&&bytes<=UINT32_MAX&&
@@ -424,7 +460,7 @@ public:
     }
     void resetPathScores(VkCommandBuffer c){
         if(!pathScorePages)return;
-        uint32_t header[8]{capacity,pathScorePages,RT_ATTENTION_HEADS,RT_ATTENTION_HEAD_DIM,pathScoreExhausted?0u:pathScoreMagic,attentionBackend,0u,0u};
+        uint32_t header[8]{capacity,pathScorePages,RT_ATTENTION_HEADS,RT_ATTENTION_HEAD_DIM,pathScoreExhausted?0u:pathScoreMagic,attentionBackend,0u,pathAggregatePolicy};
         for(auto* buffer:pathScoreLayers){
             vkCmdFillBuffer(c,buffer->handle,0u,buffer->size,0u);sync(c);
             vkCmdUpdateBuffer(c,buffer->handle,0u,sizeof(header),header);
@@ -444,8 +480,13 @@ public:
     void prepareDetector(){
         if(!detectorOrdered)return;
         const char* orderedModules[3]{"resident_detector_ordered_scores","resident_detector_ordered_normalize","resident_detector_ordered_value"};
-        if(!detectorPipelines[0])for(uint32_t i=0;i<3u;i++)detectorPipelines[i]=e.pipeline(orderedModules[i],layout,0u,detectorBlock,0xffffffffu,wordTile,i==2u?32u:128u,featureTile);
-        uint64_t stride=4u+detectorBlock;
+        if(!detectorPipelines[0]){
+            for(uint32_t i=0;i<3u;i++)detectorPipelines[i]=e.pipeline(orderedModules[i],layout,0u,detectorBlock,0xffffffffu,wordTile,i==2u?32u:128u,featureTile);
+            for(uint32_t i=3u;i<5u;i++)detectorPipelines[i]=e.pipeline("resident_detector_parallel_value",layout,i-3u,detectorBlock,0xffffffffu,wordTile,32u,featureTile);
+            parallelDetectorValue=RT_QUERY_WIDTH/RT_GQA_WIDTH<=4u;
+            if(auto* value=std::getenv("RT_PARALLEL_DETECTOR_VALUE"))parallelDetectorValue=parallelDetectorValue&&std::string(value)!="0";
+        }
+        uint64_t stride=4u+detectorBlock+RT_ATTENTION_HEAD_DIM;
         uint64_t bytes=uint64_t((capacity+detectorBlock-1u)/detectorBlock)*RT_ATTENTION_HEADS*stride*4u;
         if(bytes<=attentionReceipts->size)return;
         VkPhysicalDeviceProperties properties{};vkGetPhysicalDeviceProperties(e.physical,&properties);
@@ -478,7 +519,12 @@ public:
         else vkCmdDispatch(c,uint32_t(groups),1u,1u);
         sync(c);
         bindCompute(c,detectorPipelines[1],layerSets[cfg.layer]);vkCmdDispatch(c,heads[cfg.layer],1u,1u);sync(c);
-        bindCompute(c,detectorPipelines[2],layerSets[cfg.layer]);vkCmdDispatch(c,uint32_t(valueGroups),1u,1u);sync(c);
+        if(parallelDetectorValue){
+            uint32_t axes=(RT_ATTENTION_HEAD_DIM+31u)/32u;
+            uint32_t tiles=(visible+detectorBlock-1u)/detectorBlock;
+            bindCompute(c,detectorPipelines[3],layerSets[cfg.layer]);vkCmdDispatch(c,kvHeads*axes,tiles,1u);sync(c);
+            bindCompute(c,detectorPipelines[4],layerSets[cfg.layer]);vkCmdDispatch(c,kvHeads*axes,1u,1u);sync(c);
+        }else{bindCompute(c,detectorPipelines[2],layerSets[cfg.layer]);vkCmdDispatch(c,uint32_t(valueGroups),1u,1u);sync(c);}
     }
     void mark(VkCommandBuffer c,ResidentConfig cfg,uint32_t at){if(cfg.debug==2)vkCmdWriteTimestamp(c,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,e.timestamps,2+cfg.step*(depth*7+4)+cfg.layer*7+at);}
     void setup(){if(initialized)return;ResidentConfig cfg{7,1,0,0,0,0,0,capacity,depth,0,0,0};auto c=e.command();begin(c);vkCmdResetQueryPool(c,e.timestamps,0,2);vkCmdWriteTimestamp(c,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,e.timestamps,0);vkCmdFillBuffer(c,featureRays->handle,0,featureRays->size,0u);sync(c);
@@ -697,7 +743,7 @@ cfg.stage=6;launch(c,math,cfg,1,cfg.rows);
         bool sameLiveClasses=sameLiveAttentionClasses(hit);
         if(attentionBackend==4u){
             // Test the live prefix before a resize can discard its directory.
-            resizeAttentionClasses(count,sameLiveClasses);prepareStaticAttentionClassScene();
+            resizeAttentionClasses(count+std::min(64u,capacity-count),sameLiveClasses);prepareStaticAttentionClassScene();
         }
         prepareAttentionClassAttachment(hit,sameLiveClasses);
         if(attentionBackend>=2u&&rows){uint32_t activeRows=std::min(count,workRows);prepareAttention(activeRows,count-activeRows);}
@@ -728,7 +774,10 @@ cfg.stage=6;launch(c,math,cfg,1,cfg.rows);
         if(cacheEnabled){gpuFieldAddress=pathAddress;gpuFieldPosition=count;gpuFieldReady=true;}
         if(useCache){for(auto& entry:sharedHistory->entries)if(entry&&entry->input==ids){entry->address=pathAddress;entry->addressReady=true;entry->stops=stops;}}
 
-        if(useCache){cachedPrefix=ids;prefixReady=true;stableTokens=boundary;stableReady=true;if(!pending.empty())sharedHistory->publish();}
+        // The live K/V source also changes during diagnostic prefill, which
+        // deliberately bypasses cache admission. Keep its token identity current.
+        cachedPrefix=ids;
+        if(useCache){prefixReady=true;stableTokens=boundary;stableReady=true;bool trimmed=sharedHistory->trim();if(!pending.empty()||trimmed)sharedHistory->publish();}
         else{prefixReady=false;stableReady=false;}
         std::vector<char> output;append(output,std::vector<double>{setupGPU,time.gpu,time.wall,ms(start),double(bool(hit)),double(reused)});
         output.insert(output.end(),static_cast<char*>(readback->map),static_cast<char*>(readback->map)+bytes);
@@ -783,7 +832,7 @@ cfg.stage=6;launch(c,math,cfg,1,cfg.rows);
             uint64_t boundaryBytes=uint64_t(MODEL_D)*4u+uint64_t(MODEL_RECURRENT)*(MODEL_STATE_HEADS*128u*128u+MODEL_S*9u)*4u;
             auto entry=sharedHistory->reserve(ids,tokens,2u,keys[tokens],boundaryBytes);
             if(entry){prepareBoundary(entry,keys);auto c=e.command();begin(c);saveBoundary(c,entry,0u,&attachedBlocks);
-                check(vkEndCommandBuffer(c),"end output boundary capture");e.submit(c);vkFreeCommandBuffers(e.device,e.pool,1,&c);sharedHistory->publish();saved=1;}
+                check(vkEndCommandBuffer(c),"end output boundary capture");e.submit(c);vkFreeCommandBuffers(e.device,e.pool,1,&c);sharedHistory->trim();sharedHistory->publish();saved=sharedHistory->entries[entry->slot]==entry;}
         }
         // Pending gaps belong to the attached history and are consumed by
         // classification. Finishing before decode must retain those intervals.
@@ -981,6 +1030,7 @@ cfg.stage=6;launch(c,math,cfg,1,cfg.rows);
         reply(output);
     }
     #include "resident_attention_runtime.inl"
+    #include "prefill_decoded_history.inl"
     ~Resident(){
         vkDeviceWaitIdle(e.device);if(rtTimestamps)vkDestroyQueryPool(e.device,rtTimestamps,nullptr);if(attentionSubmitTimestamps)vkDestroyQueryPool(e.device,attentionSubmitTimestamps,nullptr);
         std::set<VkPipeline> handles;auto add=[&](const auto& pipes){for(auto p:pipes)if(p)handles.insert(p);};

@@ -1,0 +1,65 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#include "resident_attention_local_value_split.glsl"
+
+void main(){
+    // Normalization does not use decode's chunk scratch, so each prefill row
+    // can publish its existing weights with one subgroup per KV head.
+    if(cfg.rows==0u||DH!=256u||Q_PER_KV!=4u||BLOCK%CHUNK!=0u||
+       gl_WorkGroupSize.x!=32u||gl_SubgroupSize!=32u){
+        if(gl_LocalInvocationID.x==0u)atomicOr(control[3],ATTENTION_ERROR);return;
+    }
+    uint row=gl_WorkGroupID.y,c=gl_SubgroupInvocationID,kv=gl_WorkGroupID.x,heads=headCount();
+    if(row>=cfg.rows||stopped()||(control[3]&ATTENTION_ERROR)!=0u)return;
+    if(localAggregatePolicyMatches()&&reusePathAggregate())return;
+    uint firstHead=kv*Q_PER_KV,available=availablePositions(row),groups=groupCount(row);
+    if(firstHead>=heads)return;
+    bool diagnostics=splitDiagnostics(),persistent=pathScoresEnabled()&&pathScoreWork[2u]==1u;
+    uint historyBase=parameters[blockBase()+41u]*cfg.capacity;
+    uvec4 scorePlanes=uvec4(0u);
+    if(persistent)for(uint h=0u;h<4u;h++)scorePlanes[h]=pathScorePlane(firstHead+h);
+    bvec4 enabled=lessThan(uvec4(firstHead)+uvec4(0u,1u,2u,3u),uvec4(heads));
+    vec4 maximum=vec4(-1.0/0.0);bool invalid=false;
+    for(uint group=0u;group<groups;group++){
+        uint at=recordIndex(row,group,firstHead)*RECORD_WORDS,count=min(BLOCK,available-group*BLOCK);
+        for(uint h=0u;h<4u;h++)if(enabled[h]){
+            uint record=at+h*RECORD_WORDS;
+            if(attentionReceipts[record+2u]!=count||attentionReceipts[record+7u]!=3u)invalid=true;
+            if(diagnostics&&c==0u){attentionReceipts[record+4u]=0u;attentionReceipts[record+5u]=0u;}
+        }
+        for(uint j=c;j<count;j+=32u){
+            vec4 score=vec4(-1.0/0.0);
+            uint slot=persistent?hits[row*(cfg.capacity+1u)+group*BLOCK+j+1u]:0u;
+            for(uint h=0u;h<4u;h++)if(enabled[h])score[h]=persistent?uintBitsToFloat(pathScoreCache[scorePlanes[h]+slot-historyBase]):
+                uintBitsToFloat(attentionReceipts[at+h*RECORD_WORDS+SCORE_OFFSET+j]);
+            maximum=max(maximum,score);
+        }
+    }
+    maximum=subgroupMax(maximum);
+    precise vec4 reference=vec4(0.0),correction=vec4(0.0);
+    for(uint group=0u;group<groups;group++){
+        uint at=recordIndex(row,group,firstHead)*RECORD_WORDS,count=min(BLOCK,available-group*BLOCK);
+        for(uint j=c;j<count;j+=32u){
+            vec4 weight=vec4(0.0);
+            for(uint h=0u;h<4u;h++)if(enabled[h]){
+                float score=persistent?uintBitsToFloat(pathScoreCache[scorePlanes[h]+hits[row*(cfg.capacity+1u)+group*BLOCK+j+1u]-historyBase]):
+                    uintBitsToFloat(attentionReceipts[at+h*RECORD_WORDS+SCORE_OFFSET+j]);
+                weight[h]=exp(score-maximum[h]);
+                attentionReceipts[at+h*RECORD_WORDS+WEIGHT_OFFSET+j]=floatBitsToUint(weight[h]);
+            }
+            accurateAdd4(reference,correction,weight);
+        }
+    }
+    reference=subgroupAdd(reference-correction);invalid=subgroupAny(invalid);
+    if(c==0u){
+        if(invalid)atomicOr(control[3],ATTENTION_ERROR);
+        for(uint h=0u;h<4u;h++)if(enabled[h]){
+            if(!finiteValue(reference[h])||reference[h]<=0.0||!finiteValue(maximum[h]))atomicOr(control[3],ATTENTION_ERROR);
+            uint p=(row*max(H,uint(RT_ATTENTION_HEADS))+firstHead+h)*2u;
+            physical[p]=maximum[h]+20.0;physical[p+1u]=reference[h];
+        }
+    }
+}

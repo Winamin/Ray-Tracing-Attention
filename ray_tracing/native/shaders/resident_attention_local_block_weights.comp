@@ -1,0 +1,43 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#include "resident_attention_local_value_split.glsl"
+// Each complete history block publishes the same exp(score-globalMax)
+// values. Only pointwise scheduling changes; FP32 expressions stay intact.
+void main(){
+    if(!splitValid(32u))return;
+    if(localAggregatePolicyMatches()&&reusePathAggregate())return;
+    uint kv=gl_WorkGroupID.x,headBase=kv*Q_PER_KV,c=gl_SubgroupInvocationID;
+    uint available=availablePositions(0u),groups=groupCount(0u);
+    if(headBase>=headCount())return;
+    bvec4 enabled=lessThan(uvec4(headBase)+uvec4(0u,1u,2u,3u),uvec4(headCount()));
+    bool persistent=pathScoresEnabled()&&pathScoreWork[2u]==1u;
+    uint historyBase=parameters[blockBase()+41u]*cfg.capacity;
+    uvec4 planes=uvec4(0u);
+    if(persistent)for(uint h=0u;h<4u;h++)planes[h]=pathScorePlane(headBase+h);
+    uint group=gl_WorkGroupID.y,first=group*BLOCK;
+    if(group>=groups||first>=available)return;
+    vec4 maximum=vec4(-1.0/0.0);
+    for(uint g=c;g<groups;g+=32u){
+        uint record=recordIndex(0u,g,headBase)*RECORD_WORDS;
+        vec4 partial=vec4(-1.0/0.0);
+        for(uint h=0u;h<4u;h++)if(enabled[h])
+            partial[h]=uintBitsToFloat(attentionReceipts[record+h*RECORD_WORDS+4u]);
+        maximum=max(maximum,partial);
+    }
+    maximum=subgroupMax(maximum);
+    uint count=min(BLOCK,available-first),at=recordIndex(0u,group,headBase)*RECORD_WORDS;
+    for(uint j=c;j<count;j+=32u){
+            uint slot=persistent?hits[first+j+1u]:0u;
+            vec4 score=vec4(-1.0/0.0);
+            for(uint h=0u;h<4u;h++)if(enabled[h])
+                score[h]=persistent?uintBitsToFloat(pathScoreCache[planes[h]+slot-historyBase]):
+                    uintBitsToFloat(attentionReceipts[at+h*RECORD_WORDS+SCORE_OFFSET+j]);
+        for(uint h=0u;h<4u;h++)if(enabled[h]){
+            float weight=exp(score[h]-maximum[h]);
+            attentionReceipts[at+h*RECORD_WORDS+WEIGHT_OFFSET+j]=floatBitsToUint(weight);
+        }
+    }
+}

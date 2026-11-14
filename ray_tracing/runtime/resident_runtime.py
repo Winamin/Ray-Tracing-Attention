@@ -60,7 +60,7 @@ class ResidentRuntime:
         self.metadata['detector_precision']='fp32'
         self.metadata['detector_history_policy']='complete_rt_hits'
         self.metadata['detector_min_history']=512 if mode&1048576 else None
-        self.metadata['detector_accumulation_order']='original'
+        self.metadata['detector_accumulation_order']='ordered_tiles' if mode&1048576 else 'original'
         self.metadata['attention_receipt_format']='compact_columns' if mode&2048 else 'dense'
         self.metadata['attention_stats']=bool(attention_stats)
         if mode&2048:self.metadata['attention_compute']='RT hit classification / compact FP32 grouped softmax'

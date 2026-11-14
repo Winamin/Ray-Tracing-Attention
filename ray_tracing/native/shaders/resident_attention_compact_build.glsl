@@ -49,9 +49,21 @@ void buildCompactClasses(){
         attentionClassScratch[base+CLASS_TEMP_DESCRIPTOR_OFFSET+i]=descriptor;
         attentionClassScratch[base+CLASS_TEMP_VALUE_OFFSET+i]=attentionClassScratch[base+CLASS_TEMP_BITS_OFFSET+axis];
     }
+    bool content=kind>=CLASS_KV_HEADS;
+    if(content){
+        // The original descriptors have crossed into scratch. Reuse this
+        // transient array for root-to-rank lookup; K's member list is untouched.
+        memoryBarrierBuffer();barrier();
+        for(uint i=lane;i<roots;i+=gl_WorkGroupSize.x)
+            compactEntries[compactAxis(attentionClassScratch[base+CLASS_TEMP_DESCRIPTOR_OFFSET+i])]=i;
+        barrier();
+    }
     for(uint i=lane;i<CLASS_PACKED_MEMBER_WORDS;i+=gl_WorkGroupSize.x){
         uint j=4u*i;
-        attentionClassScratch[base+CLASS_TEMP_MEMBER_OFFSET+i]=compactMembers[j]|(compactMembers[j+1u]<<8u)|(compactMembers[j+2u]<<16u)|(compactMembers[j+3u]<<24u);
+        uvec4 packed=content?uvec4(compactEntries[tempClassParent(compactWords[j])],
+            compactEntries[tempClassParent(compactWords[j+1u])],compactEntries[tempClassParent(compactWords[j+2u])],
+            compactEntries[tempClassParent(compactWords[j+3u])]):uvec4(compactMembers[j],compactMembers[j+1u],compactMembers[j+2u],compactMembers[j+3u]);
+        attentionClassScratch[base+CLASS_TEMP_MEMBER_OFFSET+i]=packed.x|(packed.y<<8u)|(packed.z<<16u)|(packed.w<<24u);
     }
     if(lane==0u)attentionClassScratch[base+CLASS_TEMP_COUNT_OFFSET]=roots;
 }
@@ -102,6 +114,20 @@ void expandCompactClasses(){
     uint lane=gl_LocalInvocationID.x,slot=parameters[blockBase()+41u]*cfg.capacity+(cfg.position+row)%cfg.capacity;
     uint base=tempDomainAddress(row,kind),count=compactCount(slot,kv,content),dim=RT_ATTENTION_HEAD_DIM;
     if(count==0u||count>dim){if(lane==0u)atomicOr(control[3],65536u);return;}
+    if(content){
+        uint payload=classDomainAddress(slot,kv,true);
+        for(uint axis=lane;axis<dim;axis+=gl_WorkGroupSize.x){
+            uint rank=compactValueRankAt(payload,count,axis);
+            if(rank>=count){atomicOr(control[3],65536u);continue;}
+            uint descriptor=attentionClasses[payload+rank],root=compactAxis(descriptor),members=compactMemberCount(descriptor);
+            if(root>=dim||members==0u||members>dim){atomicOr(control[3],65536u);continue;}
+            uint next=dim;
+            for(uint candidate=axis+1u;candidate<dim;candidate++)
+                if(compactValueRankAt(payload,count,candidate)==rank){next=candidate;break;}
+            attentionClassScratch[base+CLASS_TEMP_MAP_OFFSET+axis]=root|(next<<8u)|(members<<17u);
+        }
+        return;
+    }
     for(uint rank=lane;rank<count;rank+=gl_WorkGroupSize.x){
         uint descriptor=compactDescriptor(slot,kv,rank,content),root=compactAxis(descriptor);
         uint offset=compactMemberOffset(descriptor),members=compactMemberCount(descriptor);

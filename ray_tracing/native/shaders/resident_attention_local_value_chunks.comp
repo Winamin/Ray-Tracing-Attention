@@ -1,0 +1,50 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#include "resident_attention_local_value_split.glsl"
+const uint VALUE_AXES=DH/128u;
+
+void main(){
+    if(!splitValid(128u))return;
+    if(localAggregatePolicyMatches()&&reusePathAggregate())return;
+    uint kv=gl_WorkGroupID.x,headBase=kv*Q_PER_KV,lane=gl_LocalInvocationID.x;
+    uint group=gl_WorkGroupID.y/CHUNKS,chunk=gl_WorkGroupID.y%CHUNKS;
+    uint available=availablePositions(0u),first=group*BLOCK+chunk*CHUNK;
+    if(headBase>=headCount()||first>=available)return;
+    uint count=min(CHUNK,available-first),c=gl_SubgroupInvocationID,tile=gl_SubgroupID;
+    bool diagnostics=splitDiagnostics();
+    bvec4 enabled=lessThan(uvec4(headBase)+uvec4(0u,1u,2u,3u),uvec4(headCount()));
+    precise vec4 signal[VALUE_AXES];
+    for(uint a=0u;a<VALUE_AXES;a++)signal[a]=vec4(0.0);
+    uint products=0u,decodes=0u;
+    if(lane==0u)groupFailure=0u;
+    barrier();
+    for(uint j=0u;j<count;j++){
+        uint slot=hits[first+j+1u];
+        uvec2 directory=classDirectory(slot,kv,true);
+        uint roots=directory.y,payload=classPayloadBase()+directory.x;
+        if(roots==0u||roots>DH){attentionFailure();continue;}
+        vec4 weight=vec4(0.0);
+        for(uint h=0u;h<4u;h++)if(enabled[h])weight[h]=uintBitsToFloat(attentionReceipts[splitWeight(group,chunk*CHUNK+j,headBase+h)]);
+        for(uint a=0u;a<VALUE_AXES;a++){
+            uint axis=lane+a*128u,rank=compactValueRankAt(payload,roots,axis);
+            if(rank>=roots){attentionFailure();continue;}
+            if(DISTRIBUTE_V_MEMBERS==0u&&compactAxis(attentionClasses[payload+rank])!=axis)continue;
+            float value=uintBitsToFloat(attentionClasses[payload+roots+rank]);
+            if(!finiteValue(value)){attentionFailure();continue;}
+            if(diagnostics)decodes++;
+            if(value!=0.0){signal[a]=fma(weight,vec4(value),signal[a]);if(diagnostics)products++;}
+        }
+    }
+    for(uint a=0u;a<VALUE_AXES;a++)for(uint h=0u;h<4u;h++)if(enabled[h])
+        attentionReceipts[splitChunkAddress(group,chunk,headBase+h,lane+a*128u)]=floatBitsToUint(signal[a][h]);
+    if(diagnostics){
+        products=subgroupAdd(products);decodes=subgroupAdd(decodes);
+        if(c==0u)for(uint h=0u;h<4u;h++)if(enabled[h]){
+            uint at=recordIndex(0u,group,headBase+h)*RECORD_WORDS;
+            atomicAdd(attentionReceipts[at+4u],products);atomicAdd(attentionReceipts[at+5u],decodes);statisticAdd(3u,products);
+        }
+    }
+}
