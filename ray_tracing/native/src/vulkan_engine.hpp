@@ -23,7 +23,7 @@ using Clock=std::chrono::steady_clock;
 static void check(VkResult r,const char* label){if(r!=VK_SUCCESS)throw std::runtime_error(std::string(label)+": Vulkan "+std::to_string(r));}
 static double ms(Clock::time_point t){return std::chrono::duration<double,std::milli>(Clock::now()-t).count();}
 static double median(std::vector<double> x){std::sort(x.begin(),x.end());return x[x.size()/2];}
-struct Buffer {VkBuffer handle{};VkDeviceMemory memory{};VkDeviceSize size{},allocationSize{};VkDeviceAddress address{};void* map{};bool ownsMemory=true,deviceLocal=false;uint32_t poolIndex=~0u;};
+struct Buffer {VkBuffer handle{};VkDeviceMemory memory{};VkDeviceSize size{},allocationSize{},poolOffset{};VkDeviceAddress address{};void* map{};bool ownsMemory=true,deviceLocal=false;uint32_t poolIndex=~0u;};
 struct Leaf {VkAccelerationStructureKHR handle{};VkAccelerationStructureGeometryKHR geometry{};Buffer *scratch{},*storage{};uint32_t first{},count{};};
 struct Measure {double gpu{},wall{};};
 class Engine {
@@ -31,11 +31,42 @@ public:
     VkInstance instance{};VkPhysicalDevice physical{};VkDevice device{};VkQueue queue{};
     VkPhysicalDeviceMemoryProperties memory{};uint32_t family{},alignment{},capacity{},width{};
     float period{};std::string deviceName;VkCommandPool pool{};VkFence fence{};VkQueryPool timestamps{};uint32_t timestampCount{};bool cooperativeMatrix{},cooperativeMatrix2{};
+    uint32_t maxComputeInvocations{},maxComputeSizeX{},maxComputeSharedMemory{};
+    bool supportsWorkgroup(uint32_t invocations,uint64_t sharedBytes)const{
+        return invocations<=maxComputeInvocations&&invocations<=maxComputeSizeX&&sharedBytes<=maxComputeSharedMemory;
+    }
     PFN_vkCreateAccelerationStructureKHR createAS{};PFN_vkDestroyAccelerationStructureKHR destroyAS{};
     PFN_vkGetAccelerationStructureBuildSizesKHR getSizes{};PFN_vkCmdBuildAccelerationStructuresKHR buildAS{};
     PFN_vkGetAccelerationStructureDeviceAddressKHR asAddress{};
     std::vector<std::unique_ptr<Buffer>> buffers;Buffer *uploadStaging{},*downloadStaging{};
-    struct MemoryPool {VkDeviceMemory memory;VkDeviceSize size,used;uint32_t type,kind,live;};
+    struct MemoryPool {
+        struct Range {VkDeviceSize offset,size;};
+        VkDeviceMemory memory;VkDeviceSize size,used;uint32_t type,kind,live;
+        std::vector<Range> free;
+        bool take(VkDeviceSize bytes,VkDeviceSize alignment,VkDeviceSize& offset){
+            for(size_t i=0;i<free.size();i++){
+                auto range=free[i];auto at=(range.offset+alignment-1u)&~(alignment-1u);
+                if(at-range.offset>range.size||bytes>range.size-(at-range.offset))continue;
+                auto end=at+bytes,tail=range.offset+range.size-end;
+                if(at>range.offset){free[i].size=at-range.offset;if(tail)free.insert(free.begin()+i+1,{end,tail});}
+                else if(tail)free[i]={end,tail};else free.erase(free.begin()+i);
+                offset=at;return true;
+            }
+            auto at=(used+alignment-1u)&~(alignment-1u);
+            if(at>size||bytes>size-at)return false;
+            if(at>used)free.push_back({used,at-used});
+            used=at+bytes;offset=at;return true;
+        }
+        void give(VkDeviceSize offset,VkDeviceSize bytes){
+            auto at=std::lower_bound(free.begin(),free.end(),offset,[](const Range& range,VkDeviceSize value){return range.offset<value;});
+            at=free.insert(at,{offset,bytes});
+            if(at!=free.begin()&&(at-1)->offset+(at-1)->size==at->offset){
+                (at-1)->size+=at->size;at=free.erase(at)-1;
+            }
+            if(at+1!=free.end()&&at->offset+at->size==(at+1)->offset){at->size+=(at+1)->size;free.erase(at+1);}
+            if(!free.empty()&&free.back().offset+free.back().size==used){used=free.back().offset;free.pop_back();}
+        }
+    };
     std::vector<MemoryPool> memoryPools;
     uint64_t allocated{},physicalAllocated{},physicalDeviceAllocated{};std::filesystem::path directory;VkPipelineLayout layout{};
     Buffer* buffer(VkDeviceSize size,VkBufferUsageFlags usage,bool host=false,bool standalone=false) {
@@ -56,14 +87,15 @@ public:
         VkDeviceSize bindingOffset=0;
         if(!host&&!standalone&&req.size<16u*1024u*1024u&&!dedicated.requiresDedicatedAllocation){
             MemoryPool* selected=nullptr;
-            for(auto& pool:memoryPools){auto at=(pool.used+req.alignment-1)&~(req.alignment-1);if(pool.memory&&pool.type==type&&pool.kind==kind&&at+req.size<=pool.size){selected=&pool;bindingOffset=at;break;}}
+            for(auto& pool:memoryPools)if(pool.memory&&pool.type==type&&pool.kind==kind&&pool.take(req.size,req.alignment,bindingOffset)){selected=&pool;break;}
             if(!selected){
                 VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};flags.flags=VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
                 VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};ai.pNext=&flags;ai.allocationSize=std::max<VkDeviceSize>(req.size,(kind==1u?8u:64u)*1024u*1024u);ai.memoryTypeIndex=type;
                 VkDeviceMemory backing{};check(vkAllocateMemory(device,&ai,nullptr,&backing),"allocate optical memory pool");
-                memoryPools.push_back({backing,ai.allocationSize,0,type,kind,0});selected=&memoryPools.back();physicalAllocated+=ai.allocationSize;physicalDeviceAllocated+=ai.allocationSize;
+                memoryPools.push_back({backing,ai.allocationSize,0,type,kind,0,{}});selected=&memoryPools.back();physicalAllocated+=ai.allocationSize;physicalDeviceAllocated+=ai.allocationSize;
+                if(!selected->take(req.size,req.alignment,bindingOffset))throw std::runtime_error("New memory pool cannot fit its buffer");
             }
-            b->memory=selected->memory;b->ownsMemory=false;b->poolIndex=uint32_t(selected-memoryPools.data());selected->used=bindingOffset+req.size;selected->live++;
+            b->memory=selected->memory;b->ownsMemory=false;b->poolIndex=uint32_t(selected-memoryPools.data());b->poolOffset=bindingOffset;selected->live++;
         }else{
             VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};flags.flags=(usage&VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)?VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT:0;
             VkMemoryDedicatedAllocateInfo standalone{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};standalone.buffer=b->handle;
@@ -99,7 +131,7 @@ public:
         if(current->map)vkUnmapMemory(device,current->memory);
         vkDestroyBuffer(device,current->handle,nullptr);allocated-=current->allocationSize;
         if(current->ownsMemory){vkFreeMemory(device,current->memory,nullptr);physicalAllocated-=current->allocationSize;if(current->deviceLocal)physicalDeviceAllocated-=current->allocationSize;}
-        else {auto& backing=memoryPools[current->poolIndex];if(--backing.live==0){vkFreeMemory(device,backing.memory,nullptr);backing.memory=VK_NULL_HANDLE;physicalAllocated-=backing.size;physicalDeviceAllocated-=backing.size;}}
+        else {auto& backing=memoryPools[current->poolIndex];backing.give(current->poolOffset,current->allocationSize);if(--backing.live==0){vkFreeMemory(device,backing.memory,nullptr);backing.memory=VK_NULL_HANDLE;backing.free.clear();physicalAllocated-=backing.size;physicalDeviceAllocated-=backing.size;}}
         buffers.erase(std::remove_if(buffers.begin(),buffers.end(),[&](const auto& item){return item.get()==current;}),buffers.end());current=nullptr;
     }
     Buffer* staging(Buffer*& current,VkDeviceSize size,VkBufferUsageFlags usage) {
@@ -144,6 +176,9 @@ public:
         VkPhysicalDeviceAccelerationStructurePropertiesKHR asProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR};asProps.pNext=&subgroup;
         VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};props.pNext=&asProps;vkGetPhysicalDeviceProperties2(physical,&props);
         alignment=asProps.minAccelerationStructureScratchOffsetAlignment;period=props.properties.limits.timestampPeriod;deviceName=props.properties.deviceName;
+        maxComputeInvocations=props.properties.limits.maxComputeWorkGroupInvocations;
+        maxComputeSizeX=props.properties.limits.maxComputeWorkGroupSize[0];
+        maxComputeSharedMemory=props.properties.limits.maxComputeSharedMemorySize;
         if(subgroup.subgroupSize!=32||!(subgroup.supportedOperations&VK_SUBGROUP_FEATURE_ARITHMETIC_BIT))throw std::runtime_error("32-lane arithmetic subgroups required");
         if(integerDot&&!dotProps.integerDotProduct4x8BitPackedSignedAccelerated)throw std::runtime_error("Hardware packed signed integer dot product required");
         VkPhysicalDeviceBufferDeviceAddressFeatures address{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};

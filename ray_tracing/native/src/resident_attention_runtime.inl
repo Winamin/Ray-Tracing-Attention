@@ -119,8 +119,28 @@
     }
     void resizeAttentionClasses(uint32_t required,bool preserve=true){
         if(attentionBackend!=4u)return;
-        uint32_t next=required?std::min(capacity,(required+31u)/32u*32u):0u;
+        if(required>capacity)throw std::runtime_error("Attention class directory exceeds history capacity");
+        // Directory extent is reserved space, independent of the live prefix.
+        // Grow geometrically and keep it across shorter requests. Actual-D
+        // payload allocation remains controlled by the GPU arena cursor.
+        uint32_t next=attentionClassSlots;
+        if(required>next){
+            uint64_t grown=std::max<uint64_t>(required,uint64_t(next)+std::max(32u,next/2u));
+            next=uint32_t(std::min<uint64_t>(capacity,(grown+31u)/32u*32u));
+        }
         if(next==attentionClassSlots&&preserve)return;
+        if(next==attentionClassSlots&&next){
+            auto c=e.command();begin(c);
+            for(auto& layer:attentionClassLayers){
+                vkCmdFillBuffer(c,layer.buffer->handle,0u,attentionClassDirectoryWords(next)*4u,0u);
+                sync(c);uint32_t header[3]{next,0u,layer.arenaWords};
+                vkCmdUpdateBuffer(c,layer.buffer->handle,0u,sizeof(header),header);
+                layer.usedWords=layer.reservedWords=0u;layer.freeBlocks.clear();layer.mirrorDirty=false;
+                std::fill(layer.directory.begin(),layer.directory.end(),0u);
+                std::fill(layer.allocations.begin(),layer.allocations.end(),AttentionClassAllocation{});
+            }
+            sync(c);check(vkEndCommandBuffer(c),"end attention class directory reset");e.submit(c);vkFreeCommandBuffers(e.device,e.pool,1u,&c);return;
+        }
         if(preserve)refreshAttentionClassMirrors();
         if(!next){
             for(auto& layer:attentionClassLayers){e.release(layer.buffer);layer={};}
@@ -275,10 +295,17 @@
         if(record)*record={offset,count};return true;
     }
     bool sameLiveAttentionClasses(const std::shared_ptr<SharedHistoryCache::Entry>& entry){
-        if(attentionBackend!=4u||!entry||!entry->addressReady||!gpuFieldReady||attentionDiagnosticDirty)return false;
+        if(attentionBackend!=4u||!entry||!gpuFieldReady||attentionDiagnosticDirty)return false;
         uint32_t tokens=uint32_t(entry->input.size());
-        if(!tokens||tokens>capacity||gpuFieldPosition!=tokens||gpuFieldAddress.key!=entry->address.key||
-           gpuFieldAddress.chart!=entry->address.chart)return false;
+        if(!tokens||tokens>gpuFieldPosition||gpuFieldPosition>capacity||
+           gpuFieldPosition>cachedPrefix.size()+currentGenerated.size())return false;
+        // Classes depend only on their stored K/V. A shorter identical prefix
+        // can reuse the live directory after decode, provided no ring slot has
+        // been overwritten. This does not reuse a changed query's scores.
+        for(uint32_t i=0u;i<tokens;i++){
+            uint32_t live=i<cachedPrefix.size()?cachedPrefix[i]:currentGenerated[i-cachedPrefix.size()];
+            if(entry->input[i]!=live)return false;
+        }
         refreshAttentionClassMirrors();
         for(uint32_t full=0u;full<MODEL_FULL;full++){
             uint32_t layer=MODEL_FULL_LAYERS[full];
@@ -311,12 +338,9 @@
         if(attentionBackend!=4u||!sharedHistory||block.attentionReady||!matchingPackets||!block.ready||
            !MODEL_FULL||!block.count||block.count>SharedHistoryCache::blockTokens||
            block.first%SharedHistoryCache::blockTokens||uint64_t(block.first)+block.count>capacity)return;
-        uint64_t used=sharedHistory->blockBytes(),snapshots=sharedHistory->snapshotBytes();
-        if(used>sharedHistory->budget||snapshots>sharedHistory->budget-used)return;
         for(uint32_t full=0u;full<MODEL_FULL;full++)
             if(!pendingAttentionClassRanges[MODEL_FULL_LAYERS[full]].empty())return;
         refreshAttentionClassMirrors(c);
-        uint64_t available=sharedHistory->budget-used-snapshots,requested=0u;
         std::vector<SharedHistoryCache::Block::AttentionLayer> saved(MODEL_FULL);
         std::vector<std::vector<VkBufferCopy>> copies(MODEL_FULL);
         std::vector<uint64_t> layerBytes(MODEL_FULL);
@@ -336,12 +360,9 @@
                 else regions.push_back(copy);
                 words+=size;
             }
-            layerBytes[full]=words*4u;if(!layerBytes[full]||layerBytes[full]>available-requested)return;
-            requested+=layerBytes[full];
+            layerBytes[full]=words*4u;if(!layerBytes[full])return;
         }
-        // Standalone transfer buffers make the optional cache's physical byte
-        // charge explicit instead of opening a new shared memory pool. Publish
-        // all layers together only after allocation rounding also fits budget.
+        // Publish all layers together after their transfer buffers are ready.
         VkPhysicalDeviceProperties properties{};vkGetPhysicalDeviceProperties(e.physical,&properties);
         uint64_t allocations=0u;
         for(const auto& buffer:e.buffers)allocations+=buffer->ownsMemory&&buffer->memory!=VK_NULL_HANDLE;
@@ -350,15 +371,11 @@
         // plus staging; optional cache exhaustion must only create a gap.
         uint64_t limit=properties.limits.maxMemoryAllocationCount,reserve=MODEL_FULL+8u;
         if(allocations>limit||reserve>limit-allocations||MODEL_FULL>limit-allocations-reserve)return;
-        uint64_t allocated=0u;bool fits=true;
         try{
             for(uint32_t full=0u;full<MODEL_FULL;full++){
                 saved[full].payload=e.buffer(layerBytes[full],VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT,false,true);
-                uint64_t bytes=saved[full].payload->allocationSize;
-                if(bytes>available-allocated){fits=false;break;}allocated+=bytes;
             }
         }catch(...){for(auto& layer:saved)e.release(layer.payload);throw;}
-        if(!fits){for(auto& layer:saved)e.release(layer.payload);return;}
         sync(c);
         for(uint32_t full=0u;full<MODEL_FULL;full++)
             copyAttentionClassRegions(c,attentionClassLayers[full].buffer,saved[full].payload,uint32_t(copies[full].size()),copies[full].data());
@@ -522,7 +539,8 @@
            (subgroup.supportedOperations&required)!=required||limits.maxComputeWorkGroupInvocations<producerWidth||
            limits.maxComputeWorkGroupSize[0]<producerWidth||limits.maxComputeSharedMemorySize<sharedBytes)
             throw std::runtime_error("Grouped attention requires 32-lane compute subgroups with basic, vote, ballot, arithmetic and shuffle operations and sufficient workgroup/shared memory limits");
-        for(uint32_t slot=0u;slot<(attentionLocalSplit?5u:3u);slot++){
+        for(uint32_t slot=0u;slot<(attentionLocalSplit?12u:3u);slot++){
+            if(attentionLocalSplit&&slot==8u)continue;
             const char* module=tc?"resident_attention_receipt_tc":local?"resident_attention_local":attentionBackend==2u?"resident_attention_receipt":"resident_attention_dense";
             uint32_t operation=slot,width=slot==0u?producerWidth:128u;
             if(attentionLocalSplit){
@@ -530,6 +548,12 @@
                 else if(slot==1u)module="resident_attention_local_value";
                 else if(slot==3u){module="resident_attention_local_trace";width=32u;}
                 else if(slot==4u){module="resident_attention_local_key_fallback";operation=0u;width=256u;}
+                else if(slot==5u){module="resident_attention_local_normalize";width=32u;}
+                else if(slot==6u)module="resident_attention_local_value_chunks";
+                else if(slot==7u){module="resident_attention_local_value_merge";width=32u;}
+                else if(slot==9u){module="resident_attention_local_block_max";width=32u;}
+                else if(slot==10u){module="resident_attention_local_block_weights";width=32u;}
+                else if(slot==11u){module="resident_attention_local_reference";width=32u;}
             }
             attentionReceiptPipelines[slot]=e.pipeline(module,layout,operation,attentionBlock,0xffffffffu,wordTile,width,featureTile,0xffffffffu,local?uint32_t(attentionVMemberDistribution):0xffffffffu,0xffffffffu,0xffffffffu,tc?1u:0xffffffffu);
         }
@@ -538,6 +562,10 @@
         ensureAttentionPipelines();
         AttentionReceiptLayout receipt{attentionBlock,(attentionBackend==2u||attentionBackend==5u),attentionBackend==4u};
         uint64_t bytes=receipt.records(rows,position,capacity,origin)*receipt.stride()*4u;
+        // Single-row decode adds only its 64-term V sums. Multi-row prefill
+        // already has sufficient parallel work and keeps its existing layout.
+        if(attentionLocalSplit&&rows==1u)
+            bytes+=receipt.records(rows,position,capacity,origin)*(attentionBlock/64u)*RT_ATTENTION_HEAD_DIM*4u;
         if(bytes<=attentionReceipts->size)return;
         VkPhysicalDeviceProperties properties{};vkGetPhysicalDeviceProperties(e.physical,&properties);
         if(bytes>properties.limits.maxStorageBufferRange||bytes>UINT32_MAX)
@@ -591,6 +619,28 @@
         uint32_t finalPosition=cfg.mode==0u?cfg.rows-1u:cfg.mode==1u?cfg.position:cfg.position+cfg.rows-1u;
         if(attentionBackend!=4u&&AttentionReceiptLayout{attentionBlock}.groups(finalPosition,capacity)==1u)return;
         cfg.index=0u;cfg.checkpoint=0u;
+        if(attentionLocalSplit&&cfg.rows==1u){
+            uint32_t groups=AttentionReceiptLayout{attentionBlock}.groups(finalPosition,capacity);
+            // Parallel exp wins on longer history; retain the original single
+            // dispatch below the threshold and an explicit A/B override.
+            uint32_t visible=std::min(finalPosition+1u,capacity);
+            bool parallelNormalize=attentionLocalParallelNormalize==1u||
+                (attentionLocalParallelNormalize==2u&&visible>=1024u);
+            if(parallelNormalize){
+                receiptDispatch(c,cfg,9u,MODEL_GQA/RT_ATTENTION_HEAD_DIM,groups);
+                receiptDispatch(c,cfg,10u,MODEL_GQA/RT_ATTENTION_HEAD_DIM,groups);
+                receiptDispatch(c,cfg,11u,MODEL_GQA/RT_ATTENTION_HEAD_DIM);
+            }else receiptDispatch(c,cfg,5u,MODEL_GQA/RT_ATTENTION_HEAD_DIM);
+            receiptDispatch(c,cfg,6u,MODEL_GQA/RT_ATTENTION_HEAD_DIM,groups*(attentionBlock/64u));
+            receiptDispatch(c,cfg,7u,(MODEL_GQA/RT_ATTENTION_HEAD_DIM)*(RT_ATTENTION_HEAD_DIM/32u));
+            // Every value workgroup has completed behind receiptDispatch's
+            // storage barrier. Publish only the optional strict aggregate;
+            // fresh Q and every miss still executed the original full value.
+            if(pathAggregatePolicy&&pathScorePages&&!pathScoreExhausted&&cfg.mode==1u&&(cfg.debug&(65536u|131072u))==0u&&!attentionStatsEnabled){
+                cfg.stage=11u;launch(c,ray,cfg,1u);
+            }
+            attentionMergeDispatches+=parallelNormalize?5u:3u;return;
+        }
         receiptDispatch(c,cfg,1u,attentionBackend==4u?MODEL_GQA/RT_ATTENTION_HEAD_DIM:RT_ATTENTION_HEADS,cfg.rows);attentionMergeDispatches++;
     }
     void attentionCheck(uint32_t rows,uint32_t layer){

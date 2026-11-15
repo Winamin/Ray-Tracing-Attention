@@ -4,27 +4,31 @@
 // Input identity is chained content; decode identity remains OpticalPathKey.
 class SharedHistoryCache {
 public:
-    static constexpr uint32_t limit=64u,blockTokens=16u;
+    static constexpr uint32_t initialSlots=64u,blockTokens=16u;
     using Key=std::array<uint32_t,8>;
     struct Block {
+        struct Geometry {
+            ShapeMesh scene;bool ready=false,sharedLayers;
+            Geometry(Engine& e,bool shared):scene(e,shared?1u:std::max(1u,MODEL_FULL),96u,1u),sharedLayers(shared){}
+            uint32_t layer(uint32_t index)const{return sharedLayers?0u:index;}
+        };
         struct AttentionLayer {
             Buffer* payload{};
             // One [relative payload word offset, representative count] per
             // token/K-or-V/KV-head, in the existing compact directory order.
             std::vector<std::array<uint32_t,2>> directory;
         };
-        Engine& e;uint32_t first,count;bool ready=false;std::unique_ptr<ShapeMesh> scene;Buffer *packets{},*marks{};
+        Engine& e;uint32_t first,count;bool ready=false;std::shared_ptr<Geometry> geometry;Buffer *packets{},*marks{};
         bool attentionReady=false;uint32_t attentionDomains{},attentionHeadDim{},attentionKVWidth{},attentionPacketBytes{};
         std::vector<uint32_t> attentionFullLayers;
         std::vector<AttentionLayer> attentionLayers;
-        Block(Engine& engine,uint32_t begin,uint32_t n):e(engine),first(begin),count(n) {
-            scene=std::make_unique<ShapeMesh>(e,std::max(1u,MODEL_FULL),96u,1u);
+        Block(Engine& engine,uint32_t begin,uint32_t n,std::shared_ptr<Geometry> shared={}):e(engine),first(begin),count(n),geometry(shared?std::move(shared):std::make_shared<Geometry>(e,false)) {
             auto usage=VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT;
             packets=e.buffer(size_t(std::max(1u,MODEL_FULL))*n*HISTORY_BYTES,usage);
             marks=e.buffer(size_t(std::max(1u,MODEL_FULL))*n*8u,usage);
         }
         uint64_t attentionBytes()const{uint64_t bytes=0u;for(const auto& layer:attentionLayers)if(layer.payload)bytes+=layer.payload->allocationSize;return bytes;}
-        uint64_t bytes()const{return packets->size+marks->size+scene->sceneBytes()+attentionBytes();}
+        uint64_t bytes()const{return packets->size+marks->size+attentionBytes();}
         ~Block(){for(auto& layer:attentionLayers)e.release(layer.payload);e.release(packets);e.release(marks);}
     };
     struct Entry {
@@ -33,17 +37,14 @@ public:
         Entry(Engine& engine):e(engine){}
         ~Entry(){for(auto& item:snapshot.items)e.release(item.saved);}
     };
-    Engine& e;ShapeMesh directory;Buffer *nodes{},*queries{},*results{},*readback{};
+    Engine& e;std::unique_ptr<ShapeMesh> directory;uint32_t directorySlots{};
+    Buffer *nodes{},*queries{},*results{},*readback{};
     VkDescriptorSetLayout setLayout{};VkPipelineLayout layout{};VkDescriptorPool pool{};VkDescriptorSet set{};VkPipeline pipeline{};
-    std::array<std::shared_ptr<Entry>,limit> entries{};
+    std::vector<std::shared_ptr<Entry>> entries;
     std::map<Key,std::weak_ptr<Block>> blocks;
-    uint64_t clock{},evictions{},budget=512ull*1024u*1024u,lookupRays{};double lookupMs{};uint32_t entryLimit=limit;
-    SharedHistoryCache(Engine& engine):e(engine),directory(e,limit/16u,96u,1u) {
-        if(auto* value=std::getenv("RT_HISTORY_CACHE_MIB"))budget=std::max(64ull,std::stoull(value))*1024ull*1024ull;
-        if(auto* value=std::getenv("RT_HISTORY_CACHE_ENTRIES"))entryLimit=std::max(1u,std::min(limit,uint32_t(std::stoul(value))));
-        auto usage=VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT|VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-        nodes=e.buffer(limit*48u,usage);queries=e.buffer(limit*48u,usage);results=e.buffer(limit*4u,usage);
-        readback=e.buffer(limit*4u,VK_BUFFER_USAGE_TRANSFER_DST_BIT,true);
+    std::map<uint64_t,std::weak_ptr<Block::Geometry>> geometries;
+    uint64_t clock{},evictions{},lookupRays{};double lookupMs{};
+    SharedHistoryCache(Engine& engine):e(engine) {
         VkDescriptorSetLayoutBinding bindings[4]{};
         for(uint32_t i=0;i<4u;i++)bindings[i]={i,i?VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,1u,VK_SHADER_STAGE_COMPUTE_BIT,nullptr};
         VkDescriptorSetLayoutCreateInfo sl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};sl.bindingCount=4;sl.pBindings=bindings;
@@ -56,11 +57,27 @@ public:
         check(vkCreateDescriptorPool(e.device,&dp,nullptr,&pool),"shared history pool");
         VkDescriptorSetAllocateInfo a{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};a.descriptorPool=pool;a.descriptorSetCount=1;a.pSetLayouts=&setLayout;
         check(vkAllocateDescriptorSets(e.device,&a,&set),"shared history set");
-        VkWriteDescriptorSetAccelerationStructureKHR as{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};as.accelerationStructureCount=1;as.pAccelerationStructures=directory.tops.data();
+        pipeline=e.pipeline("history_cache",layout);publish();
+    }
+    void growDirectory() {
+        if(directory&&entries.size()<=directorySlots)return;
+        uint32_t slots=directorySlots?directorySlots:initialSlots;
+        while(slots<entries.size()){
+            if(slots>0x7fffffffu)throw std::runtime_error("History directory exceeds native address range");
+            slots*=2u;
+        }
+        // Publication runs after all boundary captures have completed. Only
+        // the lookup geometry grows; saved states and shared blocks stay put.
+        directory=std::make_unique<ShapeMesh>(e,slots/blockTokens,96u,1u);
+        e.release(nodes);e.release(queries);e.release(results);e.release(readback);
+        auto usage=VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT|VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        nodes=e.buffer(size_t(slots)*48u,usage);queries=e.buffer(size_t(slots)*48u,usage);results=e.buffer(size_t(slots)*4u,usage);
+        readback=e.buffer(size_t(slots)*4u,VK_BUFFER_USAGE_TRANSFER_DST_BIT,true);directorySlots=slots;
+        VkWriteDescriptorSetAccelerationStructureKHR as{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};as.accelerationStructureCount=1;as.pAccelerationStructures=directory->tops.data();
         Buffer* buffers[3]{nodes,queries,results};VkDescriptorBufferInfo infos[3]{};VkWriteDescriptorSet writes[4]{};
-        for(uint32_t i=0;i<4;i++){auto& w=writes[i];w={VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};w.dstSet=set;w.dstBinding=i;w.descriptorCount=1;w.descriptorType=bindings[i].descriptorType;
+        for(uint32_t i=0;i<4;i++){auto& w=writes[i];w={VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};w.dstSet=set;w.dstBinding=i;w.descriptorCount=1;w.descriptorType=i?VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
             if(!i)w.pNext=&as;else{infos[i-1]={buffers[i-1]->handle,0,buffers[i-1]->size};w.pBufferInfo=&infos[i-1];}}
-        vkUpdateDescriptorSets(e.device,4,writes,0,nullptr);pipeline=e.pipeline("history_cache",layout);publish();
+        vkUpdateDescriptorSets(e.device,4,writes,0,nullptr);
     }
     static std::vector<Key> identities(const std::vector<uint32_t>& input,uint32_t epoch) {
         Key key{};for(uint32_t k=0;k<8;k++)key[k]=0x9e3779b9u*(k+1u)^epoch;
@@ -86,35 +103,40 @@ public:
         Engine::barrier(c,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,VK_ACCESS_TRANSFER_WRITE_BIT,VK_ACCESS_HOST_READ_BIT);
         check(vkEndCommandBuffer(c),"end shared history lookup");e.submit(c);vkFreeCommandBuffers(e.device,e.pool,1,&c);
         std::shared_ptr<Entry> best;auto* hits=static_cast<uint32_t*>(readback->map);
-        for(uint32_t i=0;i<count;i++)if(hits[i]<limit){auto entry=entries[hits[i]];
+        for(uint32_t i=0;i<count;i++)if(hits[i]<entries.size()){auto entry=entries[hits[i]];
             if(entry&&entry->key==keys[entry->input.size()]&&std::equal(entry->input.begin(),entry->input.end(),input.begin())&&(!best||entry->input.size()>best->input.size()))best=entry;}
         if(best)best->touched=++clock;lookupRays=count;lookupMs=ms(start);return best;
     }
     uint64_t snapshotBytes()const {uint64_t n=0;for(auto& entry:entries)if(entry)n+=entry->snapshot.bytes;return n;}
-    uint64_t blockBytes()const {uint64_t n=0;for(auto& pair:blocks)if(auto b=pair.second.lock())n+=b->bytes();return n;}
-    uint32_t size()const {return uint32_t(std::count_if(entries.begin(),entries.end(),[](auto& x){return bool(x);}));}
-    uint32_t maxEntries(uint64_t snapshotSize)const {uint64_t historyBytes=blockBytes();return uint32_t(std::max(1ull,std::min(uint64_t(entryLimit),(budget>historyBytes?budget-historyBytes:0u)/std::max(1ull,snapshotSize))));}
-    static uint32_t priority(uint32_t kind){return kind&20u?3u:kind&1u?2u:kind&2u?1u:0u;}
-    std::shared_ptr<Entry> reserve(const std::vector<uint32_t>& input,uint32_t count,uint32_t kind,const Key& key,uint64_t snapshotSize) {
+    std::shared_ptr<Block::Geometry> sharedGeometry(uint32_t first,uint32_t count){
+        uint64_t key=(uint64_t(first)<<32u)|count;auto& saved=geometries[key];auto geometry=saved.lock();
+        if(!geometry){geometry=std::make_shared<Block::Geometry>(e,true);saved=geometry;}return geometry;
+    }
+    uint64_t blockBytes()const {
+        uint64_t n=0;std::set<const Block::Geometry*> seen;
+        for(auto& pair:blocks)if(auto b=pair.second.lock()){
+            n+=b->bytes();if(seen.insert(b->geometry.get()).second)n+=b->geometry->scene.sceneBytes();
+        }return n;
+    }
+    uint32_t size()const {return uint32_t(entries.size());}
+    std::shared_ptr<Entry> reserve(const std::vector<uint32_t>& input,uint32_t count,uint32_t kind,const Key& key) {
         for(auto& x:entries)if(x&&x->key==key&&x->input.size()==count&&std::equal(x->input.begin(),x->input.end(),input.begin())){x->kind|=kind;x->touched=++clock;return {};}
-        uint32_t maximum=maxEntries(snapshotSize);
-        // Preserve request ends and common roots ahead of optional inner/output
-        // boundaries, so a returning branch still attaches its shared history.
-        while(size()>=maximum){auto oldest=entries.end();for(auto i=entries.begin();i!=entries.end();i++)if(*i&&(oldest==entries.end()||priority((*i)->kind)<priority((*oldest)->kind)||(priority((*i)->kind)==priority((*oldest)->kind)&&(*i)->touched<(*oldest)->touched)))oldest=i;
-            if(priority((*oldest)->kind)>priority(kind))return {};
-            oldest->reset();evictions++;}
-        uint32_t slot=0;while(entries[slot])slot++;
-        auto entry=std::make_shared<Entry>(e);entry->slot=slot;entry->kind=kind;entry->key=key;entry->touched=++clock;
-        entry->input.assign(input.begin(),input.begin()+count);entries[slot]=entry;return entry;
+        auto entry=std::make_shared<Entry>(e);entry->slot=size();entry->kind=kind;entry->key=key;entry->touched=++clock;
+        entry->input.assign(input.begin(),input.begin()+count);entries.push_back(entry);return entry;
     }
     void publish() {
-        std::array<std::array<uint32_t,12>,limit> data{};std::vector<float> vertices(limit*18u,0.f);
+        growDirectory();
+        std::vector<std::array<uint32_t,12>> data(directorySlots);std::vector<float> vertices(size_t(directorySlots)*18u,0.f);
         const float corners[6][2]{{-1,-1},{-1,1},{1,1},{-1,-1},{1,1},{1,-1}};
-        for(uint32_t i=0;i<limit;i++)if(auto& entry=entries[i]){data[i]=node(entry->key,uint32_t(entry->input.size()),true);float xy[2];std::memcpy(xy,data[i].data()+8,8);
-            for(uint32_t v=0;v<6;v++)for(uint32_t axis=0;axis<2;axis++)vertices[i*18u+v*3u+axis]=xy[axis]+corners[v][axis]*.00005f;}
-        e.upload(nodes,data.data(),sizeof(data));e.upload(directory.vertices,vertices.data(),vertices.size()*4u);
-        auto c=e.command();e.begin(c);directory.build(c,directory.count,false);check(vkEndCommandBuffer(c),"end shared boundary publication");e.submit(c);vkFreeCommandBuffers(e.device,e.pool,1,&c);
+        for(uint32_t i=0;i<entries.size();i++)if(auto& entry=entries[i]){data[i]=node(entry->key,uint32_t(entry->input.size()),true);float xy[2];std::memcpy(xy,data[i].data()+8,8);
+            for(uint32_t v=0;v<6;v++)for(uint32_t axis=0;axis<2;axis++)vertices[size_t(i)*18u+v*3u+axis]=xy[axis]+corners[v][axis]*.00005f;}
+        e.upload(nodes,data.data(),data.size()*sizeof(data[0]));e.upload(directory->vertices,vertices.data(),vertices.size()*4u);
+        auto c=e.command();e.begin(c);directory->build(c,directory->count,false);check(vkEndCommandBuffer(c),"end shared boundary publication");e.submit(c);vkFreeCommandBuffers(e.device,e.pool,1,&c);
+        // Immutable block geometry has finished building before publication.
+        // Its BLAS and vertices stay shared; build scratch is reusable now.
+        for(auto& pair:blocks)if(auto b=pair.second.lock())if(b->geometry->ready)b->geometry->scene.releaseScratch();
         for(auto it=blocks.begin();it!=blocks.end();)if(it->second.expired())it=blocks.erase(it);else ++it;
+        for(auto it=geometries.begin();it!=geometries.end();)if(it->second.expired())it=geometries.erase(it);else ++it;
     }
     ~SharedHistoryCache(){entries={};blocks.clear();vkDestroyPipeline(e.device,pipeline,nullptr);vkDestroyDescriptorPool(e.device,pool,nullptr);vkDestroyPipelineLayout(e.device,layout,nullptr);vkDestroyDescriptorSetLayout(e.device,setLayout,nullptr);e.release(nodes);e.release(queries);e.release(results);e.release(readback);}
 };

@@ -4,6 +4,7 @@
 layout(std430,binding=40) buffer PathScoreCache {uint pathScoreCache[];};
 layout(std430,binding=41) coherent buffer PathScoreWork {uint pathScoreWork[];};
 const uint PATH_SCORE_MAGIC=0x52545053u,PATH_SCORE_WORK_FLAGS=16u;
+const uint PATH_AGGREGATE_META=8u,PATH_AGGREGATE_VERSION=0x10000000u;
 shared uint pathTargetMismatch,pathTargetBank,pathTargetGeneration;
 bool pathTraversalSame=false;
 uint pathTraversalStampBase=0u,pathTraversalGeneration=0u,pathTraversalHistoryBase=0u;
@@ -16,7 +17,8 @@ bool pathScoresEnabled(){
         pathScoreCache[3u]==headWidth();
 }
 uint pathQWords(){return pathScoreCache[2u]*pathScoreCache[3u];}
-uint pathBankWords(){return 4u+pathQWords()+cfg.capacity*(2u+pathScoreCache[2u]);}
+uint pathScoreBankWords(){return 4u+pathQWords()+cfg.capacity*(2u+pathScoreCache[2u]);}
+uint pathBankWords(){return pathScoreBankWords()+(pathScoreCache[7u]!=0u?PATH_AGGREGATE_META+pathQWords()+2u*headCount():0u);}
 uint pathBankBase(uint bank){return 8u+bank*pathBankWords();}
 uint pathLocalSlot(uint global){return global-parameters[blockBase()+41u]*cfg.capacity;}
 uint pathStamp(uint global){return pathScoreWork[0u]+4u+pathQWords()+2u*pathLocalSlot(global);}
@@ -27,6 +29,64 @@ bool pathTargetReady(uint head){
 }
 float readPathScore(uint head,uint global){
     return uintBitsToFloat(pathScoreCache[pathScorePlane(head)+pathLocalSlot(global)]);
+}
+
+// Optional strict local aggregate is a suffix of the existing exact-Q bank.
+// It owns neither another history cache nor another BVH. Work 11 is RT's
+// any-miss verdict, 12 the post-RT reuse verdict, 13 complete value workgroups.
+uint pathAggregateBase(){return pathScoreWork[0u]+pathScoreBankWords();}
+uint pathAggregateOutput(){return pathAggregateBase()+PATH_AGGREGATE_META;}
+uint pathAggregatePhysical(){return pathAggregateOutput()+pathQWords();}
+bool pathAggregateAllocated(){
+    return pathTargetReady(0u)&&pathScoreWork[6u]==2u&&
+        (pathScoreCache[7u]&0xf0000000u)==PATH_AGGREGATE_VERSION;
+}
+bool pathAggregateEnabled(){return pathAggregateAllocated()&&(cfg.debug&(65536u|131072u))==0u;}
+bool reusePathAggregate(){return pathAggregateEnabled()&&pathScoreWork[12u]==1u;}
+void invalidatePathAggregate(){
+    if(pathAggregateAllocated())atomicExchange(pathScoreCache[pathAggregateBase()],0u);
+}
+void savePathAggregateValue(uint channel,float normalizedSignal){
+    pathScoreCache[pathAggregateOutput()+channel]=floatBitsToUint(normalizedSignal);
+}
+float readPathAggregateValue(uint channel){
+    return uintBitsToFloat(pathScoreCache[pathAggregateOutput()+channel]);
+}
+void restorePathAggregatePhysical(uint head){
+    uint at=pathAggregatePhysical()+head*2u;
+    physical[head*2u]=uintBitsToFloat(pathScoreCache[at]);
+    physical[head*2u+1u]=uintBitsToFloat(pathScoreCache[at+1u]);
+}
+void preparePathAggregateDispatch(){
+    pathScoreWork[12u]=0u;
+    if(!pathAggregateEnabled())return;
+    uint end=absolute(0u),count=min(end+1u,cfg.capacity);
+    if(count==0u)return;
+    uint begin=end-(count-1u);
+    uint at=pathAggregateBase();
+    bool reuse=control[3]==0u&&hits[0u]==count&&pathScoreWork[3u]==1u&&pathScoreWork[11u]==0u&&
+        pathScoreCache[at]==1u&&pathScoreCache[at+1u]==pathScoreWork[1u]&&
+        pathScoreCache[at+2u]==begin&&pathScoreCache[at+3u]==end&&pathScoreCache[at+4u]==count&&
+        pathScoreCache[at+5u]==pathScoreWork[6u]&&pathScoreCache[at+6u]==pathScoreCache[7u];
+    if(reuse)pathScoreWork[12u]=1u;
+    else pathScoreCache[at]=0u;
+}
+// Native calls this single-lane publisher only after the complete local value
+// dispatch and its storage barrier. No value workgroup may publish early.
+void commitPathAggregate(){
+    if(gl_LocalInvocationID.x!=0u||!pathAggregateEnabled()||reusePathAggregate())return;
+    uint perKV=uint(RT_QUERY_WIDTH)/uint(RT_GQA_WIDTH);
+    uint expected=((headCount()+perKV-1u)/perKV)*((headWidth()+31u)/32u);
+    if(control[3]!=0u||pathScoreWork[13u]!=expected||stopped())return;
+    uint end=absolute(0u),count=min(end+1u,cfg.capacity);
+    if(hits[0u]!=count||count==0u)return;
+    uint begin=end-(count-1u);
+    uint at=pathAggregateBase(),p=pathAggregatePhysical();
+    for(uint i=0u;i<headCount()*2u;i++)pathScoreCache[p+i]=floatBitsToUint(physical[i]);
+    pathScoreCache[at+1u]=pathScoreWork[1u];pathScoreCache[at+2u]=begin;
+    pathScoreCache[at+3u]=end;pathScoreCache[at+4u]=count;
+    pathScoreCache[at+5u]=pathScoreWork[6u];pathScoreCache[at+6u]=pathScoreCache[7u];
+    memoryBarrierBuffer();pathScoreCache[at]=1u;
 }
 
 // Cache the target namespace once per ray/group; candidate visits use only
@@ -45,7 +105,8 @@ void beginPathScoreTraversal(uint row){
 // have no Q payload to inspect, and a new target never inspects slot history.
 void preparePathTarget(uint head,uint lane){
     if(head!=0u)return;
-    if(lane==0u)pathScoreWork[2u]=0u;
+    if(uint(pathScoreWork.length())<14u)return;
+    if(lane==0u){pathScoreWork[2u]=0u;pathScoreWork[11u]=0u;pathScoreWork[12u]=0u;pathScoreWork[13u]=0u;}
     if(!pathScoresEnabled())return;
     uint width=pathQWords(),pages=pathScoreCache[1u];
     if(lane==0u){
@@ -83,7 +144,10 @@ void preparePathTarget(uint head,uint lane){
         uint base=pathBankBase(pathTargetBank);
         pathTargetGeneration=pathScoreCache[base]+(fresh?1u:0u);
         pathTargetMismatch=0u;
-        if(fresh)pathScoreCache[base+1u]=0u;
+        if(fresh){
+            pathScoreCache[base+1u]=0u;
+            if(pathScoreCache[7u]!=0u)pathScoreCache[base+pathScoreBankWords()]=0u;
+        }
     }
     barrier();
     uint base=pathBankBase(pathTargetBank);
@@ -153,7 +217,8 @@ void publishPathScoreStamp(uint global){
 // The compact miss queue is produced by RT, then an existing dispatch barrier
 // publishes it before this single-lane indirect-command preparation.
 void preparePathScoreDispatch(){
-    if(gl_LocalInvocationID.x!=0u||uint(pathScoreWork.length())<11u)return;
+    if(gl_LocalInvocationID.x!=0u||uint(pathScoreWork.length())<14u)return;
+    preparePathAggregateDispatch();
     uint visible=min(absolute(0u)+1u,cfg.capacity);
     uint perKV=uint(RT_QUERY_WIDTH)/uint(RT_GQA_WIDTH);
     uint kvHeads=(headCount()+perKV-1u)/perKV;

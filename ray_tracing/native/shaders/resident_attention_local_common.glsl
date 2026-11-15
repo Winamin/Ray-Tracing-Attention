@@ -9,8 +9,8 @@ void statisticAdd(uint metric,uint value){
     uint at=11u+cfg.capacity+65536u+parameters[blockBase()+41u]*32u+metric*2u;
     uint old=atomicAdd(control[at],value);if(old+value<old)atomicAdd(control[at+1u],1u);
 }
-float finalHeadSignal(uint row,uint channel,float signal,float reference){
-    precise float result=signal/max(reference,1e-30);
+float applyHeadGate(uint row,uint channel,float normalizedSignal){
+    precise float result=normalizedSignal;
     if(RT_ATTENTION_GATE==1){
         float gate=feedForward[row*W+channel];
         if(!finiteValue(gate)){attentionFailure();return 0.0;}
@@ -18,6 +18,10 @@ float finalHeadSignal(uint row,uint channel,float signal,float reference){
     }
     if(!finiteValue(result)){attentionFailure();return 0.0;}
     return result;
+}
+float finalHeadSignal(uint row,uint channel,float signal,float reference){
+    precise float result=signal/max(reference,1e-30);
+    return applyHeadGate(row,channel,result);
 }
 uint availablePositions(uint row){
     uint time=absolute(row);

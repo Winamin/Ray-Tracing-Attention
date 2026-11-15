@@ -1,0 +1,52 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#include "resident_attention_local_value_split.glsl"
+
+void main(){
+    if(!splitValid(32u))return;
+    uint axisGroups=DH/32u,kv=gl_WorkGroupID.x/axisGroups;
+    uint axis=(gl_WorkGroupID.x%axisGroups)*32u+gl_LocalInvocationID.x,headBase=kv*Q_PER_KV;
+    if(headBase>=headCount())return;
+    bool diagnostics=splitDiagnostics();
+    uint available=availablePositions(0u),groups=groupCount(0u);
+    bvec4 enabled=lessThan(uvec4(headBase)+uvec4(0u,1u,2u,3u),uvec4(headCount()));
+    precise vec4 signal=vec4(0.0),correction=vec4(0.0);
+    if(gl_LocalInvocationID.x==0u)groupFailure=0u;
+    barrier();
+    bool aggregate=localAggregatePolicyMatches();
+    if(aggregate&&reusePathAggregate()){
+        for(uint h=0u;h<4u;h++)if(enabled[h]){
+            uint head=headBase+h,channel=head*DH+axis;
+            if(axis==0u)restorePathAggregatePhysical(head);
+            detector[channel]=applyHeadGate(0u,channel,readPathAggregateValue(channel));
+        }
+        return;
+    }
+    for(uint group=0u;group<groups;group++){
+        uint count=min(BLOCK,available-group*BLOCK);
+        for(uint chunk=0u;chunk<(count+CHUNK-1u)/CHUNK;chunk++){
+            vec4 value=vec4(0.0);
+            for(uint h=0u;h<4u;h++)if(enabled[h])value[h]=uintBitsToFloat(attentionReceipts[splitChunkAddress(group,chunk,headBase+h,axis)]);
+            accurateAdd4(signal,correction,value);
+        }
+        if(axis==0u)for(uint h=0u;h<4u;h++)if(enabled[h]){
+            uint record=recordIndex(0u,group,headBase+h)*RECORD_WORDS;
+            attentionReceipts[record+7u]=15u;
+            if(diagnostics){attentionReceipts[record+6u]=count;statisticAdd(7u,count);statisticAdd(8u,count);}
+        }
+    }
+    for(uint h=0u;h<4u;h++)if(enabled[h]){
+        uint channel=(headBase+h)*DH+axis;
+        precise float normalizedSignal=(signal[h]-correction[h])/max(physical[(headBase+h)*2u+1u],1e-30);
+        if(aggregate)savePathAggregateValue(channel,normalizedSignal);
+        detector[channel]=applyHeadGate(0u,channel,normalizedSignal);
+        if(diagnostics&&axis==0u){statisticAdd(4u,DH);statisticAdd(5u,DH);statisticAdd(15u,DH);statisticAdd(11u,DH);}
+    }
+    if(aggregate){
+        memoryBarrierBuffer();barrier();
+        if(gl_LocalInvocationID.x==0u&&groupFailure==0u)atomicAdd(pathScoreWork[13u],1u);
+    }
+}

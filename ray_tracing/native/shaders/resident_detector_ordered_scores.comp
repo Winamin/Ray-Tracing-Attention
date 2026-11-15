@@ -20,6 +20,7 @@ const uint Q_PER_KV=RT_QUERY_WIDTH/RT_GQA_WIDTH,MAX_DH=256u;
 const uint RECORD_WORDS=4u+BLOCK,DETECTOR_ERROR=65536u;
 shared vec4 queryTile[MAX_DH];
 shared uint groupFailure;
+#include "resident_detector_key_common.glsl"
 
 bool orderedFinite(float value){return !isnan(value)&&!isinf(value);}
 void orderedFailure(){atomicOr(groupFailure,1u);atomicOr(control[3],DETECTOR_ERROR);}
@@ -84,7 +85,17 @@ void main(){
             uint position=sparse?pathMissIndex(queueFirst+j):first+j;
             if(position>=count){orderedFailure();continue;}
             uint slot=hits[position+1u];vec4 total=vec4(0.0),score=vec4(0.0);
-            for(uint axis=c;axis<dh;axis+=32u){
+            if(dh==256u){
+                vec4 even,odd;detectorKeyOctet(slot,firstHead*dh,c,even,odd);
+                for(uint part=0u;part<4u;part++){
+                    if(!orderedFinite(even[part])||!orderedFinite(odd[part]))orderedFailure();
+                    uint axis=c+part*64u;
+                    for(uint h=0u;h<4u;h++)if(enabled[h]){
+                        total[h]+=queryTile[axis][h]*even[part];
+                        total[h]+=queryTile[axis+32u][h]*odd[part];
+                    }
+                }
+            }else for(uint axis=c;axis<dh;axis+=32u){
                 float k=pathCoordinate(slot,firstHead*dh+axis,false);
                 if(!orderedFinite(k))orderedFailure();
                 for(uint h=0u;h<4u;h++)if(enabled[h])total[h]+=queryTile[axis][h]*k;

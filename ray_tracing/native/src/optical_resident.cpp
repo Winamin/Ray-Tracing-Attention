@@ -84,10 +84,11 @@ class Resident {
 public:
     Engine& e;uint32_t depth{},blocks{},middle{},quantization{},step{},capacity{},absolutePosition{},workRows{},matrixBatchRows{};bool initialized=false;
     uint32_t captureRows{};
-    uint32_t attentionBackend=0u,attentionBlock=128u;bool rtTransmissionMLP=false,attentionDiagnosticDirty=false,attentionStatsEnabled=false,attentionVMemberDistribution=false,attentionLocalSplit=false;Buffer* attentionReceipts{};VkPipeline attentionReceiptPipelines[5]{};
+    uint32_t attentionBackend=0u,attentionBlock=128u;bool rtTransmissionMLP=false,attentionDiagnosticDirty=false,attentionStatsEnabled=false,attentionVMemberDistribution=false,attentionLocalSplit=false;Buffer* attentionReceipts{};VkPipeline attentionReceiptPipelines[12]{};
+    uint32_t attentionLocalParallelNormalize=2u;
     bool detectorOrdered=false;static constexpr uint32_t detectorBlock=256u,detectorThreshold=512u;VkPipeline detectorPipelines[3]{};
     Buffer *pathScoreDummy{},*pathScoreWork{};std::vector<Buffer*> pathScoreLayers;
-    uint32_t pathScorePages{};uint64_t pathScoreSource=1u;bool pathScoreExhausted=false;
+    uint32_t pathScorePages{},pathAggregatePolicy{};uint64_t pathScoreSource=1u;bool pathScoreExhausted=false;
     static constexpr uint32_t pathScoreMagic=0x52545053u,pathScoreSourceLimit=0x3fffffffu;
     std::unique_ptr<AttentionClassGeometry> attentionClassScene;
     Buffer *attentionClassDummy{},*attentionClassScratch{},*attentionClassCounts{};
@@ -124,6 +125,12 @@ public:
         std::string mlpBackend=std::getenv("RT_MLP_BACKEND")?std::getenv("RT_MLP_BACKEND"):"standard";
         if(mlpBackend!="standard"&&mlpBackend!="rt_transmission")throw std::runtime_error("MLP backend must be standard or rt_transmission");
         rtTransmissionMLP=mlpBackend=="rt_transmission";
+        if(const char* value=std::getenv("RT_LOCAL_PARALLEL_NORMALIZE")){
+            std::string mode(value);
+            if(mode=="0")attentionLocalParallelNormalize=0u;
+            else if(mode=="1")attentionLocalParallelNormalize=1u;
+            else if(mode!="auto")throw std::runtime_error("Local parallel normalization requires 0, 1 or auto");
+        }
         attentionStatsEnabled=std::getenv("RT_ATTENTION_STATS")&&std::string(std::getenv("RT_ATTENTION_STATS"))=="1";
         attentionVMemberDistribution=std::getenv("RT_ATTENTION_V_MEMBERS")&&std::string(std::getenv("RT_ATTENTION_V_MEMBERS"))=="1";
         if(const char* block=std::getenv("RT_ATTENTION_BLOCK"))attentionBlock=uint32_t(std::stoul(block));
@@ -153,6 +160,7 @@ public:
         attentionClassScratch=e.buffer(attentionBackend==4u?uint64_t(workRows)*classDomains*classTempDomainWords*4u:4u,usage,true);
         attentionClassCounts=e.buffer(4u,VK_BUFFER_USAGE_TRANSFER_DST_BIT,true);
         attentionClassLayers.resize(std::max(1u,MODEL_FULL));
+        allocatePrefillDecodedHistory();
         readback=e.buffer(4*1024*1024,VK_BUFFER_USAGE_TRANSFER_DST_BIT,true);
         if(cacheEnabled){initializeMarker(liveMarker,true);}
         VkDescriptorSetLayoutBinding bindings[46]{};uint32_t bindingCount=0;for(uint32_t i=0;i<46;i++){bindings[bindingCount++]={i,((i<5&&i!=2)||i==32||i==39||i==43)?VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,i==6||i==32?depth:i==0||i==1||i==3?4u:1u,VK_SHADER_STAGE_COMPUTE_BIT,nullptr};}
@@ -175,7 +183,12 @@ public:
         if(e.cooperativeMatrix2&&!(std::getenv("RT_PREFILL_COOPERATIVE")&&std::string(std::getenv("RT_PREFILL_COOPERATIVE"))=="0")){
             if(wideCooperative){
                 matrixPack=e.pipeline("resident_pack",layout,0u,1u,0xffffffffu,wordTile,128u,featureTile);
-                matrixAttention=e.pipeline("resident_attention",layout,0u,1u,0xffffffffu,wordTile,256u,featureTile);fastState=e.pipeline("resident_state",layout,21u,1u,0xffffffffu,wordTile,128u,featureTile);
+                matrixAttention=e.pipeline("resident_attention",layout,0u,1u,0xffffffffu,wordTile,256u,featureTile);
+                if(prefillDecodedData){
+                    prefillDecodePipeline=e.pipeline("resident_attention_prefill_decode",layout,0u,1u,0xffffffffu,wordTile,256u,featureTile);
+                    prefillScratchAttention=e.pipeline("resident_attention_prefill_scratch",layout,0u,64u,128u,wordTile,256u,featureTile);
+                    ownedCooperative.push_back(prefillDecodePipeline);ownedCooperative.push_back(prefillScratchAttention);
+                }fastState=e.pipeline("resident_state",layout,21u,1u,0xffffffffu,wordTile,128u,featureTile);
                 std::map<std::tuple<uint32_t,uint32_t,uint32_t,uint32_t,uint32_t>,VkPipeline> cache;
                 auto pipe=[&](uint32_t stage,uint32_t pass,uint32_t format,uint32_t projection=0xffffffffu,uint32_t up=0xffffffffu){auto id=std::make_tuple(stage,pass,format,projection,up);if(!cache.count(id)){auto handle=e.pipeline("resident_batch2",layout,stage,pass,projection,wordTile,256u,featureTile,1u,4u,format,up);cache[id]=handle;ownedCooperative.push_back(handle);}return cache[id];};
                 for(uint32_t l=0;l<depth;l++){uint32_t base=32u+l*64u;cooperativeOutputs.push_back(pipe(2u,1u,p[base+14u],2u));if(!rtTransmissionMLP){cooperativeGates.push_back(pipe(28u,1u,p[base+16u],0xffffffffu,p[base+20u]));cooperativeDowns.push_back(pipe(33u,1u,p[base+18u]));}cooperativeQKV.push_back({pipe(2u,1u,p[base+10u],0u),pipe(2u,1u,p[base+12u],1u),pipe(2u,1u,p[base+22u],6u),pipe(2u,1u,p[base+33u],8u)});
@@ -246,7 +259,11 @@ public:
         keyGeometry=newPaths;slots=newSlots;hits=newHits;prompt=newPrompt;control=newControl;
         // Class maps have their own compact layer stride; enlarging the history
         // address space does not allocate unused derived records.
+        // Growing the ring cannot restore an overwritten prefix. Retain valid
+        // packets, but require saved provenance before reusing a whole prefix.
+        if(gpuFieldPosition>previous)gpuFieldReady=false;
         capacity=e.capacity=next;
+        allocatePrefillDecodedHistory();
         resizePathScores();
         if(cacheEnabled){opticalPath->rebind(state,propagation,keyGeometry,control,next);replyTree->rebind(control,wordResult);}
         for(uint32_t l=0;l<depth;l++)bind(layerSets[l],false,l);bind(initialSet,true);
@@ -267,7 +284,7 @@ public:
         if(!initial&&attentionBackend==4u&&fullLayer(layer)){
             auto* candidate=attentionClassLayers[fullIndex(layer)].buffer;if(candidate)classPayload=candidate;
         }
-        Buffer* buffers[46]{nullptr,nullptr,propagation,nullptr,nullptr,parameters,matrices,basis,state,normalized,query,key,keyGeometry,initial?words->vertices:history->vertices,decoded,geometry,slots,rays,hits,paths,detector,physical,wordDecoded,scalars->vertices,wordResult,lenses->vertices,baseChart,feedForward,auxiliary,prompt,control,audit,nullptr,features?features->vertices:scalars->vertices,featureWork,featureRays,featureDown,partialDown,words->vertices,nullptr,pathPayload,pathScoreWork?pathScoreWork:pathScoreDummy,attentionReceipts,nullptr,attentionClassScratch,classPayload};VkDescriptorBufferInfo infos[46]{};VkWriteDescriptorSet writes[46]{};
+        Buffer* buffers[46]{nullptr,nullptr,propagation,nullptr,nullptr,parameters,matrices,basis,state,normalized,query,key,keyGeometry,initial?words->vertices:history->vertices,decoded,geometry,slots,rays,hits,paths,detector,physical,wordDecoded,scalars->vertices,wordResult,lenses->vertices,baseChart,feedForward,auxiliary,prompt,control,audit,nullptr,features?features->vertices:scalars->vertices,featureWork,featureRays,featureDown,partialDown,words->vertices,nullptr,pathPayload,pathScoreWork?pathScoreWork:pathScoreDummy,attentionReceipts,nullptr,prefillDecodedData?prefillDecodedData:attentionClassScratch,prefillDecodedMeta?prefillDecodedMeta:classPayload};VkDescriptorBufferInfo infos[46]{};VkWriteDescriptorSet writes[46]{};
         uint32_t writeCount=0;for(uint32_t i=0;i<46;i++){auto& w=writes[writeCount++];w={VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};w.dstSet=target;w.dstBinding=i;w.descriptorCount=i==6||i==32?depth:i==0||i==1||i==3?4:1;w.descriptorType=((i<5&&i!=2)||i==32||i==39||i==43)?VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;if((i<5&&i!=2)||i==32||i==39||i==43){as[i]={VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};as[i].accelerationStructureCount=w.descriptorCount;as[i].pAccelerationStructures=i==32?featureHandles:i==43?(attentionClassScene?attentionClassScene->tops.data():handles[0]):i==39?(mlpSurfaces?mlpSurfaces->tops.data():handles[0]):handles[i];w.pNext=&as[i];}else{infos[i]={buffers[i]->handle,0,buffers[i]->size};w.pBufferInfo=i==6?layerMatrices.data():&infos[i];}}vkUpdateDescriptorSets(e.device,writeCount,writes,0,nullptr);
     }
     static void sync(VkCommandBuffer c){Engine::barrier(c,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_ACCESS_MEMORY_WRITE_BIT,VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT);}
@@ -297,7 +314,12 @@ public:
         // Narrow heads use the subgroup detector; its reduction is reliable for
         // the 32-channel shape, while matrix projections still share weights.
         if(attentionBackend==0u&&cfg.rows>=8u&&wideCooperative&&RT_ATTENTION_HEAD_DIM>=64u&&pipelines==ray&&cfg.stage==3u){
-            bindCompute(c,matrixAttention,target?target:layerSets[cfg.layer]);vkCmdDispatch(c,x,(cfg.rows+63u)/64u,1u);sync(c);return;
+            auto selectedSet=target?target:layerSets[cfg.layer];
+            uint32_t epoch=recordPrefillDecodedHistory(c,cfg,selectedSet);
+            if(epoch)cfg.checkpoint=epoch;
+            bindCompute(c,epoch?prefillScratchAttention:matrixAttention,selectedSet);
+            vkCmdPushConstants(c,layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(cfg),&cfg);
+            vkCmdDispatch(c,x,(cfg.rows+63u)/64u,1u);sync(c);return;
         }
         if(cfg.rows>=8u&&wideCooperative&&pipelines==math&&cfg.stage==21u){vkCmdDispatch(c,4u,MODEL_STATE_HEADS,1u);sync(c);return;}
         if(cfg.rows==1u&&projection&&cfg.index==5u){
@@ -326,11 +348,20 @@ public:
     void payload(VkCommandBuffer c,ResidentConfig cfg){cfg.stage=8;launch(c,ray,cfg,1);}
     void resizePathScores(){
         for(auto* buffer:pathScoreLayers)e.release(buffer);pathScoreLayers.clear();
-        e.release(pathScoreWork);pathScoreWork=nullptr;pathScorePages=0u;
+        e.release(pathScoreWork);pathScoreWork=nullptr;pathScorePages=0u;pathAggregatePolicy=0u;
         // Per-occurrence score arithmetic is stable in standard/ordered and
         // local-class decode. Other grouped producers have different policies.
         if(!cacheEnabled||pathScoreExhausted||!MODEL_FULL||
            (attentionBackend!=0u&&attentionBackend!=1u&&attentionBackend!=4u))return;
+        // Opt-in candidate: only local decode's existing exact-Q bank gains
+        // an ungated output suffix. Version, numerical format, producer,
+        // gate, V-member distribution and block policy share its namespace.
+        if(attentionBackend==4u&&RT_ATTENTION_HEAD_DIM==256u&&MODEL_Q==4u*MODEL_GQA&&
+           std::getenv("RT_PATH_AGGREGATE_CACHE")&&std::string(std::getenv("RT_PATH_AGGREGATE_CACHE"))=="1"){
+            constexpr uint32_t numfmt=1u;
+            pathAggregatePolicy=0x10000000u|(numfmt<<24u)|(2u<<20u)|
+                (uint32_t(RT_ATTENTION_GATE==1u)<<19u)|(uint32_t(attentionVMemberDistribution)<<18u)|attentionBlock;
+        }
         uint64_t budget=128ull*1024u*1024u;
         if(auto* value=std::getenv("RT_PATH_SCORE_CACHE_MIB"))budget=std::stoull(value)*1024ull*1024ull;
         VkPhysicalDeviceProperties properties{};vkGetPhysicalDeviceProperties(e.physical,&properties);
@@ -339,6 +370,7 @@ public:
         uint64_t workBytes=(16u+2ull*capacity)*4u;
         uint64_t bankWords=4u+uint64_t(RT_ATTENTION_HEADS)*RT_ATTENTION_HEAD_DIM+
             uint64_t(capacity)*(2u+RT_ATTENTION_HEADS),layerBytes=0u;
+        if(pathAggregatePolicy)bankWords+=8u+uint64_t(RT_ATTENTION_HEADS)*(RT_ATTENTION_HEAD_DIM+2u);
         for(uint32_t pages=2u;pages;pages--){
             uint64_t bytes=(8u+pages*bankWords)*4u;
             if(bytes<=properties.limits.maxStorageBufferRange&&bytes<=UINT32_MAX&&
@@ -359,7 +391,7 @@ public:
     }
     void resetPathScores(VkCommandBuffer c){
         if(!pathScorePages)return;
-        uint32_t header[8]{capacity,pathScorePages,RT_ATTENTION_HEADS,RT_ATTENTION_HEAD_DIM,pathScoreExhausted?0u:pathScoreMagic,attentionBackend,0u,0u};
+        uint32_t header[8]{capacity,pathScorePages,RT_ATTENTION_HEADS,RT_ATTENTION_HEAD_DIM,pathScoreExhausted?0u:pathScoreMagic,attentionBackend,0u,pathAggregatePolicy};
         for(auto* buffer:pathScoreLayers){
             vkCmdFillBuffer(c,buffer->handle,0u,buffer->size,0u);sync(c);
             vkCmdUpdateBuffer(c,buffer->handle,0u,sizeof(header),header);
@@ -505,7 +537,12 @@ cfg.stage=6;launch(c,math,cfg,1,cfg.rows);
         for(uint32_t first=0;first<entry->input.size();first+=16u){
             uint32_t n=std::min(16u,uint32_t(entry->input.size())-first);auto identity=keys[first+n];
             auto block=sharedHistory->blocks[identity].lock();
-            if(!block){block=std::make_shared<SharedHistoryCache::Block>(e,first,n);sharedHistory->blocks[identity]=block;}
+            if(!block){
+                // Full-history planes depend only on absolute position, with
+                // identical vertices in every layer and conversation branch.
+                auto geometry=sparseRouting?nullptr:sharedHistory->sharedGeometry(first,n);
+                block=std::make_shared<SharedHistoryCache::Block>(e,first,n,std::move(geometry));sharedHistory->blocks[identity]=block;
+            }
             entry->blocks.push_back(block);
         }
     }
@@ -520,10 +557,12 @@ cfg.stage=6;launch(c,math,cfg,1,cfg.rows);
                     vkCmdCopyBuffer(c,keyGeometry->handle,b->packets->handle,1,&packet);
                     VkBufferCopy mark{(size_t(layer)*capacity+b->first)*8u,size_t(layer)*b->count*8u,size_t(b->count)*8u};
                     vkCmdCopyBuffer(c,slots->handle,b->marks->handle,1,&mark);
-                    VkBufferCopy shape{size_t(layer)*history->chunks*96u*12u+size_t(b->first)*72u,size_t(layer)*96u*12u,size_t(b->count)*72u};
-                    vkCmdCopyBuffer(c,history->vertices->handle,b->scene->vertices->handle,1,&shape);
+                    if(!b->geometry->ready&&(!b->geometry->sharedLayers||layer==0u)){
+                        VkBufferCopy shape{size_t(layer)*history->chunks*96u*12u+size_t(b->first)*72u,size_t(b->geometry->layer(layer))*96u*12u,size_t(b->count)*72u};
+                        vkCmdCopyBuffer(c,history->vertices->handle,b->geometry->scene.vertices->handle,1,&shape);
+                    }
                 }
-                sync(c);b->scene->build(c,b->scene->count,false);b->ready=true;
+                sync(c);if(!b->geometry->ready){auto& scene=b->geometry->scene;scene.build(c,scene.count,false);b->geometry->ready=true;}b->ready=true;
             }
             // An older immutable packet can gain its derived compact payload
             // after restoration. Only that exact restored block, or the packet
@@ -536,7 +575,7 @@ cfg.stage=6;launch(c,math,cfg,1,cfg.rows);
     void prepareAttachment(const std::shared_ptr<SharedHistoryCache::Entry>& entry){
         auto instances=history->hostInstances;
         if(entry)for(auto& b:entry->blocks)if(b->count==16u)for(uint32_t layer=0;layer<MODEL_FULL;layer++){
-            VkAccelerationStructureDeviceAddressInfoKHR address{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR};address.accelerationStructure=b->scene->leaves[layer].handle;
+            VkAccelerationStructureDeviceAddressInfoKHR address{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR};address.accelerationStructure=b->geometry->scene.leaves[b->geometry->layer(layer)].handle;
             instances[layer*history->chunks+b->first/16u].accelerationStructureReference=e.asAddress(e.device,&address);
         }
         e.upload(history->instances,instances.data(),history->instances->size);
@@ -550,8 +589,8 @@ cfg.stage=6;launch(c,math,cfg,1,cfg.rows);
             vkCmdCopyBuffer(c,b->packets->handle,keyGeometry->handle,1,&packet);
             VkBufferCopy mark{size_t(layer)*b->count*8u,(size_t(layer)*capacity+b->first)*8u,size_t(b->count)*8u};
             vkCmdCopyBuffer(c,b->marks->handle,slots->handle,1,&mark);
-            VkBufferCopy shape{size_t(layer)*96u*12u,size_t(layer)*history->chunks*96u*12u+size_t(b->first)*72u,size_t(b->count)*72u};
-            vkCmdCopyBuffer(c,b->scene->vertices->handle,history->vertices->handle,1,&shape);
+            VkBufferCopy shape{size_t(b->geometry->layer(layer))*96u*12u,size_t(layer)*history->chunks*96u*12u+size_t(b->first)*72u,size_t(b->count)*72u};
+            vkCmdCopyBuffer(c,b->geometry->scene.vertices->handle,history->vertices->handle,1,&shape);
         }
         sync(c);
         // Complete chunks attach existing BLAS references. Only the appendable
@@ -600,21 +639,16 @@ cfg.stage=6;launch(c,math,cfg,1,cfg.rows);
         // A matched boundary carries both its shared history Tree and encoded
         // optical field, so only the suffix is new computation.
         uint32_t rows=count-reused,rebuildTokens=0u;
-        uint64_t boundaryBytes=uint64_t(MODEL_D)*4u+uint64_t(MODEL_RECURRENT)*(MODEL_STATE_HEADS*128u*128u+MODEL_S*9u)*4u;
         uint32_t snapshotKind=hit?(reused==count?1u:reused==boundary?2u:3u):0u;
-        // Plan bounded storage before recording GPU commands. Entries and blocks
+        // Plan boundary storage before recording GPU commands. Entries and blocks
         // stay pinned until the command buffer has completed.
         std::map<uint32_t,std::shared_ptr<SharedHistoryCache::Entry>> pending;
-        if(useCache){uint32_t maximum=sharedHistory->maxEntries(boundaryBytes),selected=0;
-            std::set<uint32_t> wanted;
-            // A recurrent batch exposes its terminal field, not intermediate
-            // row fields. Save only actual batch ends without changing the
-            // source operator's batching or allocating a field per token.
-            for(uint32_t end=count;end>reused&&selected<maximum;){wanted.insert(end);selected++;
-                uint32_t previous=reused+((end-reused-1u)/workRows)*workRows;
-                if(previous<=reused)break;end=previous;}
-            for(auto position:wanted){uint32_t kind=position==count?17u:4u;
-                auto entry=sharedHistory->reserve(ids,position,kind,keys[position],boundaryBytes);if(entry){prepareBoundary(entry,keys);pending[position]=entry;}}
+        if(useCache&&rows){
+            // Persist request ends and generated output ends, rather than a
+            // full recurrent field for every internal compute batch. Prior
+            // conversation boundaries remain available without eviction.
+            auto entry=sharedHistory->reserve(ids,count,17u,keys[count]);
+            if(entry){prepareBoundary(entry,keys);pending[count]=entry;}
         }
         uint32_t initial[8]{0,0,1,0,stops[0],stops[1],0,0};
         if(rows)e.upload(prompt,ids.data(),count*4u);e.upload(control,initial,32);inboundBytes+=(rows?count*4u:0u)+40u;setup();
@@ -628,7 +662,7 @@ cfg.stage=6;launch(c,math,cfg,1,cfg.rows);
         bool sameLiveClasses=sameLiveAttentionClasses(hit);
         if(attentionBackend==4u){
             // Test the live prefix before a resize can discard its directory.
-            resizeAttentionClasses(count,sameLiveClasses);prepareStaticAttentionClassScene();
+            resizeAttentionClasses(count+std::min(64u,capacity-count),sameLiveClasses);prepareStaticAttentionClassScene();
         }
         prepareAttentionClassAttachment(hit,sameLiveClasses);
         if(attentionBackend>=2u&&rows){uint32_t activeRows=std::min(count,workRows);prepareAttention(activeRows,count-activeRows);}
@@ -659,7 +693,10 @@ cfg.stage=6;launch(c,math,cfg,1,cfg.rows);
         if(cacheEnabled){gpuFieldAddress=pathAddress;gpuFieldPosition=count;gpuFieldReady=true;}
         if(useCache){for(auto& entry:sharedHistory->entries)if(entry&&entry->input==ids){entry->address=pathAddress;entry->addressReady=true;entry->stops=stops;}}
 
-        if(useCache){cachedPrefix=ids;prefixReady=true;stableTokens=boundary;stableReady=true;if(!pending.empty())sharedHistory->publish();}
+        // The live K/V source also changes during diagnostic prefill, which
+        // deliberately bypasses cache admission. Keep its token identity current.
+        cachedPrefix=ids;
+        if(useCache){prefixReady=true;stableTokens=boundary;stableReady=true;if(!pending.empty())sharedHistory->publish();}
         else{prefixReady=false;stableReady=false;}
         std::vector<char> output;append(output,std::vector<double>{setupGPU,time.gpu,time.wall,ms(start),double(bool(hit)),double(reused)});
         output.insert(output.end(),static_cast<char*>(readback->map),static_cast<char*>(readback->map)+bytes);
@@ -711,10 +748,9 @@ cfg.stage=6;launch(c,math,cfg,1,cfg.rows);
             // Persist precisely the prefix whose state has been computed.
             if(ids.back()==stops[0]||ids.back()==stops[1])ids.pop_back();
             tokens=uint32_t(ids.size());auto keys=SharedHistoryCache::identities(ids,cacheEpoch);
-            uint64_t boundaryBytes=uint64_t(MODEL_D)*4u+uint64_t(MODEL_RECURRENT)*(MODEL_STATE_HEADS*128u*128u+MODEL_S*9u)*4u;
-            auto entry=sharedHistory->reserve(ids,tokens,2u,keys[tokens],boundaryBytes);
+            auto entry=sharedHistory->reserve(ids,tokens,2u,keys[tokens]);
             if(entry){prepareBoundary(entry,keys);auto c=e.command();begin(c);saveBoundary(c,entry,0u,&attachedBlocks);
-                check(vkEndCommandBuffer(c),"end output boundary capture");e.submit(c);vkFreeCommandBuffers(e.device,e.pool,1,&c);sharedHistory->publish();saved=1;}
+                check(vkEndCommandBuffer(c),"end output boundary capture");e.submit(c);vkFreeCommandBuffers(e.device,e.pool,1,&c);sharedHistory->publish();saved=1u;}
         }
         // Pending gaps belong to the attached history and are consumed by
         // classification. Finishing before decode must retain those intervals.
@@ -872,7 +908,7 @@ cfg.stage=6;launch(c,math,cfg,1,cfg.rows);
         std::vector<char> output;append(output,std::vector<uint64_t>{e.physicalAllocated,e.physicalDeviceAllocated,wordSceneBytes,words->vertices->size,uint64_t(wordTiles)*wordBlocks,wordTile,featureTile,replyTree?replyTree->sceneBytes:0u,liveMarker.bytes+(sharedHistory?sharedHistory->snapshotBytes():0u),parameters->size+matrices->size+basis->size,featureDown->size,deviceBytes,uint64_t(std::count_if(e.memoryPools.begin(),e.memoryPools.end(),[](const auto& p){return p.memory!=VK_NULL_HANDLE;})),keyGeometry->size,decoded->size,propagation->size,audit->size,partialDown->size,
             e.uploadStaging?e.uploadStaging->size:0u,readback->size,history->sceneBytes(),history->count,uint64_t(history->tops.size()),
             words->scratchBytes()+lenses->scratchBytes()+scalars->scratchBytes()+(mlpSurfaces?mlpSurfaces->scratchBytes():0u)+(features?features->scratchBytes():0u),
-            hits->size,featureWork->size,workRows,uint64_t(detector==key),geometry->size+paths->size+baseChart->size,0u,sharedHistory?sharedHistory->snapshotBytes():0u,sharedHistory?sharedHistory->blockBytes():0u,sharedHistory?sharedHistory->directory.sceneBytes():0u,sharedHistory?sharedHistory->size():0u,sharedHistory?sharedHistory->evictions:0u,mlpSurfaces?mlpSurfaces->sceneBytes():0u,mlpSurfaces?mlpSurfaces->count:0u,attentionBackend,attentionBlock,attentionReceipts->size,attentionProducerDispatches,attentionMergeDispatches,attentionPlannedRays,attentionCoveredTerms,attentionReportedRecords,attentionClassRays,attentionClassBuilds,attentionClassBytes(),attentionClassScene?attentionClassScene->sceneBytes():0u,attentionClassSlots,attentionClassPeakSceneBytes,attentionClassReleases,attentionSplitSubmissions});
+            hits->size,featureWork->size,workRows,uint64_t(detector==key),geometry->size+paths->size+baseChart->size,0u,sharedHistory?sharedHistory->snapshotBytes():0u,sharedHistory?sharedHistory->blockBytes():0u,sharedHistory?sharedHistory->directory->sceneBytes():0u,sharedHistory?sharedHistory->size():0u,sharedHistory?sharedHistory->evictions:0u,mlpSurfaces?mlpSurfaces->sceneBytes():0u,mlpSurfaces?mlpSurfaces->count:0u,attentionBackend,attentionBlock,attentionReceipts->size,attentionProducerDispatches,attentionMergeDispatches,attentionPlannedRays,attentionCoveredTerms,attentionReportedRecords,attentionClassRays,attentionClassBuilds,attentionClassBytes(),attentionClassScene?attentionClassScene->sceneBytes():0u,attentionClassSlots,attentionClassPeakSceneBytes,attentionClassReleases,attentionSplitSubmissions});
         append(output,attentionClassResourceDetails());reply(output);
     }
     void apertureUpdate(){float aperture;std::cin.read(reinterpret_cast<char*>(&aperture),4);if(!std::cin||!(aperture>0&&aperture<=2)||!sparseRouting)throw std::runtime_error("Sparse aperture update requires (0,2]");
@@ -912,6 +948,7 @@ cfg.stage=6;launch(c,math,cfg,1,cfg.rows);
         reply(output);
     }
     #include "resident_attention_runtime.inl"
+    #include "prefill_decoded_history.inl"
     ~Resident(){
         vkDeviceWaitIdle(e.device);if(rtTimestamps)vkDestroyQueryPool(e.device,rtTimestamps,nullptr);if(attentionSubmitTimestamps)vkDestroyQueryPool(e.device,attentionSubmitTimestamps,nullptr);
         std::set<VkPipeline> handles;auto add=[&](const auto& pipes){for(auto p:pipes)if(p)handles.insert(p);};

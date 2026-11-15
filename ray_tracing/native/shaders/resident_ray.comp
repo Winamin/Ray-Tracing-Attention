@@ -87,7 +87,7 @@ void main(){
             publishPathScoreStamp(hits[relative+1u]);}
         return;
     }
-    if(operation==11u)return;
+    if(operation==11u){commitPathAggregate();return;}
     if(operation==12u){
         uint groups=(WORD_TILES+wordRayBatch-1u)/wordRayBatch,bank=job/groups,localJob=job%groups;
         if(lane==0u){float total;uvec2 lens;wordLensValid=throughLens(0u,cfg.depth,rays[bank],wordOrigin,wordDirection,total,lens)?1u:0u;}barrier();

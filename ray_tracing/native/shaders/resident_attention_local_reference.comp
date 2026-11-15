@@ -1,0 +1,52 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#include "resident_attention_local_value_split.glsl"
+// Preserve the original lane's full history Kahan sequence and the same
+// subgroupAdd. The parallel stages only supplied maxima/pointwise weights.
+void main(){
+    if(!splitValid(32u))return;
+    if(localAggregatePolicyMatches()&&reusePathAggregate())return;
+    uint kv=gl_WorkGroupID.x,headBase=kv*Q_PER_KV,c=gl_SubgroupInvocationID;
+    uint available=availablePositions(0u),groups=groupCount(0u);
+    if(headBase>=headCount())return;
+    bvec4 enabled=lessThan(uvec4(headBase)+uvec4(0u,1u,2u,3u),uvec4(headCount()));
+    vec4 maximum=vec4(-1.0/0.0);
+    for(uint g=c;g<groups;g+=32u){
+        uint record=recordIndex(0u,g,headBase)*RECORD_WORDS;
+        vec4 partial=vec4(-1.0/0.0);
+        for(uint h=0u;h<4u;h++)if(enabled[h])
+            partial[h]=uintBitsToFloat(attentionReceipts[record+h*RECORD_WORDS+4u]);
+        maximum=max(maximum,partial);
+    }
+    maximum=subgroupMax(maximum);
+    precise vec4 reference=vec4(0.0),correction=vec4(0.0);
+    for(uint group=0u;group<groups;group++){
+        uint at=recordIndex(0u,group,headBase)*RECORD_WORDS,count=min(BLOCK,available-group*BLOCK);
+        for(uint j=c;j<count;j+=32u){
+            vec4 weight=vec4(0.0);
+            for(uint h=0u;h<4u;h++)if(enabled[h])
+                weight[h]=uintBitsToFloat(attentionReceipts[at+h*RECORD_WORDS+WEIGHT_OFFSET+j]);
+            accurateAdd4(reference,correction,weight);
+        }
+    }
+    reference=subgroupAdd(reference-correction);
+    bool diagnostics=splitDiagnostics();
+    if(diagnostics){
+        subgroupMemoryBarrierBuffer();subgroupBarrier();
+        if(c==0u)for(uint group=0u;group<groups;group++){
+            uint at=recordIndex(0u,group,headBase)*RECORD_WORDS;
+            for(uint h=0u;h<4u;h++)if(enabled[h]){
+                attentionReceipts[at+h*RECORD_WORDS+4u]=0u;
+                attentionReceipts[at+h*RECORD_WORDS+5u]=0u;
+            }
+        }
+    }
+    if(c==0u)for(uint h=0u;h<4u;h++)if(enabled[h]){
+        if(!finiteValue(reference[h])||reference[h]<=0.0||!finiteValue(maximum[h]))atomicOr(control[3],ATTENTION_ERROR);
+        uint p=(headBase+h)*2u;
+        physical[p]=maximum[h]+20.0;physical[p+1u]=reference[h];
+    }
+}

@@ -5,6 +5,7 @@
 #extension GL_KHR_shader_subgroup_ballot : require
 #extension GL_KHR_shader_subgroup_shuffle : require
 #include "resident_common.glsl"
+#define RT_ATTENTION_CLASSES_ACCESS readonly restrict
 #include "resident_attention_classes.glsl"
 #define headCount() parameters[blockBase()+23u]
 layout(constant_id=1) const uint BLOCK=128u;
@@ -13,11 +14,9 @@ layout(std430,binding=42) buffer AttentionReceipts {uint attentionReceipts[];};
 const uint DH=RT_ATTENTION_HEAD_DIM,Q_PER_KV=RT_QUERY_WIDTH/RT_GQA_WIDTH;
 const uint COVERAGE_WORDS=BLOCK/32u,SCORE_OFFSET=8u+COVERAGE_WORDS;
 const uint WEIGHT_OFFSET=SCORE_OFFSET+BLOCK,RECORD_WORDS=WEIGHT_OFFSET+BLOCK;
-const uint ATTENTION_ERROR=65536u,VALUE_AXES=(DH+127u)/128u,WINDOW=4u;
+const uint ATTENTION_ERROR=65536u,VALUE_AXES=(DH+127u)/128u;
 shared uint groupFailure,valueInvalid;
 shared vec4 valueMaximum,valueReference;
-shared uint ownerRank[WINDOW*DH];
-shared float representativeValue[WINDOW*DH];
 #include "resident_attention_local_common.glsl"
 
 void accurateAdd4(inout vec4 sum,inout vec4 correction,vec4 value){
@@ -86,51 +85,24 @@ void valueAttentionWindow(uint row,uint kv,uint lane){
         for(uint group=0u;group<groups;group++){
             uint count=min(BLOCK,available-group*BLOCK),at=recordIndex(row,group,firstHead)*RECORD_WORDS;
             uint products=0u,decodes=0u;
-            for(uint firstToken=0u;firstToken<count;firstToken+=WINDOW){
-                uint n=min(WINDOW,count-firstToken);
-                // Each subgroup builds one token's transient ownership table.
-                // K domains are never touched. Only D V descriptors are read.
-                if(tile<n){
-                    uint slot=hits[row*(cfg.capacity+1u)+group*BLOCK+firstToken+tile+1u];
-                    uvec2 directory=classDirectory(slot,kv,true);
-                    uint roots=directory.y,payload=classPayloadBase()+directory.x;
-                    if(roots==0u||roots>DH){attentionFailure();roots=0u;}
-                    for(uint axis=c;axis<DH;axis+=32u)ownerRank[tile*DH+axis]=0xffffffffu;
-                    subgroupMemoryBarrierShared();subgroupBarrier();
-                    for(uint rank=c;rank<roots;rank+=32u){
-                        uint descriptor=attentionClasses[payload+rank],root=compactAxis(descriptor);
-                        uint offset=compactMemberOffset(descriptor),members=compactMemberCount(descriptor);
-                        float value=uintBitsToFloat(attentionClasses[payload+roots+rank]);
-                        if(root>=DH||members==0u||offset+members>DH||!finiteValue(value)){attentionFailure();continue;}
-                        representativeValue[tile*DH+rank]=value;
-                        if(DISTRIBUTE_V_MEMBERS!=0u){
-                            for(uint m=0u;m<members;m++){
-                                uint index=offset+m,word=attentionClasses[payload+2u*roots+index/4u];
-                                uint axis=(word>>((index&3u)*8u))&255u;
-                                if(axis>=DH){attentionFailure();continue;}
-                                ownerRank[tile*DH+axis]=rank;
-                            }
-                        }else ownerRank[tile*DH+root]=rank;
-                    }
+            for(uint j=0u;j<count;j++){
+                if(j!=0u&&(j&63u)==0u){for(uint a=0u;a<VALUE_AXES;a++){
+                    accurateAdd4(signal[a],correction[a],chunkSignal[a]);chunkSignal[a]=vec4(0.0);}}
+                uint slot=hits[row*(cfg.capacity+1u)+group*BLOCK+j+1u];
+                uvec2 directory=classDirectory(slot,kv,true);
+                uint roots=directory.y,payload=classPayloadBase()+directory.x;
+                if(roots==0u||roots>DH){attentionFailure();continue;}
+                vec4 weight=weight4(at,j,headEnabled);
+                for(uint a=0u;a<VALUE_AXES;a++){
+                    uint axis=lane+a*128u;if(axis>=DH)continue;
+                    uint rank=compactValueRankAt(payload,roots,axis);
+                    if(rank>=roots){attentionFailure();continue;}
+                    if(DISTRIBUTE_V_MEMBERS==0u&&compactAxis(attentionClasses[payload+rank])!=axis)continue;
+                    float value=uintBitsToFloat(attentionClasses[payload+roots+rank]);
+                    if(!finiteValue(value)){attentionFailure();continue;}
+                    if(diagnostics)decodes++;
+                    if(value!=0.0){chunkSignal[a]=fma(weight,vec4(value),chunkSignal[a]);if(diagnostics)products++;}
                 }
-                // Publish all four token maps and values to every axis owner.
-                barrier();if(groupFailure!=0u)return;
-                for(uint t=0u;t<n;t++){
-                    uint j=firstToken+t;
-                    if(j!=0u&&(j&63u)==0u){for(uint a=0u;a<VALUE_AXES;a++){
-                        accurateAdd4(signal[a],correction[a],chunkSignal[a]);chunkSignal[a]=vec4(0.0);}}
-                    vec4 weight=weight4(at,j,headEnabled);
-                    for(uint a=0u;a<VALUE_AXES;a++){
-                        uint axis=lane+a*128u;
-                        if(axis>=DH)continue;
-                        uint rank=ownerRank[t*DH+axis];if(rank==0xffffffffu)continue;
-                        float value=representativeValue[t*DH+rank];
-                        if(diagnostics)decodes++;
-                        if(value!=0.0){chunkSignal[a]=fma(weight,vec4(value),chunkSignal[a]);if(diagnostics)products++;}
-                    }
-                }
-                // Readers finish before the next window reuses the same maps.
-                barrier();
             }
             for(uint a=0u;a<VALUE_AXES;a++){accurateAdd4(signal[a],correction[a],chunkSignal[a]);chunkSignal[a]=vec4(0.0);}
             if(diagnostics){products=subgroupAdd(products);decodes=subgroupAdd(decodes);}

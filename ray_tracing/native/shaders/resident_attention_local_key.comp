@@ -5,6 +5,7 @@
 #extension GL_KHR_shader_subgroup_ballot : require
 #extension GL_KHR_shader_subgroup_shuffle : require
 #include "resident_common.glsl"
+#define RT_ATTENTION_CLASSES_ACCESS readonly restrict
 #include "resident_attention_classes.glsl"
 #define headCount() parameters[blockBase()+23u]
 
@@ -18,7 +19,7 @@ const uint COVERAGE_WORDS=BLOCK/32u,SCORE_OFFSET=8u+COVERAGE_WORDS;
 const uint WEIGHT_OFFSET=SCORE_OFFSET+BLOCK,RECORD_WORDS=WEIGHT_OFFSET+BLOCK;
 const uint ATTENTION_ERROR=65536u;
 shared uint groupFailure;
-shared uint classTile[KEY_SLICES*(DH/4u)],keyWork[Q_ROWS*KEY_SLICES*Q_BATCH*2u];
+shared uint keyWork[Q_ROWS*KEY_SLICES*Q_BATCH*2u];
 shared vec4 qHeadTile[Q_ROWS*DH];
 #include "resident_attention_local_common.glsl"
 void accurateAddHeads(inout vec4 sum,inout vec4 correction,vec4 value){
@@ -60,12 +61,10 @@ void keyAttention(uint firstRow,uint group,uint kv,uint lane){
         uvec4 products1=uvec4(0u);uint decodes1=0u;
         for(uint firstToken=0u;firstToken<count;firstToken+=KEY_SLICES){
             uint n=min(KEY_SLICES,count-firstToken);
-            if(slice<n){
-                uint slot=hits[lastRow*(cfg.capacity+1u)+first+firstToken+slice+1u];
-                uint membersAddress=classDomainAddress(slot,kv,false)+2u*compactCount(slot,kv,false);
-                for(uint index=c;index<DH/4u;index+=32u)classTile[slice*(DH/4u)+index]=attentionClasses[membersAddress+index];
-            }
-            subgroupMemoryBarrierShared();subgroupBarrier();
+            uint descriptorSlot=slice<n?hits[lastRow*(cfg.capacity+1u)+first+firstToken+slice+1u]:0u;
+            uvec2 directory=slice<n?classDirectory(descriptorSlot,kv,false):uvec2(0u);
+            uint descriptorBase=classPayloadBase()+directory.x,rootCount=directory.y;
+            uint membersAddress=descriptorBase+2u*rootCount;
             uint shift0=cfg.mode==1u?0u:rows-1u-0u,rowAvailable0=availablePositions(firstRow+0u);
             uint rowCount0=first<rowAvailable0?min(BLOCK,rowAvailable0-first):0u;
             bool scoreActive0=0u<rows&&slice<n&&firstToken+slice>=shift0&&firstToken+slice-shift0<rowCount0;
@@ -74,9 +73,6 @@ void keyAttention(uint firstRow,uint group,uint kv,uint lane){
             uint rowCount1=first<rowAvailable1?min(BLOCK,rowAvailable1-first):0u;
             bool scoreActive1=1u<rows&&slice<n&&firstToken+slice>=shift1&&firstToken+slice-shift1<rowCount1;
             precise vec4 sum1=vec4(0.0),error1=vec4(0.0);
-            uint descriptorSlot=slice<n?hits[lastRow*(cfg.capacity+1u)+first+firstToken+slice+1u]:0u;
-            uint descriptorBase=slice<n?classDomainAddress(descriptorSlot,kv,false):0u;
-            uint rootCount=slice<n?compactCount(descriptorSlot,kv,false):0u;
             if(slice<n&&(rootCount==0u||rootCount>DH)){attentionFailure();rootCount=0u;}
             // Consume RT-provided D roots directly; each rank matches its value.
             // The current product producer preserves its own representative order.
@@ -84,7 +80,6 @@ void keyAttention(uint firstRow,uint group,uint kv,uint lane){
                 uint descriptor=attentionClasses[descriptorBase+root],axis=descriptor&255u;
                 uint members=(descriptor>>16u)&511u,offset=(descriptor>>8u)&255u;
                 if(axis>=DH||members==0u||offset+members>DH){attentionFailure();continue;}
-                uint base=slice*(DH/4u);
                 float value=uintBitsToFloat(attentionClasses[descriptorBase+rootCount+root]);
                 if(!finiteValue(value)){attentionFailure();continue;}
                 if(value==0.0){
@@ -97,7 +92,7 @@ void keyAttention(uint firstRow,uint group,uint kv,uint lane){
                 precise vec4 qsum1=qHeadTile[1u*DH+axis],qerror1=vec4(0.0);
                 if(diagnostics&&scoreActive1)decodes1++;
                 for(uint seen=1u;seen<members;seen++){
-                    uint index=offset+seen,word=classTile[base+index/4u];
+                    uint index=offset+seen,word=attentionClasses[membersAddress+index/4u];
                     uint member=(word>>((index&3u)*8u))&255u;
                     accurateAddHeads(qsum0,qerror0,qHeadTile[0u*DH+member]);
                     accurateAddHeads(qsum1,qerror1,qHeadTile[1u*DH+member]);
@@ -130,7 +125,6 @@ void keyAttention(uint firstRow,uint group,uint kv,uint lane){
                 }
             }
 
-            subgroupMemoryBarrierShared();subgroupBarrier();
         }
         if(diagnostics){
         products0=subgroupAdd(products0);decodes0=subgroupAdd(decodes0);

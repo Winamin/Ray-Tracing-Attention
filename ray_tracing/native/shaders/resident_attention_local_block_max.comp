@@ -1,0 +1,41 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#include "resident_attention_local_value_split.glsl"
+// Group maxima stage from llama.cpp's split decode organization (MIT,
+// THIRD_PARTY.md). Actual local D scores and complete history are unchanged.
+void main(){
+    if(!splitValid(32u))return;
+    if(localAggregatePolicyMatches()&&reusePathAggregate())return;
+    uint kv=gl_WorkGroupID.x,headBase=kv*Q_PER_KV,c=gl_SubgroupInvocationID;
+    uint available=availablePositions(0u),groups=groupCount(0u);
+    if(headBase>=headCount())return;
+    bvec4 enabled=lessThan(uvec4(headBase)+uvec4(0u,1u,2u,3u),uvec4(headCount()));
+    bool persistent=pathScoresEnabled()&&pathScoreWork[2u]==1u;
+    uint historyBase=parameters[blockBase()+41u]*cfg.capacity;
+    uvec4 planes=uvec4(0u);
+    if(persistent)for(uint h=0u;h<4u;h++)planes[h]=pathScorePlane(headBase+h);
+    uint group=gl_WorkGroupID.y,first=group*BLOCK;
+    if(group>=groups||first>=available)return;
+    uint count=min(BLOCK,available-first),at=recordIndex(0u,group,headBase)*RECORD_WORDS;
+    bool invalid=false;
+    for(uint h=0u;h<4u;h++)if(enabled[h])
+        invalid=invalid||attentionReceipts[at+h*RECORD_WORDS+2u]!=count||attentionReceipts[at+h*RECORD_WORDS+7u]!=3u;
+    vec4 maximum=vec4(-1.0/0.0);
+    for(uint j=c;j<count;j+=32u){
+            uint slot=persistent?hits[first+j+1u]:0u;
+            vec4 score=vec4(-1.0/0.0);
+            for(uint h=0u;h<4u;h++)if(enabled[h])
+                score[h]=persistent?uintBitsToFloat(pathScoreCache[planes[h]+slot-historyBase]):
+                    uintBitsToFloat(attentionReceipts[at+h*RECORD_WORDS+SCORE_OFFSET+j]);
+        maximum=max(maximum,score);
+    }
+    maximum=subgroupMax(maximum);invalid=subgroupAny(invalid);
+    if(c==0u){
+        if(invalid)atomicOr(control[3],ATTENTION_ERROR);
+        for(uint h=0u;h<4u;h++)if(enabled[h])
+            attentionReceipts[at+h*RECORD_WORDS+4u]=floatBitsToUint(maximum[h]);
+    }
+}

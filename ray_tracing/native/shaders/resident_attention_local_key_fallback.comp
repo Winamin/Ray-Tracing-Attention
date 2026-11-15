@@ -5,6 +5,7 @@
 #extension GL_KHR_shader_subgroup_ballot : require
 #extension GL_KHR_shader_subgroup_shuffle : require
 #include "resident_common.glsl"
+#define RT_ATTENTION_CLASSES_ACCESS readonly restrict
 #include "resident_attention_classes.glsl"
 #define headCount() parameters[blockBase()+23u]
 
