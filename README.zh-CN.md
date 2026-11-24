@@ -135,7 +135,8 @@ rt-chat --attention-backend rt_geometry --mlp-backend rt_geometry
 
 ## 实测表现
 
-上一个提交：`d8e86c2`。数据不变。
+`d8e86c2`
+这是之前混合tensor的数据，当前纯RT Attention性能还在优化
 
 | 工作负载 | 实测结果 |
 |---|---:|
