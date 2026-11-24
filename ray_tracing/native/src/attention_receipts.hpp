@@ -15,7 +15,9 @@ inline uint32_t attentionBackendCode(const char *name)
         return 4u;
     if (value == "grouped_rt_tc")
         return 5u;
-    throw std::runtime_error("Attention backend must be standard, standard_fp32, grouped_rt, grouped_rt_dense, grouped_rt_local or grouped_rt_tc");
+    if (value == "rt_geometry")
+        return 6u;
+    throw std::runtime_error("Unknown attention backend");
 }
 
 // A receipt covers a complete age interval for one query head. The history

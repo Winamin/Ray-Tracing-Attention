@@ -40,7 +40,7 @@ def build(spec, output=None):
     cpp+='constexpr uint32_t MODEL_FULL_INDEX[]={'+','.join(map(str,mapping))+'};\n'
     (target/'rt_layer_map.hpp').write_text(cpp,encoding='utf8')
     commands=[]
-    shader_names=('resident_math','resident_mlp','resident_batch2','resident_pack','resident_attention','resident_attention_receipt','resident_attention_dense','resident_attention_local','resident_attention_classes','resident_auxiliary','resident_state','resident_ray','reply_cache','optical_path_key','history_cache')
+    shader_names=('resident_math','resident_mlp','resident_batch2','resident_pack','resident_attention','resident_attention_receipt','resident_attention_dense','resident_attention_local','resident_attention_classes','resident_auxiliary','resident_state','resident_ray','reply_cache','optical_path_key','history_cache','resident_geometry_arithmetic','resident_geometry_model')
     prefill_scratch_names=('resident_attention_prefill_decode','resident_attention_prefill_scratch') if spec.full_layers and spec.attention_head_dim>=64 else ()
     shader_names+=prefill_scratch_names
     local_split_names=()

@@ -590,10 +590,10 @@ def parser():
                    help="Prefill 并行位置数；按绝对位置批量写入和查询 Tree")
     p.add_argument("--prefill-matrix-rows", type=int, choices=(4,8,16), default=8,
                    help="共享一组量化权重的 token 数")
-    p.add_argument("--attention-backend", choices=("standard","standard_fp32","grouped_rt","grouped_rt_dense","grouped_rt_local","grouped_rt_tc"), default="standard",
-                   help="Attention 算法：原版、FP32 对照或 RT 全贡献分组聚合")
-    p.add_argument("--mlp-backend", choices=("standard","rt_transmission"), default="standard",
-                   help="MLP 算法：原矩阵通路或 RT Core 固定透射通路")
+    p.add_argument("--attention-backend", choices=("standard","standard_fp32","grouped_rt","grouped_rt_dense","grouped_rt_local","grouped_rt_tc","rt_geometry"), default="standard",
+                   help="Attention 算法：原版、FP32 对照、RT 分组聚合或 rt_geometry 几何求交")
+    p.add_argument("--mlp-backend", choices=("standard","rt_transmission","rt_geometry"), default="standard",
+                   help="MLP 算法：原矩阵、固定透射或 rt_geometry 求交 SwiGLU")
     p.add_argument("--attention-block", type=int, choices=(128,256,512), default=128,
                    help="每个完整 attention 回执覆盖的历史位置数")
     p.add_argument("--attention-v-members", action=argparse.BooleanOptionalAction, default=False,

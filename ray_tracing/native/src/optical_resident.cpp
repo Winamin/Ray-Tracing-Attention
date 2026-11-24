@@ -1,10 +1,12 @@
 #include <map>
+#include <cstdio>
 #include <set>
 #include "resident_dimensions.hpp"
 #include "reply_cache.hpp"
 #include "mlp_geometry.hpp"
 #include "attention_receipts.hpp"
 #include "attention_class_geometry.hpp"
+#include "rt_geometry_arithmetic.hpp"
 
 struct ResidentConfig
 {
@@ -165,7 +167,11 @@ public:
     bool initialized = false;
     uint32_t captureRows{};
     uint32_t attentionBackend = 0u, attentionBlock = 128u;
-    bool rtTransmissionMLP = false, attentionDiagnosticDirty = false, attentionStatsEnabled = false, attentionVMemberDistribution = false, attentionLocalSplit = false;
+    bool rtTransmissionMLP = false, geometricMLP = false, attentionDiagnosticDirty = false, attentionStatsEnabled = false, attentionVMemberDistribution = false, attentionLocalSplit = false;
+    std::unique_ptr<RTArithmeticSpace> geometrySpace;
+    Buffer *geometryStatus{}, *geometryScores{};
+    VkPipeline geometryPipelines[9]{};
+    uint32_t geometryScoreStride=1u, geometryScoreRows=1u;
     Buffer *attentionReceipts{};
     VkPipeline attentionReceiptPipelines[12]{};
     uint32_t attentionLocalParallelNormalize=2u;
@@ -248,9 +254,10 @@ public:
         if (attentionBackend == 4u && RT_ATTENTION_HEAD_DIM != 256u)
             throw std::runtime_error("grouped_rt_local requires a 256-dimensional attention head");
         std::string mlpBackend = std::getenv("RT_MLP_BACKEND") ? std::getenv("RT_MLP_BACKEND") : "standard";
-        if (mlpBackend != "standard" && mlpBackend != "rt_transmission")
-            throw std::runtime_error("MLP backend must be standard or rt_transmission");
+        if (mlpBackend != "standard" && mlpBackend != "rt_transmission" && mlpBackend != "rt_geometry")
+            throw std::runtime_error("Unknown MLP backend");
         rtTransmissionMLP = mlpBackend == "rt_transmission";
+        geometricMLP = mlpBackend == "rt_geometry";
         if(const char* value=std::getenv("RT_LOCAL_PARALLEL_NORMALIZE")){
             std::string mode(value);
             if(mode=="0")attentionLocalParallelNormalize=0u;
@@ -394,6 +401,12 @@ public:
         featureDown = floats(sparseRouting ? size_t(depth) * MODEL_FF * 1024 : (wideCooperative && MODEL_RECURRENT && MODEL_STATE_HEADS % 32u == 0u ? size_t(MODEL_RECURRENT) * MODEL_STATE_HEADS * MODEL_D : 1));
         partialDown = floats(sparseRouting ? size_t(workRows) * 96 * MODEL_D : 1);
         attentionReceipts = e.buffer(4u, usage);
+        geometryStatus = e.buffer(32u, usage);
+        geometryScores = e.buffer(4u, usage);
+        uint32_t geometryInitial[8]{};
+        e.upload(geometryStatus, geometryInitial, sizeof(geometryInitial));
+        if (geometricMLP || attentionBackend == 6u)
+            geometrySpace = std::make_unique<RTArithmeticSpace>(e);
         pathScoreDummy = e.buffer(32u, usage);
         uint32_t noPathScores[8]{};
         e.upload(pathScoreDummy, noPathScores, sizeof(noPathScores));
@@ -412,11 +425,11 @@ public:
         {
             initializeMarker(liveMarker, true);
         }
-        VkDescriptorSetLayoutBinding bindings[46]{};
+        VkDescriptorSetLayoutBinding bindings[49]{};
         uint32_t bindingCount = 0;
-        for (uint32_t i = 0; i < 46; i++)
+        for (uint32_t i = 0; i < 49; i++)
         {
-            bindings[bindingCount++] = {i, ((i < 5 && i != 2) || i == 32 || i == 39 || i == 43) ? VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, i == 6 || i == 32 ? depth : i == 0 || i == 1 || i == 3 ? 4u
+            bindings[bindingCount++] = {i, ((i < 5 && i != 2) || i == 32 || i == 39 || i == 43 || i == 46) ? VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, i == 6 || i == 32 ? depth : i == 0 || i == 1 || i == 3 ? 4u
                                                                                                                                                                                                                                             : 1u,
                                         VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
         }
@@ -431,7 +444,7 @@ public:
         pl.pushConstantRangeCount = 1;
         pl.pPushConstantRanges = &pc;
         check(vkCreatePipelineLayout(e.device, &pl, nullptr, &layout), "resident pipeline layout");
-        VkDescriptorPoolSize sizes[2]{{VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, (15 + depth) * (depth + 1)}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (depth + 1) * (38 + depth)}};
+        VkDescriptorPoolSize sizes[2]{{VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, (16 + depth) * (depth + 1)}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (depth + 1) * (40 + depth)}};
         VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         pool.maxSets = depth + 1;
         pool.poolSizeCount = 2;
@@ -450,6 +463,9 @@ public:
         for (uint32_t l = 0; l < depth; l++)
             bind(layerSets[l], false, l);
         bind(initialSet, true);
+        if (geometrySpace)
+            for (uint32_t operation=0;operation<9u;operation++)
+                geometryPipelines[operation]=e.pipeline("resident_geometry_model",layout,operation,matrixBatchRows,0xffffffffu,wordTile,128u);
         for (uint32_t i = 0; i < 35; i++)
             if (i != 2 && i != 4 && i != 5 && i != 10)
                 math[i] = e.pipeline("resident_math", layout, i, 1u, 0xffffffffu, wordTile, i == 16u ? readoutWords * 32u : 128u, featureTile, readoutUnroll, readoutWords, quantization == 4u ? (i == 16u ? p[15] : 0xffffffffu) : 0xffffffffu);
@@ -679,7 +695,7 @@ public:
         VkAccelerationStructureKHR featureHandles[RT_LAYER_COUNT]{};
         for (uint32_t l = 0; l < depth; l++)
             featureHandles[l] = features ? features->tops[l] : scalars->tops[0];
-        VkWriteDescriptorSetAccelerationStructureKHR as[46]{};
+        VkWriteDescriptorSetAccelerationStructureKHR as[49]{};
         Buffer *classPayload = attentionClassDummy;
         Buffer *pathPayload = pathScoreDummy;
         if (!initial && fullLayer(layer) && !pathScoreLayers.empty())
@@ -690,11 +706,11 @@ public:
             if (candidate)
                 classPayload = candidate;
         }
-        Buffer *buffers[46]{nullptr, nullptr, propagation, nullptr, nullptr, parameters, matrices, basis, state, normalized, query, key, keyGeometry, initial ? words->vertices : history->vertices, decoded, geometry, slots, rays, hits, paths, detector, physical, wordDecoded, scalars->vertices, wordResult, lenses->vertices, baseChart, feedForward, auxiliary, prompt, control, audit, nullptr, features ? features->vertices : scalars->vertices, featureWork, featureRays, featureDown, partialDown, words->vertices, nullptr, pathPayload, pathScoreWork ? pathScoreWork : pathScoreDummy, attentionReceipts, nullptr, prefillDecodedData?prefillDecodedData:attentionClassScratch, prefillDecodedMeta?prefillDecodedMeta:classPayload};
-        VkDescriptorBufferInfo infos[46]{};
-        VkWriteDescriptorSet writes[46]{};
+        Buffer *buffers[49]{nullptr, nullptr, propagation, nullptr, nullptr, parameters, matrices, basis, state, normalized, query, key, keyGeometry, initial ? words->vertices : history->vertices, decoded, geometry, slots, rays, hits, paths, detector, physical, wordDecoded, scalars->vertices, wordResult, lenses->vertices, baseChart, feedForward, auxiliary, prompt, control, audit, nullptr, features ? features->vertices : scalars->vertices, featureWork, featureRays, featureDown, partialDown, words->vertices, nullptr, pathPayload, pathScoreWork ? pathScoreWork : pathScoreDummy, attentionReceipts, nullptr, prefillDecodedData?prefillDecodedData:attentionClassScratch, prefillDecodedMeta?prefillDecodedMeta:classPayload, nullptr, geometryStatus, geometryScores};
+        VkDescriptorBufferInfo infos[49]{};
+        VkWriteDescriptorSet writes[49]{};
         uint32_t writeCount = 0;
-        for (uint32_t i = 0; i < 46; i++)
+        for (uint32_t i = 0; i < 49; i++)
         {
             auto &w = writes[writeCount++];
             w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -702,12 +718,12 @@ public:
             w.dstBinding = i;
             w.descriptorCount = i == 6 || i == 32 ? depth : i == 0 || i == 1 || i == 3 ? 4
                                                                                        : 1;
-            w.descriptorType = ((i < 5 && i != 2) || i == 32 || i == 39 || i == 43) ? VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            if ((i < 5 && i != 2) || i == 32 || i == 39 || i == 43)
+            w.descriptorType = ((i < 5 && i != 2) || i == 32 || i == 39 || i == 43 || i == 46) ? VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            if ((i < 5 && i != 2) || i == 32 || i == 39 || i == 43 || i == 46)
             {
                 as[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};
                 as[i].accelerationStructureCount = w.descriptorCount;
-                as[i].pAccelerationStructures = i == 32 ? featureHandles : i == 43 ? (attentionClassScene ? attentionClassScene->tops.data() : handles[0])
+                as[i].pAccelerationStructures = i == 46 ? (geometrySpace ? &geometrySpace->top : handles[0]) : i == 32 ? featureHandles : i == 43 ? (attentionClassScene ? attentionClassScene->tops.data() : handles[0])
                                                                        : i == 39   ? (mlpSurfaces ? mlpSurfaces->tops.data() : handles[0])
                                                                                    : handles[i];
                 w.pNext = &as[i];
@@ -779,6 +795,13 @@ public:
                                                     : 0u;
         std::memcpy(&cfg.padding1, &routeAperture, 4);
         bool projection = pipelines == math && cfg.stage == 2u, batch = projection && cfg.rows > 1u;
+        if (projection && attentionBackend==6u && fullLayer(cfg.layer) && (cfg.index==2u || cfg.index==5u))
+        {
+            uint32_t channels=cfg.index==2u?MODEL_D:MODEL_Q+2u*MODEL_GQA+RT_ATTENTION_GATE*MODEL_Q;
+            geometryDispatch(c,cfg,4u,channels,(cfg.rows+matrixBatchRows-1u)/matrixBatchRows,1u,target);
+            geometryPublishError(c,cfg);
+            return;
+        }
         VkPipeline selected = projection ? matrixProjection[cfg.index - 2u][batch ? 1u : 0u] : pipelines[cfg.stage];
         if (quantization == 4u && projection && cfg.index == 2u)
             selected = outputPipelines[cfg.layer][batch ? 1u : 0u];
@@ -1192,7 +1215,12 @@ public:
                 launch(c, ray, cfg, 1u);
                 cfg.index = previousIndex;
             }
-            if (attentionBackend >= 2u)
+            if (attentionBackend == 6u)
+            {
+                executeGeometryAttention(c,cfg);
+                mark(c,cfg,3);mark(c,cfg,4);mark(c,cfg,5);
+            }
+            else if (attentionBackend >= 2u)
             {
                 traceAttentionReceipts(c, cfg);
                 mark(c, cfg, 3);
@@ -1251,6 +1279,11 @@ public:
     size_t featureGlobal() const { return size_t(workRows) * (16u + MODEL_FF * (sparseRouting ? 2u : 1u)); }
     void executeMLP(VkCommandBuffer &c, ResidentConfig cfg)
     {
+        if (geometricMLP)
+        {
+            executeGeometryMLP(c,cfg);
+            return;
+        }
         if (rtTransmissionMLP || sparseRouting)
         {
             routedMLP(c, cfg);
@@ -1356,6 +1389,11 @@ public:
     }
     void word(VkCommandBuffer c, ResidentConfig cfg)
     {
+        if (geometrySpace)
+        {
+            executeGeometryWord(c,cfg);
+            return;
+        }
         wordMark(c, cfg, 0);
         wordTrace(c, cfg);
         wordMark(c, cfg, 1);
@@ -2367,6 +2405,7 @@ public:
         reply(output);
     }
 #include "resident_attention_runtime.inl"
+#include "resident_geometry_runtime.inl"
     #include "prefill_decoded_history.inl"
     ~Resident()
     {
@@ -2384,6 +2423,7 @@ public:
         add(attentionReceiptPipelines);
         add(attentionClassPipelines);
         add(detectorPipelines);
+        add(geometryPipelines);
         for (auto &pair : opticalMlp)
             add(pair);
         for (auto &pair : matrixProjection)
@@ -2411,6 +2451,15 @@ int main(int argc, char **argv)
 #endif
     try
     {
+        if (argc == 2 && std::string(argv[1]) == "--geometry-worker")
+        {
+            auto root = std::filesystem::absolute(argv[0]).parent_path();
+            Engine engine;
+            engine.initialize(root, 32u);
+            RTGeometryWorker worker(engine);
+            worker.serve();
+            return 0;
+        }
         if (argc < 3)
             throw std::runtime_error("Usage: rt_optical_resident student.bin original_head.bin [capacity]");
         uint32_t capacity = argc > 3 ? uint32_t(std::stoul(argv[3])) : 300;
@@ -2437,7 +2486,7 @@ int main(int argc, char **argv)
         if (matrixRows != 4u && matrixRows != 8u && matrixRows != 16u)
             throw std::runtime_error("Matrix row tile requires 4, 8 or 16 tokens");
         Resident model(engine, argv[1], argv[2], argc <= 4 || std::stoul(argv[4]) != 0, sparse, aperture, wordTile, argc > 5 && std::string(argv[5]) == "rt_full", featureTile, readoutUnroll, readoutWords, prefillBatch, matrixRows);
-        uint32_t hello[5]{0x5254523a, model.depth, model.blocks, model.middle, model.quantization | (model.wideCooperative ? 256u : 0u) | (model.attentionBackend >= 2u ? 512u : 0u) | ((model.attentionBackend == 2u || model.attentionBackend == 4u || model.attentionBackend == 5u) ? 2048u : 0u) | (model.attentionBackend == 1u ? 1024u : 0u) | (!model.rtTransmissionMLP ? 4096u : 0u)};
+        uint32_t hello[5]{0x5254523a, model.depth, model.blocks, model.middle, model.quantization | (model.wideCooperative ? 256u : 0u) | (model.attentionBackend >= 2u ? 512u : 0u) | ((model.attentionBackend == 2u || model.attentionBackend == 4u || model.attentionBackend == 5u) ? 2048u : 0u) | (model.attentionBackend == 1u ? 1024u : 0u) | (!model.rtTransmissionMLP&&!model.geometricMLP ? 4096u : 0u) | (model.geometricMLP ? 524288u : 0u) | (model.attentionBackend==6u ? 1048576u : 0u)};
         hello[4] |= (model.detectorOrdered ? 131072u : 0u);
         std::cout.write(reinterpret_cast<char *>(hello), 20);
         std::cout.flush();
@@ -2484,6 +2533,8 @@ int main(int argc, char **argv)
                 model.attentionCheck(count, debug);
             else if (op == 15)
                 model.attentionStatistics(count);
+            else if (op == 19)
+                model.geometryStatistics();
             else
                 throw std::runtime_error("Unknown resident operation");
         }

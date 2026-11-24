@@ -845,6 +845,7 @@ void ensureAttentionPipelines()
 }
 void prepareAttention(uint32_t rows, uint32_t position, uint32_t origin = 0u)
 {
+    if(attentionBackend==6u){prepareGeometryAttention(rows,position,origin);return;}
     ensureAttentionPipelines();
     AttentionReceiptLayout receipt{attentionBlock, (attentionBackend == 2u || attentionBackend == 5u), attentionBackend == 4u};
     uint64_t bytes = receipt.records(rows, position, capacity, origin) * receipt.stride() *4u;
@@ -984,6 +985,7 @@ void attentionCheck(uint32_t rows, uint32_t layer)
     if (!finite(q) || !finite(k) || !finite(v) || !finite(gate))
         throw std::runtime_error("Attention diagnostic values must be finite");
     attentionDiagnosticDirty = true;
+    if(attentionBackend==6u){geometryAttentionCheck(rows,count,layer,queryStart,historyStart,q,k,v,gate);return;}
     resetAttentionClassPending();
     attentionClassRestoreCopies.clear();
     uint32_t firstSlot = historyStart % capacity;

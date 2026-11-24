@@ -17,12 +17,12 @@ class ResidentRuntime:
         from ..compiler.build import build
         spec=asset_spec(asset.parent)
         self.model_spec=spec
-        if attention_backend not in ('standard','standard_fp32','grouped_rt','grouped_rt_dense','grouped_rt_local','grouped_rt_tc'):
-            raise ValueError('Attention backend must be standard, standard_fp32, grouped_rt, grouped_rt_dense, grouped_rt_local or grouped_rt_tc')
+        if attention_backend not in ('standard','standard_fp32','grouped_rt','grouped_rt_dense','grouped_rt_local','grouped_rt_tc','rt_geometry'):
+            raise ValueError('Unknown attention backend')
         if attention_backend=='grouped_rt_local' and spec.attention_head_dim!=256:
             raise ValueError('grouped_rt_local requires a 256-dimensional attention head')
-        if mlp_backend not in ('standard','rt_transmission'):
-            raise ValueError('MLP backend must be standard or rt_transmission')
+        if mlp_backend not in ('standard','rt_transmission','rt_geometry'):
+            raise ValueError('Unknown MLP backend')
         if attention_block not in (128,256,512):raise ValueError('Attention block must be 128, 256 or 512')
         self.hidden_size=spec.hidden_size
         self.vocabulary_size=spec.vocabulary_size
@@ -42,7 +42,9 @@ class ResidentRuntime:
         try:
             magic,depth,blocks,middle,mode=struct.unpack('<5I',self.read(20))
             if magic not in (0x52545239,0x5254523a):raise RuntimeError('Resident optical protocol mismatch')
-            if attention_backend in ('grouped_rt','grouped_rt_dense','grouped_rt_local','grouped_rt_tc') and not mode&512:raise RuntimeError('Worker did not activate grouped RT attention')
+            if attention_backend in ('grouped_rt','grouped_rt_dense','grouped_rt_local','grouped_rt_tc','rt_geometry') and not mode&512:raise RuntimeError('Worker did not activate the requested RT attention')
+            if attention_backend=='rt_geometry' and not mode&1048576:raise RuntimeError('Worker did not activate geometry attention')
+            if mlp_backend=='rt_geometry' and not mode&524288:raise RuntimeError('Worker did not activate geometry MLP')
             if attention_backend=='standard_fp32' and not mode&1024:raise RuntimeError('Worker did not activate FP32 attention')
             if (mlp_backend=='standard')!=bool(mode&4096):raise RuntimeError('Worker did not activate the requested MLP backend')
         except BaseException:
@@ -83,6 +85,24 @@ class ResidentRuntime:
         self.metadata['mlp_decode_compute']='subgroup' if mode&4096 else 'rt_transmission'
         self.metadata['mlp_token_tile']=256 if mode&4096 and mode&256 else matrix_rows
         if not mode&4096:self.metadata['mlp_material_receipts']='shared within token tile'
+        if attention_backend=='rt_geometry':
+            self.metadata.update(attention_compute='RT 2D-fragment history / pair-plane QK, geometric softmax and PV',
+                attention_rt_timing='combined QK, softmax, PV and shader operand encoding',
+                detector_mode='geometry',detector_precision='fp32_triangle_intersections',
+                detector_history_policy='complete_causal_rt_micro_rays',attention_receipt_format='geometry_weights',
+                attention_full_contribution=True,geometry_history_block=32,geometry_history_coordinates_per_ray=2,
+                attention_projection_compute='rt_geometry',attention_value_policy='full_quantized_history')
+        if mlp_backend=='rt_geometry':
+            self.metadata.update(mlp_compute='rt_geometry',mlp_activation='geometric_swiglu',
+                mlp_prefill_compute='rt_geometry',mlp_decode_compute='rt_geometry',
+                mlp_material_receipts='shared full-precision weight-pair encoding within token tile')
+        if attention_backend=='rt_geometry' or mlp_backend=='rt_geometry':
+            self.metadata.update(geometry_arithmetic='triangle_intersection_distance',
+                geometry_exponential='4096_segment_piecewise_linear',vocabulary_compute='rt_geometry',
+                geometry_dot_method='two_coordinate_plane_fragments',geometry_pair_planes=65536,
+                geometry_pair_templates=64,geometry_pair_instances=1024,
+                geometry_timing_scope='dispatch including shader encoding and RT queries',
+                geometry_source_operations='source RMSNorm, RoPE, history packing and recurrence')
         self.metadata['source_model']=config.get('source_model')
         self.metadata['coordinate_partition']=config['coordinate_partition']
         self.position=0;self._attention_diagnostic_dirty=False
@@ -258,7 +278,7 @@ class ResidentRuntime:
         result={'output':values[:count].reshape(len(inputs),self.hidden_size),'activation':values[count:].reshape(len(inputs),self.metadata['middle']),'feature_hits':np.frombuffer(payload,'<u4',count=len(inputs),offset=size*4).copy()}
         offset=size*4+len(inputs)*4
         if len(payload)>=offset+24:
-            names=('setup','gate_up','down') if self.metadata['mlp_backend']=='standard' else ('setup','rt_gate_up','rt_down')
+            names=('setup','gate_up','down') if self.metadata['mlp_backend']=='standard' else ('setup','geometry_gate_up','geometry_down') if self.metadata['mlp_backend']=='rt_geometry' else ('setup','rt_gate_up','rt_down')
             result['profile_gpu_ms']=dict(zip(names,map(float,np.frombuffer(payload,'<f8',count=3,offset=offset))))
         return result
 
@@ -282,6 +302,8 @@ class ResidentRuntime:
         payload=self.request(14,len(q),layer,body)
         header=np.frombuffer(payload,'<u4',count=12)
         magic,rows,count,heads,kv_heads,dimension,packet_bytes,block,stride,records,legacy,error=map(int,header)
+        if magic==0x41544731:
+            return self._geometry_attention_result(payload,q,k,query_start,history_start)
         expected_records=spec.attention_heads*sum((min(query_start-history_start+row+1,self.capacity)+self.metadata['attention_block']-1)//self.metadata['attention_block'] for row in range(len(q)))
         if records!=expected_records or legacy!=int(history_start==0):raise RuntimeError('Full-attention diagnostic coverage protocol mismatch')
         compact=self.metadata.get('attention_receipt_format')=='compact_columns'
@@ -344,6 +366,27 @@ class ResidentRuntime:
         else:result.update(receipt_format='dense',receipt_written_bytes=int(result['receipts'].nbytes))
         return result
 
+    def _geometry_attention_result(self,payload,q,k,query_start,history_start):
+        spec=self.model_spec
+        magic,rows,count,heads,kv_heads,dimension,packet_bytes,block,stride,records,legacy,error=struct.unpack_from('<12I',payload)
+        if self.metadata['attention_backend']!='rt_geometry' or (rows,count,heads,kv_heads,dimension,packet_bytes)!=(len(q),len(k),spec.attention_heads,spec.kv_heads,spec.attention_head_dim,spec.history_bytes):
+            raise RuntimeError('Geometry attention diagnostic protocol mismatch')
+        if error:raise RuntimeError(f'Geometry attention error {error}')
+        timing=np.frombuffer(payload,'<f8',count=4,offset=48);offset=80
+        def take(dtype,shape):
+            nonlocal offset
+            value=np.frombuffer(payload,dtype,count=int(np.prod(shape)),offset=offset).copy().reshape(shape)
+            offset+=value.nbytes;return value
+        result=dict(output=take('<f4',(rows,heads,dimension)),physical=take('<f4',(rows,heads,2)),
+            weights=take('<f4',(rows,heads,stride)),history_packets=take('u1',(count,packet_bytes)),
+            query_start=query_start,history_start=history_start,history_positions=np.arange(history_start,history_start+stride),
+            gpu_ms=float(timing[0]),profile_gpu_ms={'geometry_attention':float(timing[0])},submit_wait_ms=float(timing[3]),
+            receipt_format='geometry_weights',legacy_available=False,timing_scope='combined QK, softmax and PV')
+        counters=take('<u4',(8,))
+        result['geometry_queries_cumulative']={'arithmetic':int(counters[1])+(int(counters[2])<<32),'history':int(counters[3])+(int(counters[4])<<32)}
+        if offset!=len(payload):raise RuntimeError('Unexpected geometry attention payload size')
+        return result
+
     def attention_statistics(self,reset=False):
         names=('covered_head_positions','unique_head_positions','qk_products','value_products',
                'full_return_dimensions','returned_dimensions','key_dimensions','value_groups',
@@ -354,6 +397,14 @@ class ResidentRuntime:
         values=np.frombuffer(payload,'<u8',offset=16).reshape(layers,count)
         return dict(total={name:int(values[:,i].sum()) for i,name in enumerate(names)},
                     layers=[dict(layer=layer,**{name:int(value) for name,value in zip(names,row)}) for layer,row in zip(self.model_spec.full_layers,values)])
+
+    def geometry_statistics(self):
+        """Actual cumulative arithmetic/history queries and resident BVH payload."""
+        if self.metadata['attention_backend']!='rt_geometry' and self.metadata['mlp_backend']!='rt_geometry':
+            raise ValueError('Geometry statistics require rt_geometry')
+        data=np.frombuffer(self.request(19,0),'<u8')
+        return dict(zip(('arithmetic_queries','history_micro_rays','space_bytes','score_workspace_bytes',
+                         'exponential_segments','space_builds','score_stride','score_rows','error'),map(int,data)))
 
     def resources(self):
         names = (

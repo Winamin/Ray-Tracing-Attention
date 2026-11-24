@@ -1,0 +1,293 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "resident_common.glsl"
+layout(set=0,binding=46) uniform accelerationStructureEXT arithmeticAS;
+layout(std430,set=0,binding=47) buffer GeometryStatus { uint arithmeticStatus[]; };
+layout(std430,set=0,binding=48) buffer GeometryScores { float geometryScores[]; };
+layout(constant_id=1) const uint tokenRows=8u;
+uint rtLocalQueries=0u;
+uint localHistoryQueries=0u;
+#define RT_GEOMETRY_LOCAL_COUNTER
+#include "rt_geometry_arithmetic.glsl"
+#include "resident_geometry_coefficients.glsl"
+
+// History positions covered per score workgroup. Must equal geometryScoreSegment
+// in resident_geometry_runtime.inl: the host sizes the x dispatch from it, so a
+// mismatch silently drops tail positions instead of failing loudly.
+#define RT_SCORE_SEGMENT 8u
+// score needs RT_SCORE_SEGMENT*128, projection needs 2*tokenRows*128 (=2048 at
+// the default tokenRows of 8). Shrinking this from 4096 halves shared memory and
+// therefore doubles resident workgroups per SM.
+#define RT_GEOMETRY_WORK_FLOATS 2048u
+
+shared float geometryWork[RT_GEOMETRY_WORK_FLOATS];
+shared uint geometryIds[128], geometryQueries[128], historyQueries[128];
+shared RTPreparedMultiplier geometryBeam;
+
+void geometryPublishCounters() {
+    uint lane=gl_LocalInvocationID.x;
+    geometryQueries[lane]=rtLocalQueries;
+    historyQueries[lane]=localHistoryQueries;
+    barrier();
+    for(uint stride=64u;stride!=0u;stride>>=1u) {
+        if(lane<stride) {
+            geometryQueries[lane]+=geometryQueries[lane+stride];
+            historyQueries[lane]+=historyQueries[lane+stride];
+        }
+        barrier();
+    }
+    if(lane==0u) {
+        uint amount=geometryQueries[0],old=atomicAdd(arithmeticStatus[1],amount);
+        if(old+amount<old)atomicAdd(arithmeticStatus[2],1u);
+        amount=historyQueries[0];old=atomicAdd(arithmeticStatus[3],amount);
+        if(old+amount<old)atomicAdd(arithmeticStatus[4],1u);
+    }
+}
+
+float geometryReduce(float value) {
+    uint lane=gl_LocalInvocationID.x;
+    geometryWork[lane]=value;barrier();
+    for(uint stride=64u;stride!=0u;stride>>=1u) {
+        if(lane<stride)geometryWork[lane]=rtAdd(geometryWork[lane],geometryWork[lane+stride]);
+        barrier();
+    }
+    return geometryWork[0];
+}
+
+float geometryMaximum(float value) {
+    uint lane=gl_LocalInvocationID.x;
+    geometryWork[lane]=value;barrier();
+    for(uint stride=64u;stride!=0u;stride>>=1u) {
+        if(lane<stride)geometryWork[lane]=rtMaximum(geometryWork[lane],geometryWork[lane+stride]);
+        barrier();
+    }
+    return geometryWork[0];
+}
+
+void geometryProjection() {
+    uint lane=gl_LocalInvocationID.x,channel=gl_WorkGroupID.x+gl_WorkGroupID.z*32768u,firstRow=gl_WorkGroupID.y*tokenRows;
+    uint base=blockBase(),matrixIndex=operation==0u?3u:operation==1u?4u:cfg.index;
+    bool full=parameters[base+26u]==1u;
+    uint queryWidth=full?Q:RT_STATE_KEY_HEADS*128u,keyWidth=full?RT_GQA_WIDTH:RT_STATE_KEY_HEADS*128u;
+    uint currentWidth=full?Q:S,gateWidth=full?(RT_ATTENTION_GATE==1?Q:0u):S,valueWidth=full?RT_GQA_WIDTH:S;
+    uint outputWidth=matrixIndex==5u?queryWidth+keyWidth+gateWidth+valueWidth:matrixIndex==3u?FEATURE_WIDTH:D;
+    if(channel>=outputWidth||firstRow>=cfg.rows)return;
+    if(matrixIndex==5u) {
+        if(channel<queryWidth)matrixIndex=0u;
+        else if(channel<queryWidth+keyWidth){matrixIndex=1u;channel-=queryWidth;}
+        else if(channel<queryWidth+keyWidth+gateWidth){matrixIndex=6u;channel-=queryWidth+keyWidth;}
+        else{matrixIndex=8u;channel-=queryWidth+keyWidth+gateWidth;}
+    }
+    uint columns=matrixIndex==4u?FEATURE_WIDTH:matrixIndex==2u?currentWidth:D;
+    uint offset=parameters[matrixIndex==8u?base+32u:base+9u+matrixIndex*2u];
+    uint format=parameters[matrixIndex==8u?base+33u:base+10u+matrixIndex*2u];
+    float partial[tokenRows],upper[tokenRows];
+    for(uint row=0u;row<tokenRows;row++){partial[row]=0.0;upper[row]=0.0;}
+    for(uint axis=lane*2u;axis<columns;axis+=256u) {
+        RTPreparedPair coefficient=rtPreparePair(geometryWeight(0u,offset,format,channel,columns,axis),
+                                                geometryWeight(0u,offset,format,channel,columns,axis+1u));
+        RTPreparedPair up;
+        if(matrixIndex==3u)up=rtPreparePair(geometryWeight(0u,parameters[base+19u],parameters[base+20u],channel,columns,axis),
+                                         geometryWeight(0u,parameters[base+19u],parameters[base+20u],channel,columns,axis+1u));
+        for(uint row=0u;row<tokenRows;row++)if(firstRow+row<cfg.rows) {
+            float first=matrixIndex==2u?detector[(firstRow+row)*A+axis]:matrixIndex==4u?feedForward[(firstRow+row)*W+axis]:normalized[(firstRow+row)*D+axis];
+            float second=matrixIndex==2u?detector[(firstRow+row)*A+axis+1u]:matrixIndex==4u?feedForward[(firstRow+row)*W+axis+1u]:normalized[(firstRow+row)*D+axis+1u];
+            partial[row]=rtAdd(partial[row],rtDotPair(first,second,coefficient));
+            if(matrixIndex==3u)upper[row]=rtAdd(upper[row],rtDotPair(first,second,up));
+        }
+    }
+    for(uint row=0u;row<tokenRows;row++) {
+        geometryWork[row*128u+lane]=partial[row];
+        geometryWork[(tokenRows+row)*128u+lane]=upper[row];
+    }
+    barrier();
+    for(uint stride=64u;stride!=0u;stride>>=1u) {
+        if(lane<stride)for(uint row=0u;row<tokenRows;row++) {
+            uint at=row*128u+lane,upAt=(tokenRows+row)*128u+lane;
+            geometryWork[at]=rtAdd(geometryWork[at],geometryWork[at+stride]);
+            if(matrixIndex==3u)geometryWork[upAt]=rtAdd(geometryWork[upAt],geometryWork[upAt+stride]);
+        }
+        barrier();
+    }
+    if(lane==0u)for(uint local=0u;local<tokenRows;local++)if(firstRow+local<cfg.rows) {
+        uint row=firstRow+local;
+        float signal=geometryWork[local*128u];
+        if(matrixIndex==3u) {
+            feedForward[row*W+channel]=rtSwiGLU(signal,geometryWork[(tokenRows+local)*128u]);
+            atomicAdd(featureWork[featureBase(row)],1u);
+            atomicAdd(featureWork[featureGlobal()+8u],1u);
+            atomicAdd(featureWork[featureGlobal()+9u],1u);
+        } else if(matrixIndex==2u||matrixIndex==4u)state[row*D+channel]=rtAdd(state[row*D+channel],signal);
+        else if(matrixIndex==0u) {
+            for(uint copy=0u;copy<(full?1u:RT_STATE_HEADS/RT_STATE_KEY_HEADS);copy++)queries[row*A+channel+copy*queryWidth]=signal;
+        } else if(matrixIndex==1u) {
+            uint target=full?(channel/RT_ATTENTION_HEAD_DIM)*(RT_QUERY_WIDTH/RT_GQA_WIDTH)*RT_ATTENTION_HEAD_DIM+channel%RT_ATTENTION_HEAD_DIM:channel;
+            for(uint copy=0u;copy<(full?RT_QUERY_WIDTH/RT_GQA_WIDTH:RT_STATE_HEADS/RT_STATE_KEY_HEADS);copy++)keys[row*A+target+copy*(full?RT_ATTENTION_HEAD_DIM:keyWidth)]=signal;
+        } else if(matrixIndex==6u)feedForward[row*W+channel]=signal;
+        else {
+            uint target=full?(channel/RT_ATTENTION_HEAD_DIM)*(RT_QUERY_WIDTH/RT_GQA_WIDTH)*RT_ATTENTION_HEAD_DIM+channel%RT_ATTENTION_HEAD_DIM:channel;
+            for(uint copy=0u;copy<(full?RT_QUERY_WIDTH/RT_GQA_WIDTH:1u);copy++)feedForward[row*W+currentWidth+target+copy*RT_ATTENTION_HEAD_DIM]=signal;
+        }
+    }
+}
+
+uint geometryHistoryFirst(uint row) {
+    uint time=absolute(row);
+    return max(cfg.checkpoint,time>=cfg.capacity?time-cfg.capacity+1u:0u);
+}
+
+void geometryScore() {
+    uint lane=gl_LocalInvocationID.x,localRow=gl_WorkGroupID.z,row=localRow+cfg.index;
+    uint head=gl_WorkGroupID.y,first=geometryHistoryFirst(row)+gl_WorkGroupID.x*RT_SCORE_SEGMENT,time=absolute(row);
+    uint count=time>=first?min(RT_SCORE_SEGMENT,time-first+1u):0u;
+    if(count==0u)return;
+    for(uint token=0u;token<RT_SCORE_SEGMENT;token++)geometryWork[token*128u+lane]=0.0;
+    barrier();
+    for(uint axis=lane*2u;axis<RT_ATTENTION_HEAD_DIM;axis+=256u) {
+        float q0=queries[row*A+head*RT_ATTENTION_HEAD_DIM+axis];
+        float q1=queries[row*A+head*RT_ATTENTION_HEAD_DIM+axis+1u];
+        RTPreparedPair beam=rtPreparePair(q0,q1);
+        RTBinaryOperand encoded0=rtEncode(q0),encoded1=rtEncode(q1);
+        float coordinate0=rtScale(encoded0.significand,-2),coordinate1=rtScale(encoded1.significand,-2);
+        if((floatBitsToUint(q0)&RT_SIGN)!=0u)coordinate0=rtNegate(coordinate0);
+        if((floatBitsToUint(q1)&RT_SIGN)!=0u)coordinate1=rtNegate(coordinate1);
+        float x=rtAdd(float(4u*cfg.layer),coordinate0);
+        // One micro-ray for each two-coordinate fragment, reused across a 32-position
+        // history segment. Every accepted primitive retains its causal ID.
+        rayQueryEXT historyRay;
+        localHistoryQueries++;
+        rayQueryInitializeEXT(historyRay,historyAS[0],gl_RayFlagsNoOpaqueEXT|gl_RayFlagsCullBackFacingTrianglesEXT,1u,
+            vec3(x,coordinate1,float(-int(4u*(first+count-1u))-2)),0.00001,vec3(0.0,0.0,1.0),float(4u*count));
+        uint seen=0u;
+        while(rayQueryProceedEXT(historyRay)) {
+            if(rayQueryGetIntersectionTypeEXT(historyRay,false)!=gl_RayQueryCandidateIntersectionTriangleEXT)continue;
+            uint primitive=rayQueryGetIntersectionPrimitiveIndexEXT(historyRay,false);
+            uint slot=(rayQueryGetIntersectionInstanceCustomIndexEXT(historyRay,false)&RT_SLOT_MASK)+primitive/2u;
+            if(primitive>=32u||slot>=cfg.capacity){atomicOr(arithmeticStatus[0],32u);continue;}
+            uint global=parameters[blockBase()+41u]*cfg.capacity+slot,age=slots[global].x;
+            if(age<first||age>=first+count||slot!=age%cfg.capacity)continue;
+            uint local=age-first,bit=1u<<local;
+            if((seen&bit)!=0u)continue;seen|=bit;
+            float key0=geometryHistory(global,head*RT_ATTENTION_HEAD_DIM+axis,false);
+            float key1=geometryHistory(global,head*RT_ATTENTION_HEAD_DIM+axis+1u,false);
+            uint at=local*128u+lane;
+            geometryWork[at]=rtAdd(geometryWork[at],rtDotPair(key0,key1,beam));
+        }
+        uint expected=count==RT_SCORE_SEGMENT?(RT_SCORE_SEGMENT>=32u?0xffffffffu:(1u<<RT_SCORE_SEGMENT)-1u):(1u<<count)-1u;
+        if(seen!=expected)atomicOr(arithmeticStatus[0],32u);
+    }
+    barrier();
+    for(uint stride=64u;stride!=0u;stride>>=1u) {
+        if(lane<stride)for(uint token=0u;token<count;token++) {
+            uint at=token*128u+lane;
+            geometryWork[at]=rtAdd(geometryWork[at],geometryWork[at+stride]);
+        }
+        barrier();
+    }
+    if(lane<count) {
+        uint at=(localRow*RT_ATTENTION_HEADS+head)*cfg.padding1+gl_WorkGroupID.x*RT_SCORE_SEGMENT+lane;
+        geometryScores[at]=rtMultiply(geometryWork[lane*128u],float(RT_ATTENTION_INVERSE_SCALE));
+    }
+}
+
+void geometryAttention() {
+    uint lane=gl_LocalInvocationID.x,head=gl_WorkGroupID.x,localRow=gl_WorkGroupID.y,row=localRow+cfg.index;
+    uint first=geometryHistoryFirst(row),count=absolute(row)-first+1u;
+    uint base=(localRow*RT_ATTENTION_HEADS+head)*cfg.padding1;
+    float maximum=uintBitsToFloat(0xff800000u);
+    for(uint index=lane;index<count;index+=128u)maximum=rtMaximum(maximum,geometryScores[base+index]);
+    maximum=geometryMaximum(maximum);
+    float partial=0.0;
+    for(uint index=lane;index<count;index+=128u) {
+        float energy=rtExp(rtSubtract(geometryScores[base+index],maximum));
+        geometryScores[base+index]=energy;partial=rtAdd(partial,energy);
+    }
+    memoryBarrierBuffer();barrier();
+    float denominator=geometryReduce(partial);
+    for(uint index=lane;index<count;index+=128u)geometryScores[base+index]=rtDivide(geometryScores[base+index],denominator);
+    for(uint index=count+lane;index<cfg.padding1;index+=128u)geometryScores[base+index]=0.0;
+    memoryBarrierBuffer();barrier();
+    float low=0.0,high=0.0;
+    for(uint index=0u;index<count;index++) {
+        if(lane==0u)geometryBeam=rtPrepareMultiplier(geometryScores[base+index]);
+        barrier();
+        uint global=parameters[blockBase()+41u]*cfg.capacity+(first+index)%cfg.capacity;
+        if(lane<RT_ATTENTION_HEAD_DIM)low=rtAdd(low,rtMultiplyPrepared(geometryHistory(global,head*RT_ATTENTION_HEAD_DIM+lane,true),geometryBeam));
+        if(lane+128u<RT_ATTENTION_HEAD_DIM)high=rtAdd(high,rtMultiplyPrepared(geometryHistory(global,head*RT_ATTENTION_HEAD_DIM+lane+128u,true),geometryBeam));
+        barrier();
+    }
+    if(lane<RT_ATTENTION_HEAD_DIM) {
+        uint channel=head*RT_ATTENTION_HEAD_DIM+lane;
+        if(RT_ATTENTION_GATE==1)low=rtMultiply(low,rtSigmoid(feedForward[row*W+channel]));
+        detector[row*A+channel]=low;
+    }
+    if(lane+128u<RT_ATTENTION_HEAD_DIM) {
+        uint channel=head*RT_ATTENTION_HEAD_DIM+lane+128u;
+        if(RT_ATTENTION_GATE==1)high=rtMultiply(high,rtSigmoid(feedForward[row*W+channel]));
+        detector[row*A+channel]=high;
+    }
+    if(lane==0u) {
+        uint at=(row*max(H,uint(RT_ATTENTION_HEADS))+head)*2u;
+        physical[at]=rtAdd(maximum,20.0);physical[at+1u]=denominator;
+    }
+}
+
+void geometryWord() {
+    uint lane=gl_LocalInvocationID.x,word=gl_WorkGroupID.x+gl_WorkGroupID.y*32768u;
+    if(word>=V)return;
+    float partial=0.0;
+    for(uint axis=lane*2u;axis<D;axis+=256u) {
+        if(!wordBlockHit(word,axis/256u))atomicOr(arithmeticStatus[0],64u);
+        RTPreparedPair weight=rtPreparePair(geometryWeight(1u,parameters[16u],parameters[15u],word,D,axis),
+                                            geometryWeight(1u,parameters[16u],parameters[15u],word,D,axis+1u));
+        partial=rtAdd(partial,rtDotPair(state[(cfg.rows-1u)*D+axis],state[(cfg.rows-1u)*D+axis+1u],weight));
+    }
+    float score=geometryReduce(partial);
+    if(lane==0u)wordResult[8192u+word]=floatBitsToUint(score);
+}
+
+void geometryChoose(inout float value,inout uint token,float candidate,uint identity) {
+    uint a=floatBitsToUint(value),b=floatBitsToUint(candidate);
+    if(a==b||((a|b)&RT_MAGNITUDE)==0u){if(identity<token){value=candidate;token=identity;}return;}
+    if(rtMaximumChoice(value,candidate)==1u){value=candidate;token=identity;}
+}
+
+void geometryWordMaximum() {
+    uint lane=gl_LocalInvocationID.x;
+    float value=uintBitsToFloat(0xff800000u);uint token=0xffffffffu;
+    if(operation==6u) {
+        for(uint word=gl_WorkGroupID.x*128u+lane;word<V;word+=16384u)
+            geometryChoose(value,token,uintBitsToFloat(wordResult[8192u+word]),word);
+    } else {value=uintBitsToFloat(wordResult[2048u+lane]);token=wordResult[2176u+lane];}
+    geometryWork[lane]=value;geometryIds[lane]=token;barrier();
+    for(uint stride=64u;stride!=0u;stride>>=1u) {
+        if(lane<stride) {
+            value=geometryWork[lane];token=geometryIds[lane];
+            geometryChoose(value,token,geometryWork[lane+stride],geometryIds[lane+stride]);
+            geometryWork[lane]=value;geometryIds[lane]=token;
+        }
+        barrier();
+    }
+    if(lane==0u) {
+        value=geometryWork[0];token=geometryIds[0];
+        if(operation==6u){wordResult[2048u+gl_WorkGroupID.x]=floatBitsToUint(value);wordResult[2176u+gl_WorkGroupID.x]=token;}
+        else {
+            wordResult[0]=token;wordResult[1]=floatBitsToUint(rtAdd(value,20.0));wordResult[2]=floatBitsToUint(1.0);wordResult[3]=floatBitsToUint(1.0);
+            control[0]=token;
+            if(cfg.mode==1u){wordResult[528u+control[1]]=token;control[1]++;if(token==control[4]||token==control[5])control[2]=0u;}
+        }
+    }
+}
+
+void main() {
+    if(stopped()&&operation!=8u)return;
+    if(operation==0u||operation==1u||operation==4u)geometryProjection();
+    else if(operation==2u)geometryScore();
+    else if(operation==3u)geometryAttention();
+    else if(operation==5u)geometryWord();
+    else if(operation==6u||operation==7u)geometryWordMaximum();
+    geometryPublishCounters();
+    if(operation==8u&&gl_LocalInvocationID.x==0u) {
+        if(arithmeticStatus[0]!=0u)atomicOr(control[3],8192u|arithmeticStatus[0]);
+    }
+}

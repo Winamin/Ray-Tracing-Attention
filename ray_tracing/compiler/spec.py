@@ -2,6 +2,7 @@
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import math
 from pathlib import Path
 
 
@@ -78,6 +79,7 @@ class ModelSpec:
             'RT_STATE_HEADS':self.state_heads,'RT_STATE_KEY_HEADS':self.state_key_heads,
             'RT_GQA_WIDTH':self.kv_width,'RT_ATTENTION_HEADS':self.attention_heads,
             'RT_ATTENTION_HEAD_DIM':self.attention_head_dim,'RT_ROTARY_DIM':self.rotary_dim,
+            'RT_ATTENTION_INVERSE_SCALE':f'{1.0/math.sqrt(self.attention_head_dim):.9g}',
             'RT_QUERY_WIDTH':self.query_width,'RT_STATE_WIDTH':self.state_width,
             'RT_WORKING_WIDTH':self.working_width,'RT_FF_STRIDE':self.feed_forward_stride,
             'RT_FULL_COUNT':len(self.full_layers),'RT_RECURRENT_COUNT':len(self.recurrent_layers),

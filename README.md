@@ -2,88 +2,105 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-![Ray Tracing Attention operator architecture](docs/images/ray_tracing_attention_workflow.png)
+![rt_geometry inference workflow](docs/images/ray_tracing_attention_workflow.png)
 
-**Route a large language model's attention, MLP, and vocabulary addressing through a native ray-tracing pipeline, so causal light paths that hit geometry emit tokens directly.**
+**Language-model inference whose arithmetic is returned by ray-triangle intersection: every sum, product, quotient, exponential, and maximum comes back as a hardware ray-query distance, and the shader only encodes operands, dispatches queries, gathers returns, and synchronizes.**
 
-Ray Tracing Attention (RTA) runs model inference with real Vulkan RT queries, quantized optical coefficients, and GPU detectors. Model weights are translated by a unified compiler and keep their original Q4_K, Q6_K, BF16, FP16, or F32 formats; every layer merges and restores high-dimensional signals before passing them to the next layer. Zero-training translation and native generation have been verified on the public QwenFlash 9B and Qwen3.5 2B models.
+Ray Tracing Attention (RTA) is a Vulkan inference stack for large language models. One compiler translates GGUF files and Hugging Face safetensors directories into a model spec, and the native worker runs the source weights without retraining and without expanded copies: Q4_K, Q6_K, BF16, FP16, and F32 payloads keep their original packing. With the `rt_geometry` backend, full attention, the SwiGLU MLP, and the LM Head readout run against a resident arithmetic BVH instead of evaluating floating-point instructions in the shader. Zero-training translation and native generation are verified on the public QwenFlash 9B and Qwen3.5 2B models with the default backends.
 
-## How it works
+```powershell
+rt-chat --attention-backend rt_geometry --mlp-backend rt_geometry
+```
 
-Ray Tracing Attention organizes a language model's high-dimensional signals and weights as light paths: **Q issues the query, the Tree locates geometric targets that can contribute, light intensity carries the magnitude of each contribution, and the detector recovers content and merges it into the next layer's high-dimensional state.** Full attention uses a history light-path Tree, recurrent layers use a continuously updated optical field, and Ray Tracing MLP plus vocabulary readout reuse the same intersection and detection mechanism.
+The default backend remains `standard`. Attention and MLP are selected independently, and either choice also enables the geometric LM Head.
 
-### High-dimensional space and lossless segmentation
+## How the arithmetic moves into geometry
 
-A high-dimensional vector is split coordinate-wise into 2D segments. Each segment keeps its own coordinates, signs, and scales; after computation the segments are concatenated in the original order to restore the full vector:
-
-$$
-h = P^{-1}\!\left(\bigoplus_b P_b h\right).
-$$
-
-Here $P_b$ selects the corresponding segment and $P^{-1}$ restores the original permutation. Segmentation provides a parallel geometric representation; the readout of every Attention and MLP layer returns to the full high-dimensional state before moving to the next layer. The Q4_K / Q6_K storage of history light paths is governed separately by the quantization formats.
-
-### How light intensity maps to full attention
-
-A Transformer scores history position $j$ with $s_{tj}=q_t^\top k_j/\sqrt d$. The corresponding amplified light intensities, content detection signals, and reference signals are:
+A query is the entire operation. The shader picks a field with an instance mask, sets the origin and direction, and reads the committed hit:
 
 $$
-I_{tj}=e^{c_t+s_{tj}},\qquad
-S_t=\sum_{j\le t}I_{tj}\,g_j,\qquad
-R_t=\sum_{j\le t}I_{tj}.
+\mathcal Q_{\mathcal F}(\mathbf o,\mathbf d)=(t,\iota),\qquad \mathbf r(t)=\mathbf o+t\,\mathbf d .
 $$
 
-$g_j$ is the content recovered from the hit geometry. Intensity stays amplified and $c_t$ controls the common gain; the detector recovers relative contributions through the ratio of content signal to reference signal:
+$t$ is the intersection distance and carries the value; $\iota$ is the instance and primitive identity and carries the operand choice. One TLAS holds five triangle fields, built once and reused by every layer, matrix row, query head, and later token:
+
+| Field | Geometry | What the hit returns |
+|---|---|---|
+| Sum and quotient plane | quad on $z=y$ | $t=a+b$, $t=a-b$, $t=a/b$ |
+| Unit plane | quad on $z=1$ | $t=1/b$, a reusable reciprocal |
+| Exponential strips | 4096 quads of $z=2^x$ on $[-1,1]$ | interpolated $2^x$ |
+| Comparison planes | two crossing quads | nearest-hit identity selects the winning operand |
+| Paired coefficient planes | 64 templates as 1024 instances, 65,536 coefficient planes | $t=2/(1-\alpha u-\beta v)$ |
+
+The shader never evaluates these operations. It splits each FP32 operand into a sign bit, a binary exponent, and a significand, aligns the two operands by integer shifting, and puts the aligned magnitudes on the ray. The exponent is restored afterwards by bit packing, including ties-to-even rounding into the subnormal range. For the plane $z=y$:
 
 $$
-\frac{S_t}{R_t}
-=\sum_{j\le t}\frac{e^{s_{tj}}}{\sum_{k\le t}e^{s_{tk}}}\,g_j.
+\mathbf o=(0,b,-a),\ \mathbf d=(0,0,1)\ \Rightarrow\ t=a+b,
+\qquad
+\mathbf o=(0,a,0),\ \mathbf d=(0,0,b)\ \Rightarrow\ t=a/b .
 $$
 
-When the geometric readout restores the reference model's value information and preserves every contribution, this is exactly the full attention operator. RT Core performs BVH traversal and intersection, and the Vulkan detection shaders read optical coefficients by hit identity, accumulate signals, and recover the high-dimensional output. Multiple heads, coordinate segments, and candidate queries run in parallel, and layers connect through the high-dimensional state.
+A product takes two intersections: $z=1$ returns $1/b$, then $z=y$ returns $a/(1/b)$. Subtraction is an addition of the sign-flipped operand. Maximum selection is not a compare: two crossing planes put the smaller operand in front for a downward ray, and the hit identity of the committed triangle says which source operand won, so the winner is never rebuilt from $4-t$.
 
-### How Ray Tracing MLP carries the source weights
+### Paired fragments and the full row
 
-Given a source model's SwiGLU transform:
+A weight row is read two coordinates at a time. The 24-bit significand is written in radix 256, $S=c_2\,2^{16}+c_1\,2^{8}+c_0$; the top two digits are evaluated, which keeps 16 significand bits (relative $1.5\times10^{-5}$) and removes a third of the dependent ray chain per pair. That truncation stays below the Q4_K / Q6_K step of these models. Positive and negative contributions stay in separate channels until their geometric difference, so a small residual is not lost inside $1-2/t$.
 
-$$
-z=\mathrm{SiLU}(W_g h)\odot(W_u h),\qquad y=W_dz.
-$$
-
-Weight coefficients participate in the readout as optical transmission coefficients. For an input component $x$ and coefficient $w$, the positive and negative detection channels accumulate same-sign and opposite-sign contributions; the amplification factor $\alpha>0$ applies to both the emission and the transmission scale:
+Template $p$ is the plane $z=8p+2+(p/256)y$; instance shears supply the other coefficient and the upper two bits of the second one. The input travels in the direction, so instance translations never round it, and the returned distance is
 
 $$
-E^+=|\alpha x|\,|w/\alpha|\,\mathbf1_{xw\ge0},\qquad
-E^-=|\alpha x|\,|w/\alpha|\,\mathbf1_{xw<0},\qquad
-E^+-E^-=xw.
+t=\frac{2}{1-\alpha u-\beta v}.
 $$
 
-The channels merge into the gate and up signals, the detection response completes SwiGLU, and the down optical coefficients restore the output. The compiler keeps the source model's coefficient payloads, and the feature Tree returns the identities of features participating in the readout; the same operator set adapts to the dimensions and weights of different models.
-
-![Ray Tracing Attention and MLP operators](docs/images/ray_tracing_attention_layer_detail.png)
-
-The operator diagram expands the intensity detection of full attention, the decay and correction of the recurrent optical field, and the gate/up, SiLU, and down transmission of the MLP. Solid tensors represent high-dimensional signals and field states, nested bounding boxes represent the geometric query space, and each layer's readout restores the full high-dimensional state.
-
-### Vocabulary and causal Tree emit tokens directly
-
-The vocabulary geometry comes from the model's LM Head. The high-dimensional state drives the vocabulary query, hit receipts enter parallel coefficient readout, and the strongest signal selects the output token. The answer, together with the current causal address, is written into the token Tree:
+Geometric division and subtraction recover $\alpha u+\beta v=1-2/t$, and binary scaling rebuilds the fragment scale. The full row is not truncated:
 
 $$
-\mathcal Q_t=(\text{full input path},\text{generated tokens},t,\text{stop settings},\text{runtime identity})
-\quad\longmapsto\quad y_t.
+y_r=\sum_b h_b^{\mathsf T} w_{r,b},
 $$
 
-Each output position queries the Tree once. An existing path hit returns the token directly and advances the address for the next step; a new path runs through the RT layers and writes its result into the Tree. Input and generation endpoints store shared block references, high-dimensional readout rows, and light-path addresses; consecutive hits stream tokens along the addresses, and new light paths form the current recurrent field through native propagation.
+where the shader accumulates fragments and reduces them through a 128-lane shared tree, and every reduction edge is another `rtAdd()` intersection. The BVH holds no cross-ray accumulator; the indexing, buffers, and barriers stay in the shader.
 
+![rt_geometry paired intersections and geometric reduction](docs/images/ray_tracing_attention_compact_detail.png)
 
-![Ray Tracing Attention Cache](docs/images/ray_tracing_attention_compact_detail.png)
+Source bits select a reusable pair plane, the returned fragment becomes the next operand, and the same scalar fields serve softmax normalization and maximum selection.
+
+### Source coefficients in their original format
+
+Weights are not unpacked into a second float copy. The geometry reads the packed payload and decodes it through the same space: Q4_K block scales and affine minima go through `rtMultiply()` and `rtSubtract()`, Q6_K scales through `rtMultiply()`, and BF16, FP16 and F32 are read directly. The history packets keep the same Q4_K / Q6_K layout as the rest of the runtime.
+
+## One layer's path
+
+![rt_geometry attention and MLP operators](docs/images/ray_tracing_attention_layer_detail.png)
+
+For a full-attention layer with both geometry backends selected:
+
+1. **Prepared input.** Embedding, RMSNorm, RoPE, Q/K normalization, and history quantization stay on the existing source path and hand over a prepared state and prepared history packets.
+2. **QKV projection.** Paired row dots for Q, K, the output gate, and V in one dispatch; the result is split by channel range into the same buffers the other backends use.
+3. **History update.** Prepared Q/K are written into the existing causal history packets and the history BVH is updated.
+4. **Causal QK.** Each query head sends one micro-ray per coordinate pair. A score workgroup covers 8 history positions per segment, so one ray is reused across that segment. Every accepted primitive is verified against its slot and causal position, the two triangles of the same quad collapse to one receipt, and the dot pair is scaled with `rtMultiply()`.
+5. **Softmax.** Maximum through comparison planes and the shared tree, shifted energy through the exponential strips, denominator through the `rtAdd()` tree, probabilities through `rtDivide()`. Future positions are written as zero weight.
+6. **Value aggregation.** Every output coordinate keeps its own accumulator; the probability is prepared once as a reciprocal and reused for both halves of the head width. An optional output gate applies `rtSigmoid()` before the result leaves the attention buffer.
+7. **Output projection and residual.** Paired row dots, then the residual add through `rtAdd()`.
+8. **MLP.** Gate and up dots share one coefficient encoding for a tile of 8 tokens, `rtSwiGLU()` forms the activation, the down projection uses the same paired path, and the residual add goes back through the geometry.
+9. **LM Head.** Vocabulary rows are verified against the covering structure, each row scores with geometric dots, and a comparison reduction across workgroups selects the token. Equal logits and signed zeros keep the original token-ID order. The token is written by the native worker and streamed to the CLI.
+
+### What still runs on the source path
+
+The geometry space covers projections, QK, softmax, full V aggregation, the attention gate, the MLP, the residual adds, and the LM Head. Embeddings and input preparation, RMSNorm, Q/K normalization, RoPE, history quantization and packing, the vocabulary covering build, tokenization, and the recurrent layers of hybrid models still use their existing implementations.
+
+## Numerics
+
+The exponential surface is a 4096-segment piecewise-linear approximation of $2^x$ built at startup, FP32 triangle intersection adds its own error, and the two leading significand digits bound the coefficient terms. Results are close to but not bit-identical with the source path.
+
+The tables below were measured with the default backends.
 
 ## Key capabilities
 
-- **Unified model compilation.** GGUF files and Hugging Face safetensors directories share one entry point. The model spec describes the vocabulary, head dimensions, GQA, layer order, RoPE, and recurrent state; the same shaders build the native pipeline from the spec.
-- **Ray Tracing Attention and Ray Tracing MLP.** Rays query the history Tree, the MLP feature and fixed-coefficient Trees, and the vocabulary Tree; the detector aggregates contributions from real hit receipts. Q4_K / Q6_K decode 256-coefficient blocks in parallel, and small parameters keep their source precision.
-- **Causal token Tree.** Every prediction position queries the Tree once; a hit returns the token directly and continues along the next-step address. Decode addresses are validated jointly by the high-dimensional signal, the recurrent field, valid history light paths, position, and stop settings, and hits return the token plus the successor address. Shared history is shared by content, with freely adjustable batches and output budgets.
-- **GPU-resident execution.** Model intermediate signals stay on the GPU, and the native worker runs generation continuously. Shared input embeddings and LM Head keep a single copy of the original payload.
-- **True per-token streaming.** The CLI receives and refreshes each token as the model emits it. The status line at the bottom shows RT query timing, sensor readings, generation speed, and GPU memory; `/fx` expands the detailed report.
+- **Unified model compilation.** GGUF files and Hugging Face safetensors directories share one entry point. The model spec describes the vocabulary, head dimensions, GQA, layer order, RoPE, and recurrent state, and the native pipeline is built from that spec.
+- **Geometric attention and MLP.** Rays query the causal history BVH, the arithmetic BVH, and the vocabulary covering; every contribution comes from a real committed hit. Q4_K / Q6_K blocks decode 256 coefficients in parallel, and small parameters keep their source precision.
+- **Validated reply cache.** Each verified reply and its successor address enter the causal answer tree. A full request hit replays the verified path and streams cached tokens without a forward pass; a new branch runs the forward pass.
+- **GPU-resident execution.** Intermediate signals stay on the GPU, and the native worker generates continuously. Input embeddings and the LM Head keep a single copy of the original payload.
+- **True per-token streaming.** The CLI receives and refreshes each token as the model emits it. The status line shows RT query timing, sensor readings, generation speed, and GPU memory; `/fx` expands the detailed report.
 
 ## Getting started
 
@@ -96,7 +113,7 @@ rt-compile "path/to/model.gguf" --output .local/models/chat --activate
 rt-chat
 ```
 
-You can also compile a safetensors model directory directly:
+A safetensors model directory can be compiled directly:
 
 ```powershell
 rt-compile "path/to/hf-model" --output .local/models/chat-hf
@@ -111,12 +128,14 @@ rt-build .local/models/chat
 rt-chat --prompt "write a Python binary search function" --max-tokens 256
 rt-chat --prompt-file task.txt --jsonl
 rt-chat --capacity 1024 --profile --no-cache
+rt-chat --attention-backend rt_geometry --mlp-backend rt_geometry
 ```
 
 `--activate` sets the machine-default model; `RT_MODEL` points to a model directory and `RT_HOME` to the local asset and build-cache directory. Native builds are reused by model spec and source fingerprint. The default generation budget is **65536 tokens**.
 
 ## Measured results
 
+Previous commit: `d8e86c2`. Data unchanged.
 
 | Workload | Measured result |
 |---|---:|
@@ -137,10 +156,7 @@ Four rounds of real tasks read this project's runtime, builder, attention inters
 | 3 | Full packets and column equivalence | 4096 | 85 | 11424.91 | 3.41 |
 | 4 | Causal cache branch review | 5792 | 121 | 20799.59 | 4.56 |
 
-
-
 ## Long context and memory
-
 
 | History slots | RTA history packet MiB | BF16 KV payload MiB (formula) | RTA device allocation MiB (cache on/off) | Driver peak increment MiB (cache on/off) | Same-source Vulkan peak increment MiB |
 |---:|---:|---:|---:|---:|---:|
@@ -150,7 +166,6 @@ Four rounds of real tasks read this project's runtime, builder, attention inters
 | 4096 | 44.25 | 128.00 | 5954.19 / 5954.19 | 6442 / 6388 | 5159 |
 | 8192 | 88.50 | 256.00 | 6014.44 / 6014.44 | 6554 / 6260 | — |
 
-
 | Input length (counted after each round's reply) | Boundary high-dimensional row payload | Shared history blocks and scene |
 |---:|---:|---:|
 | 203 tokens | 49,152 bytes · 3 boundaries | 3.88 MiB |
@@ -158,16 +173,16 @@ Four rounds of real tasks read this project's runtime, builder, attention inters
 | 959 tokens | 229,376 bytes · 14 boundaries | 19.00 MiB |
 | 1228 tokens | 311,296 bytes · 19 boundaries | 24.26 MiB |
 
-
+The resident arithmetic space itself is five BLAS and one TLAS built once per worker; its build scratch is released after construction and the vertices, instances, and backing storage stay resident.
 
 ## Models and operators
 
 | Interface | Native configuration |
 |---|---|
 | Model adapters | Text models of Qwen3.5, Qwen3, and Llama |
-| Coefficient formats | Q4_K, Q6_K, BF16, FP16, F32 — original payloads translated |
-| Full attention | GQA, even head dimensions 2–256, partial or full standard RoPE dimensions, optional Q/K normalization and output gating |
-| Optical recurrence | 128-dim state heads, 4th-order convolution, configurable shared key and value heads |
+| Coefficient formats | Q4_K, Q6_K, BF16, FP16, F32, original payloads translated |
+| Full attention | GQA, even head dimensions 2-256, partial or full standard RoPE dimensions, optional Q/K normalization and output gating |
+| Recurrent layers | 128-dim state heads, 4th-order convolution, configurable shared key and value heads; these layers keep the source path |
 | Hidden and matrix widths | 256-coefficient block alignment; independent hidden, attention, and recurrence widths |
 | GGUF tokenization | Qwen2 / Qwen3.5 / Llama byte BPE; safetensors uses the source tokenizer and chat template |
 
@@ -175,7 +190,7 @@ New models plug in through source-weight adapters and the `ModelSpec` interface;
 
 ## CLI
 
-The CLI, Python, and the native worker enable cache by default. A full hit reuses the verified reply/state path and a new branch runs the forward pass; use `--no-cache` or `cache=False` to disable it explicitly.
+The CLI, Python, and the native worker enable cache by default. A full hit reuses the verified reply and state path and a new branch runs the forward pass; use `--no-cache` or `cache=False` to disable it explicitly.
 The conversation stays compact by default. `/fx` shows per-round performance, `/rt` shows RT status, `/memory` shows GPU memory, and `/log` shows the log path. `/continue N` continues writing, `/retry` replays, `/tokens N` sets the budget, `/paste` and `/end` handle multi-line input, and `/save` and `/load` save and restore sessions.
 
 ## Repository layout
@@ -193,12 +208,12 @@ Ray Tracing Attention/
   ray_tracing/
     compiler/                   Source-weight adapters, specs, translation, and builds
     runtime/                    Native protocol, tokenization, chat, and live status
-    native/src/                 Vulkan engine, geometric scenes, shared causal cache
-    native/shaders/             Shared RT and optical compute shaders
+    native/src/                 Vulkan engine, geometry scenes, shared causal cache
+    native/shaders/             RT arithmetic fields and model shaders
     native/include/             Vulkan headers
-  docs/images/                  English operator diagram PNGs and the rendering script
+  docs/images/                  Architecture figures as PNG
   docs/paper/images/            Paper figures as PDF
-  docs/paper/                   Finished paper PDF and embedded figures
+  docs/paper/                   Finished paper PDF
   .github/workflows/            Source syntax and packaging checks
   .local/                       Local models, tools, build caches, and sessions
 ```

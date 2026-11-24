@@ -1,0 +1,93 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_ray_query : require
+layout(local_size_x=128) in;
+layout(set=0,binding=0) uniform accelerationStructureEXT arithmeticAS;
+layout(std430,set=0,binding=1) buffer ArithmeticValues { float arithmeticValues[]; };
+layout(std430,set=0,binding=2) buffer ArithmeticStatus { uint arithmeticStatus[]; };
+layout(push_constant) uniform ArithmeticConfig {
+    uint operation, rows, columns, channels, left, right, outputOffset, scratch, scale;
+} cfg;
+#include "rt_geometry_arithmetic.glsl"
+
+shared float reductionNodes[128];
+shared float maximumNodes[128];
+
+float rtReduce(float contribution) {
+    uint lane = gl_LocalInvocationID.x;
+    reductionNodes[lane] = contribution;
+    barrier();
+    for (uint stride = 64u; stride != 0u; stride >>= 1u) {
+        if (lane < stride) reductionNodes[lane] = rtAdd(reductionNodes[lane], reductionNodes[lane + stride]);
+        barrier();
+    }
+    return reductionNodes[0];
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    if (cfg.operation == 3u || cfg.operation == 5u) {
+        uint row = gl_WorkGroupID.x;
+        uint first = cfg.left + row * cfg.columns;
+        if (cfg.operation == 5u) {
+            // Closest-hit comparison selects the stable reference in the same
+            // geometry space used for exponentials, reduction and division.
+            float selected = uintBitsToFloat(0xff800000u);
+            for (uint axis = lane; axis < cfg.columns; axis += 128u)
+                selected = rtMaximum(selected, arithmeticValues[first + axis]);
+            maximumNodes[lane] = selected;
+            barrier();
+            for (uint stride = 64u; stride != 0u; stride >>= 1u) {
+                if (lane < stride) maximumNodes[lane] = rtMaximum(maximumNodes[lane], maximumNodes[lane + stride]);
+                barrier();
+            }
+            float reference = maximumNodes[0];
+            for (uint axis = lane; axis < cfg.columns; axis += 128u)
+                arithmeticValues[cfg.scratch + row * cfg.columns + axis] = rtExp(rtSubtract(arithmeticValues[first + axis], reference));
+            memoryBarrierBuffer();
+            barrier();
+        }
+        float partial = 0.0;
+        uint source = cfg.operation == 5u ? cfg.scratch + row * cfg.columns : first;
+        for (uint axis = lane; axis < cfg.columns; axis += 128u)
+            partial = rtAdd(partial, arithmeticValues[source + axis]);
+        float denominator = rtReduce(partial);
+        if (cfg.operation == 3u) {
+            if (lane == 0u) arithmeticValues[cfg.outputOffset + row] = denominator;
+        } else {
+            for (uint axis = lane; axis < cfg.columns; axis += 128u)
+                arithmeticValues[cfg.outputOffset + row * cfg.columns + axis] = rtDivide(arithmeticValues[source + axis], denominator);
+        }
+        return;
+    }
+    if (cfg.operation == 6u) {
+        uint row = gl_WorkGroupID.y, channel = gl_WorkGroupID.x;
+        float partial = 0.0;
+        for (uint axis = lane*2u; axis < cfg.columns; axis += 256u) {
+            float first = arithmeticValues[cfg.left + row * cfg.columns + axis];
+            float second = axis+1u<cfg.columns?arithmeticValues[cfg.left + row * cfg.columns + axis+1u]:0.0;
+            float weight0 = arithmeticValues[cfg.right + channel * cfg.columns + axis];
+            float weight1 = axis+1u<cfg.columns?arithmeticValues[cfg.right + channel * cfg.columns + axis+1u]:0.0;
+            partial = rtAdd(partial, rtDotPair(first,second,rtPreparePair(weight0,weight1)));
+        }
+        float result = rtReduce(partial);
+        if (lane == 0u) {
+            if (cfg.scale != 0xffffffffu) result = rtMultiply(result, arithmeticValues[cfg.scale]);
+            arithmeticValues[cfg.outputOffset + row * cfg.channels + channel] = result;
+        }
+        return;
+    }
+    uint index = gl_WorkGroupID.x * 128u + lane;
+    if (index >= cfg.rows * cfg.columns) return;
+    float left = arithmeticValues[cfg.left + index];
+    float result;
+    if (cfg.operation == 4u) result = rtExp(left);
+    else {
+        float right = arithmeticValues[cfg.right + index];
+        if (cfg.operation == 0u) result = rtAdd(left, right);
+        else if (cfg.operation == 1u) result = rtMultiply(left, right);
+        else if (cfg.operation == 2u) result = rtDivide(left, right);
+        else result = rtSwiGLU(left, right);
+    }
+    arithmeticValues[cfg.outputOffset + index] = result;
+}
