@@ -89,6 +89,7 @@ uvec4 encodeCoordinate(float value){
     float middle=uintBitsToFloat(floatBitsToUint(remainder)&0xffff0000u),low=remainder-middle;
     return uvec4(floatBitsToUint(high)>>16u,floatBitsToUint(middle)>>16u,floatBitsToUint(low)>>16u,uint(shiftExponent+256)|(sign<<9u));
 }
+
 float restoreCoordinate(uvec3 reference,uint meta){
     float mantissa=uintBitsToFloat(control[scalarCacheOffset()+reference.x])+uintBitsToFloat(control[scalarCacheOffset()+reference.y])+uintBitsToFloat(control[scalarCacheOffset()+reference.z]);
     uint sign=(meta>>9u)<<31u;if(mantissa==0)return uintBitsToFloat(sign);int exponent=int(meta&511u)-256+126;uint fraction=floatBitsToUint(mantissa)&0x7fffffu;
