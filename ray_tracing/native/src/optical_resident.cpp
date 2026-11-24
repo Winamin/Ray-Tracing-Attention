@@ -1711,6 +1711,8 @@ public:
             attachedBlocks = hit->blocks;
         prefixTokens = count;
         currentGenerated.clear();
+        if (replyTree)
+            replyTree->predecessor = 0xffffffffu;
         stateCursor = 0;
         attentionDiagnosticDirty = false;
         if (cacheEnabled)
@@ -1936,6 +1938,8 @@ public:
             rejected = result[87];
             if (cachedCount > count || header[1] != cachedCount)
                 throw std::runtime_error("Invalid cached path receipt");
+            if (cachedCount)
+                replyTree->predecessor = cacheLeaf;
             uint64_t stamps[2];
             check(vkGetQueryPoolResults(e.device, rtTimestamps, 0, 2, 16, stamps, 8, VK_QUERY_RESULT_64_BIT), "read cache RT timing");
             cacheRT = double(stamps[1] - stamps[0]) * e.period / 1e6;
