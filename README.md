@@ -8,7 +8,7 @@
 
 Ray Tracing Attention (RTA) is a Vulkan inference stack for large language models. One compiler supports GGUF and Hugging Face safetensors. Export preserves source Q4_K, Q6_K, BF16, FP16, and F32 payloads by default, with optional FP16 conversion for selected tensors. Zero-training translation and native generation have been verified on QwenFlash 9B and Qwen3.5 2B using the default backends.
 
-The `rt_geometry` backend queries a reusable arithmetic BVH. Shaders encode operands, recover fragments, organize reductions, and synchronize buffers. Existing preparation interfaces provide normalization, positional processing, and history writes.
+The `rt_geometry` backend queries a reusable arithmetic BVH. Shaders encode operands, recover fragments, organize reductions, and synchronize buffers. The current pure geometry path gives every coordinate pair one plane intersection, so a row costs one ray query per pair plus an FP32 reduction. Existing preparation interfaces provide normalization, positional processing, and history writes.
 
 ```powershell
 rt-chat --attention-backend rt_geometry --mlp-backend rt_geometry
@@ -39,13 +39,13 @@ For example, $\mathbf o=(0,b,-a)$ and $\mathbf d=(0,0,1)$ return $t=a+b$ on $z=y
 
 ### Paired fragments and the full row
 
-Rows are read in coordinate pairs. The current `rtDotPair` retains source bit encodings but queries rounded leading 8-bit coefficients. Inputs and product signs are encoded in the origin, with direction `(0,0,1)`:
+Rows are read in coordinate pairs. The current `rtDotPair` retains source bit encodings but queries rounded leading 8-bit coefficients. Inputs and product signs are encoded in the origin, with direction `(0,0,1)`; $x_g$ is the instance translation and $c$ the plane offset:
 
 $$
 \mathbf o=(x_g+x,y,z_p),\qquad t=c+\alpha x+\beta y.
 $$
 
-The shader restores the binary scale and removes the offset with an FP32 subtraction. All fragments enter a shared reduction tree; each internal addition uses an `rtAdd()` intersection. Under ideal intersections, its root is the complete dot product of the rounded effective coefficients $\bar w$:
+The shader restores the binary scale and removes the constant with one FP32 subtraction. Fragments then accumulate and reduce in FP32: the tree fixes the addition order, and only the coefficient products stay geometric. Under ideal intersections its root is the complete dot product of the rounded effective coefficients $\bar w$:
 
 $$
 y_r\approx\sum_b\phi_b=\bar w_r^{\mathsf T}h.
@@ -55,9 +55,27 @@ $$
 
 Matrix cells illustrate tensor shapes, and tree edges expose the reduction dependencies. The BVH performs intersections; device buffers store accumulation state across rays.
 
+### Pure geometry fragments
+
+The current paired field gives every coefficient pair its own plane. 256 templates cover the second coefficient and 256 instances cover the first, so 65,536 planes span all pairs. Template $p$ is $z=8p+0.75+\frac{p}{256}y$, an instance adds the shear $\frac{g}{256}x$, and the ray starts at $(4g+x,\ y,\ 8p)$ with direction $(0,0,1)$:
+
+$$
+t=0.75+\frac{g}{256}\,x+\frac{p}{256}\,y .
+$$
+
+The coefficient keeps its sign and binary exponent; the plane identity carries the leading 8 bits of its significand, rounded to the nearest value and clamped at the top. A fragment is therefore
+
+$$
+\phi=2^{P+4}\left(t-0.75\right),
+$$
+
+where $P$ is the common binary exponent of the pair.
+
+One traversal per coordinate pair replaces the earlier chain of radix-256 digit segments and sign channels. A row now costs one ray query per pair plus FP32 accumulation, where the first geometry version spent more than a dozen intersections per pair on digits, channels, and geometric merges.
+
 ### Source coefficients and history packets
 
-The default path reads packed source payloads. Q4_K scales and affine minima, and Q6_K scales, use geometric multiplication and subtraction; BF16, FP16, and F32 use their format readers. Optional FP16 export converts selected quantized tensors ahead of inference. History packets retain their layouts and are addressed through format metadata.
+The default path reads packed source payloads. Q4_K scales and affine minima, and Q6_K scales, use geometric multiplication and subtraction; BF16, FP16, and F32 use their format readers. Optional FP16 export converts selected quantized tensors ahead of inference: `rt-compile <model> --fp16 --fp16-scope geometry` resolves the coefficient tensors the geometry path reads element by element, and the shader then reads a pair with one `unpackHalf2x16` instead of decoding a block header per element. The scope also accepts `all`, `ffn`, `ffn_word`, and `recurrent_ffn`. The plane still uses the leading 8 bits, so F16 export changes decode cost, not fragment precision. History packets retain their layouts and are addressed through format metadata.
 
 ## One layer's path
 
@@ -69,10 +87,10 @@ For a full-attention layer with both geometry backends selected:
 2. **QKV projection.** Paired row dots for Q, K, the output gate, and V in one dispatch; the result is split by channel range into the same buffers the other backends use.
 3. **History update.** Prepared K/V are written into the existing causal history packets and the history BVH is updated.
 4. **Causal QK.** Each query head sends one micro-ray per coordinate pair. Score workgroups process history segments and reuse each ray within its segment. Every accepted primitive is verified against its slot and causal position, the two triangles of the same quad collapse to one receipt, and the dot pair is scaled with `rtMultiply()`.
-5. **Softmax.** Maximum through comparison planes and the shared tree, shifted energy through the exponential strips, denominator through the `rtAdd()` tree, probabilities through `rtDivide()`. Future positions are written as zero weight.
-6. **Value aggregation.** Every output coordinate keeps its own accumulator; the probability is prepared once as a reciprocal and reused for both halves of the head width. An optional output gate applies `rtSigmoid()` before the result leaves the attention buffer.
+5. **Softmax.** Maximum through comparison planes and the shared tree, shifted energy through the exponential strips, denominator through the FP32 tree, probabilities through `rtDivide()`. Future positions are written as zero weight.
+6. **Value aggregation.** Every output coordinate keeps its own FP32 accumulator over geometric products; the probability is prepared once as a reciprocal and reused for both halves of the head width. An optional output gate applies `rtSigmoid()` before the result leaves the attention buffer.
 7. **Output projection and residual.** Paired row dots, then the residual add through `rtAdd()`.
-8. **MLP.** Gate and up share their input, and each branch reuses its own coefficient encoding within a token tile, `rtSwiGLU()` forms the activation, the down projection uses the same paired path, and the residual add goes back through the geometry.
+8. **MLP.** Gate and up run as two passes that share the input and keep their own coefficient encodings within a token tile; the up pass applies `rtSwiGLU()` against the stored gate value, the down projection uses the same paired path, and the residual add goes back through `rtAdd()`.
 9. **LM Head.** Vocabulary rows are verified against the covering structure, each row scores with geometric dots, and a comparison reduction across workgroups selects the token. Equal logits and signed zeros keep the original token-ID order. The token is written by the native worker and streamed to the CLI.
 
 ### What still runs on the source path
@@ -82,6 +100,8 @@ The geometry space covers projections, QK, softmax, full V aggregation, the atte
 ## Numerics
 
 The current path includes 8-bit coefficient rounding, FP32 intersection error, and exponential-strip interpolation. Complete coordinate coverage and numerical equivalence require separate validation. Fragment recovery also includes scale restoration and offset subtraction error.
+
+Dot fragments, the exponential, maximum, division, sigmoid, and residual adds remain geometric; partial sums and reduction trees accumulate in FP32 in the shader.
 
 The tables below were measured with the default backends.
 
@@ -116,6 +136,7 @@ Source entry points are `rt_chat.cmd`, `rt_compile.cmd`, `python -m ray_tracing.
 ```powershell
 rt-compile "path/to/model.gguf" --inspect
 rt-build .local/models/chat
+rt-compile "path/to/model.gguf" --output .local/models/chat-f16 --fp16 --fp16-scope geometry
 rt-chat --prompt "write a Python binary search function" --max-tokens 256
 rt-chat --prompt-file task.txt --jsonl
 rt-chat --capacity 1024 --profile --no-cache
