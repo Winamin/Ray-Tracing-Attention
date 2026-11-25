@@ -1,6 +1,3 @@
-// Scalar arithmetic is returned as native triangle intersection distances.
-// Shader integer operations encode signs and binary scales and route queries;
-// no floating add, multiply, divide, exp, or reduction is evaluated here.
 const uint RT_SIGN = 0x80000000u;
 const uint RT_MAGNITUDE = 0x7fffffffu;
 const uint RT_INFINITY = 0x7f800000u;
@@ -42,8 +39,6 @@ RTBinaryOperand rtEncode(float value) {
     return RTBinaryOperand(uintBitsToFloat(0x3f800000u | fraction), int(encodedExponent) - 127);
 }
 
-// Scale by a power of two through IEEE-754 packing, including ties-to-even
-// subnormal rounding. This keeps ray coordinates in a bounded local chart.
 float rtScale(float value, int shift) {
     uint bits = floatBitsToUint(value);
     uint sign = bits & RT_SIGN;
@@ -82,15 +77,13 @@ float rtIntersectionHit(uint operatorId, vec3 origin, vec3 direction, out uint p
         1u << operatorId, origin, 0.0, direction, 8.0);
     while (rayQueryProceedEXT(query)) {}
     if (rayQueryGetIntersectionTypeEXT(query, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
-        // Tag which operator field was missed (bits 7..11 = operator 0..4) so a
-        // miss is attributable; bit 1 alone does not say where it happened.
         atomicOr(arithmeticStatus[0], 128u << operatorId);
         return rtInvalid(1u);
     }
     uint instance=rayQueryGetIntersectionInstanceCustomIndexEXT(query,true);
     primitive=rayQueryGetIntersectionPrimitiveIndexEXT(query,true);
     if(operatorId==4u) {
-        if((instance>>16u)!=4u||primitive>=128u)return rtInvalid(2u);
+        if((instance>>16u)!=4u||primitive>=512u)return rtInvalid(2u);
         primitive=(instance&65535u)+primitive/2u;
     } else if(instance!=operatorId)return rtInvalid(2u);
     float distance = rayQueryGetIntersectionTEXT(query, true);
@@ -118,36 +111,23 @@ float rtAdd(float left, float right) {
     uint sign;
     float distance;
     if (((leftBits ^ rightBits) & RT_SIGN) == 0u) {
-        // Plane z=y: t = b - (-a) = a+b.
         distance = rtIntersection(0u, vec3(0.0, alignedB, rtNegate(alignedA)), vec3(0.0, 0.0, 1.0));
         if(!rtFinite(distance))atomicOr(arithmeticStatus[0],1u<<27);
         sign = leftBits & RT_SIGN;
     } else {
         if (leftMagnitude == rightMagnitude) return 0.0;
-        // Values one ULP apart still collapse to the same aligned operand, which
-        // would put the ray at t=0 and never commit. The aligned tie cancels.
         if (alignedA == alignedB) return 0.0;
         bool leftLarger = leftMagnitude > rightMagnitude;
         float larger = leftLarger ? alignedA : alignedB;
         float smaller = leftLarger ? alignedB : alignedA;
-        // Ordered comparisons are false for NaN, so a plain !(a>b) test lets a
-        // NaN operand through and puts a NaN ray origin on the field. Test bits.
         if (!rtFinite(larger) || !rtFinite(smaller)) return 0.0;
         if (!(larger > smaller)) return 0.0;
-        // Same binade: the difference is a small integer number of ULPs, and the
-        // ray distance would sit at the coordinate ULP where c-n.o cancels to
-        // garbage. Take the exact integer difference of the significands and
-        // rebuild the float by exponent packing (no floating arithmetic).
         uint largerBits = floatBitsToUint(larger), smallerBits = floatBitsToUint(smaller);
         if (((largerBits ^ smallerBits) & 0x7f800000u) == 0u) {
             uint delta = largerBits - smallerBits;
             int shift = int((largerBits >> 23u) & 0xffu) - 127 - 23 + commonExponent;
-            // The difference takes the sign of the larger-magnitude operand, not
-            // of `left`; when `left` is the smaller operand these differ and the
-            // sign was inverted. Mirror the general path below.
             return uintBitsToFloat(floatBitsToUint(rtScale(float(delta), shift)) | ((leftLarger ? leftBits : rightBits) & RT_SIGN));
         }
-        // The same plane returns the positive magnitude of the difference.
         distance = rtIntersection(0u, vec3(0.0, larger, smaller), vec3(0.0, 0.0, 1.0));
         if(!rtFinite(distance)) {
             atomicOr(arithmeticStatus[0],1u<<28);
@@ -163,7 +143,6 @@ float rtSubtract(float left, float right) {
 
 uint rtMaximumChoice(float left, float right) {
     uint leftBits = floatBitsToUint(left), rightBits = floatBitsToUint(right);
-    // Empty reduction lanes carry -infinity as a routing sentinel.
     if (leftBits == 0xff800000u) return 1u;
     if (rightBits == 0xff800000u) return 0u;
     uint leftMagnitude = leftBits & RT_MAGNITUDE, rightMagnitude = rightBits & RT_MAGNITUDE;
@@ -179,8 +158,6 @@ uint rtMaximumChoice(float left, float right) {
     float alignedA = rtScale(a.significand, a.exponent - commonExponent);
     float alignedB = rtScale(b.significand, b.exponent - commonExponent);
     uint primitive;
-    // Plane identity selects the original operand without reconstructing and
-    // rounding it from 4-t. The first two triangles belong to z=x (left).
     rtIntersectionHit(3u, vec3(alignedA, alignedB, negative ? 0.0 : 4.0),
                       vec3(0.0, 0.0, negative ? 1.0 : -1.0), primitive);
     return primitive < 2u ? 0u : 1u;
@@ -213,8 +190,6 @@ float rtMultiplyPrepared(float value, RTPreparedMultiplier weight) {
     return uintBitsToFloat(floatBitsToUint(rtScale(product, operand.exponent + weight.exponent)) | sign);
 }
 
-// A weight's complete 24-bit significand is split into three radix-256
-// digits. This is coordinate encoding, not a quantization of the source.
 struct RTPreparedPair {
     uvec2 significand;
     ivec2 exponent;
@@ -234,26 +209,23 @@ RTPreparedPair rtPreparePair(float first,float second) {
     return RTPreparedPair(significand,ivec2(a.exponent,b.exponent),bits);
 }
 
+const float RT_PAIR_OFFSET = 0.75;
 float rtPairDigit(uvec2 digits,RTBinaryOperand a,RTBinaryOperand b,ivec2 exponent,
-                  int shift,uvec2 signs,bool negative) {
-    bool first=digits.x!=0u&&((signs.x&RT_SIGN)!=0u)==negative;
-    bool second=digits.y!=0u&&((signs.y&RT_SIGN)!=0u)==negative;
-    if(!first&&!second)return 0.0;
-    int pairExponent=first&&second?max(exponent.x,exponent.y):first?exponent.x:exponent.y;
+                  uvec2 signs,out bool used,out int pairExponent) {
+    bool first=digits.x!=0u,second=digits.y!=0u;
+    used=first||second;
+    if(!used){pairExponent=0;return 0.0;}
+    pairExponent=first&&second?max(exponent.x,exponent.y):first?exponent.x:exponent.y;
     float x=first?rtScale(a.significand,exponent.x-pairExponent-3):0.0;
     float y=second?rtScale(b.significand,exponent.y-pairExponent-3):0.0;
+    if((signs.x&RT_SIGN)!=0u)x=rtNegate(x);
+    if((signs.y&RT_SIGN)!=0u)y=rtNegate(y);
     uint code=((first?digits.x:0u)<<8u)|(second?digits.y:0u);
-    uint group=code/64u,local=code%64u,primitive;
-    // The instanced plane gives t=2/(1-alpha*x-beta*y). Its returned t is
-    // converted by geometric division and subtraction, then binary scaling.
-    float distance=rtIntersectionHit(4u,vec3(float(group*4u),0.0,float(local*8u)),vec3(x,y,1.0),primitive);
+    uint group=code/256u,local=code%256u,primitive;
+    float distance=rtIntersectionHit(4u,vec3(float(group*4u)+x,y,float(local*8u)),vec3(0.0,0.0,1.0),primitive);
     if(primitive!=code)return rtInvalid(64u);
     if(!rtFinite(distance))atomicOr(arithmeticStatus[0],1u<<24);
-    float projection=rtSubtract(1.0,rtDivide(2.0,distance));
-    if(!rtFinite(projection))atomicOr(arithmeticStatus[0],1u<<25);
-    float value=rtScale(projection,pairExponent+shift-12);
-    if(!rtFinite(value))atomicOr(arithmeticStatus[0],1u<<26);
-    return negative?rtNegate(value):value;
+    return distance;
 }
 
 float rtDotPair(float first,float second,RTPreparedPair weights) {
@@ -267,20 +239,13 @@ float rtDotPair(float first,float second,RTPreparedPair weights) {
     if(magnitude.y==0u)significand.y=0u;
     ivec2 exponent=ivec2(a.exponent,b.exponent)+weights.exponent;
     uvec2 signs=bits^weights.bits;
-    // Only the top two radix-256 digits are evaluated: that keeps 16 mantissa
-    // bits (relative 1.5e-5) which is three orders below the Q4_K/Q6_K history
-    // quantization (1.5e-2) this path feeds, and removes a third of the
-    // dependent ray chain per dot pair.
-    float total=0.0;
-    for(int shift=16;shift>=8;shift-=8) {
-        uvec2 digits=(significand>>uint(shift))&uvec2(255u);
-        // Keep positive and negative paths separate until their geometric
-        // difference, rather than losing a small residual inside 1-(2/t).
-        float positive=rtPairDigit(digits,a,b,exponent,shift,signs,false);
-        float negative=rtPairDigit(digits,a,b,exponent,shift,signs,true);
-        total=rtAdd(total,rtAdd(positive,negative));
-    }
-    return total;
+    bool used;
+    int pairExponent;
+    uvec2 digits=min((significand+uvec2(0x8000u))>>16u,uvec2(255u));
+    float distance=rtPairDigit(digits,a,b,exponent,signs,used,pairExponent);
+    if(!used)return 0.0;
+    int shift=pairExponent+4;
+    return rtScale(distance,shift)-rtScale(RT_PAIR_OFFSET,shift);
 }
 
 float rtMultiply(float left, float right) {
@@ -289,7 +254,6 @@ float rtMultiply(float left, float right) {
     if (aMagnitude >= RT_INFINITY || bMagnitude >= RT_INFINITY) return rtInvalid(8u|(7u<<20));
     if (aMagnitude == 0u || bMagnitude == 0u) return uintBitsToFloat((leftBits ^ rightBits) & RT_SIGN);
     RTBinaryOperand a = rtEncode(left), b = rtEncode(right);
-    // Plane z=1 gives 1/b. Plane z=y then gives a/(1/b).
     float inverse = rtIntersection(1u, vec3(0.0), vec3(0.0, 0.0, b.significand));
     if(!rtFinite(inverse))atomicOr(arithmeticStatus[0],1u<<31);
     if ((floatBitsToUint(inverse) & RT_MAGNITUDE) >= RT_INFINITY) return inverse;
@@ -305,7 +269,6 @@ float rtDivide(float numerator, float denominator) {
     uint sign = (aBits ^ bBits) & RT_SIGN;
     if (aMagnitude == 0u) return uintBitsToFloat(sign);
     RTBinaryOperand a = rtEncode(numerator), b = rtEncode(denominator);
-    // Plane z=y: t=a/b; the direction need not have unit length.
     float quotient = rtIntersection(0u, vec3(0.0, a.significand, 0.0), vec3(0.0, 0.0, b.significand));
     if(!rtFinite(quotient))atomicOr(arithmeticStatus[0],1u<<30);
     return uintBitsToFloat(floatBitsToUint(rtScale(quotient, a.exponent - b.exponent)) | sign);
@@ -325,7 +288,6 @@ float rtExp(float value) {
     float fraction = rtSubtract(binaryArgument, float(whole));
     if ((floatBitsToUint(fraction) & RT_MAGNITUDE) > 0x3f800000u) return rtInvalid(16u);
     float chartInput = negative ? rtNegate(rtMagnitude(fraction)) : rtMagnitude(fraction);
-    // The compiled strip surface interpolates z=2^x on [-1,1].
     float interpolated = rtIntersection(2u, vec3(chartInput, 0.0, 0.0), vec3(0.0, 0.0, 1.0));
     return rtScale(interpolated, negative ? -int(whole) : int(whole));
 }

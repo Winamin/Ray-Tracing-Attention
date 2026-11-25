@@ -100,7 +100,7 @@ class ResidentRuntime:
             self.metadata.update(geometry_arithmetic='triangle_intersection_distance',
                 geometry_exponential='4096_segment_piecewise_linear',vocabulary_compute='rt_geometry',
                 geometry_dot_method='two_coordinate_plane_fragments',geometry_pair_planes=65536,
-                geometry_pair_templates=64,geometry_pair_instances=1024,
+                geometry_pair_templates=256,geometry_pair_instances=256,
                 geometry_timing_scope='dispatch including shader encoding and RT queries',
                 geometry_source_operations='source RMSNorm, RoPE, history packing and recurrence')
         self.metadata['source_model']=config.get('source_model')

@@ -1,5 +1,3 @@
-// Original source formats remain packed. Decode scale products and affine
-// minima through the same arithmetic BVH as the model's matrix products.
 uint geometryHistoryWordBase=0u;
 uint geometryCoefficientWord(uint kind,uint at) {
     if(kind!=2u)return coefficientWord(kind,at);
@@ -58,10 +56,6 @@ float geometryWeight(uint kind, uint offset, uint metadata, uint row, uint colum
     return geometryGGUF(kind, offset * 4u + (linear / 256u) * bytes, type, linear % 256u);
 }
 
-// Resolve two neighbouring coefficients for one dot pair. F16 storage keeps
-// consecutive elements adjacent, and an even axis makes the pair word aligned, so
-// both come back from a single load instead of two loads with two address
-// computations. Everything else falls back to the generic path.
 vec2 geometryWeightPair(uint kind,uint offset,uint metadata,uint row,uint columns,uint axis) {
     if((metadata&0xffffff00u)==1u) {
         uint at=offset*4u+(row*columns+axis)*2u;

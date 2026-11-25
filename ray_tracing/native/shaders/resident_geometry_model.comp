@@ -11,13 +11,7 @@ uint localHistoryQueries=0u;
 #include "rt_geometry_arithmetic.glsl"
 #include "resident_geometry_coefficients.glsl"
 
-// History positions covered per score workgroup. Must equal geometryScoreSegment
-// in resident_geometry_runtime.inl: the host sizes the x dispatch from it, so a
-// mismatch silently drops tail positions instead of failing loudly.
 #define RT_SCORE_SEGMENT 8u
-// score needs RT_SCORE_SEGMENT*128, projection needs tokenRows*128 (=1024 at the
-// default tokenRows of 8). gate and up no longer reduce two accumulators at once,
-// so the second half is gone and shared memory halves again.
 #define RT_GEOMETRY_WORK_FLOATS 1024u
 
 shared float geometryWork[RT_GEOMETRY_WORK_FLOATS];
@@ -72,7 +66,6 @@ void geometryProjection() {
     uint currentWidth=full?Q:S,gateWidth=full?(RT_ATTENTION_GATE==1u?Q:0u):S,valueWidth=full?RT_GQA_WIDTH:S;
     uint outputWidth=matrixIndex==5u?queryWidth+keyWidth+gateWidth+valueWidth:matrixIndex==3u?FEATURE_WIDTH:D;
     if(channel>=outputWidth||firstRow>=cfg.rows)return;
-    // tokenRows is sized for prefill batching; during decode only one row is live.
     uint rows=min(tokenRows,cfg.rows-firstRow);
     if(matrixIndex==5u) {
         if(channel<queryWidth)matrixIndex=0u;
@@ -81,11 +74,6 @@ void geometryProjection() {
         else{matrixIndex=8u;channel-=queryWidth+keyWidth+gateWidth;}
     }
     uint columns=matrixIndex==4u?FEATURE_WIDTH:matrixIndex==2u?currentWidth:D;
-    // gate and up used to share one loop, issuing two rays and streaming two weight
-    // rows per axis pair. Measured against the single-stream loops that run at
-    // 7.0e9 rays/s, that shape only reached 3.6e9. They now run as two passes over
-    // one row each, and the second pass folds the stored gate sum through SwiGLU in
-    // place, so no extra buffer and no extra pass are needed.
     bool split=matrixIndex==3u,upPass=split&&cfg.mode!=0u;
     uint offset=upPass?parameters[base+19u]:parameters[matrixIndex==8u?base+32u:base+9u+matrixIndex*2u];
     uint format=upPass?parameters[base+20u]:parameters[matrixIndex==8u?base+33u:base+10u+matrixIndex*2u];
@@ -155,8 +143,6 @@ void geometryScore() {
         if((floatBitsToUint(q0)&RT_SIGN)!=0u)coordinate0=rtNegate(coordinate0);
         if((floatBitsToUint(q1)&RT_SIGN)!=0u)coordinate1=rtNegate(coordinate1);
         float x=rtAdd(float(4u*cfg.layer),coordinate0);
-        // One micro-ray for each two-coordinate fragment, reused across a 32-position
-        // history segment. Every accepted primitive retains its causal ID.
         rayQueryEXT historyRay;
         localHistoryQueries++;
         rayQueryInitializeEXT(historyRay,historyAS[0],gl_RayFlagsNoOpaqueEXT|gl_RayFlagsCullBackFacingTrianglesEXT,1u,
@@ -282,10 +268,6 @@ void geometryWordMaximum() {
     }
 }
 
-// Benchmark: identical coverage expressed two ways over the template field.
-// op 9 issues one ray that enumerates every template plane of its instance;
-// op 10 issues one single-hit ray per template. Hit counts land in the history
-// counter so both paths can be checked for equal coverage.
 void geometryBench() {
     uint lane=gl_LocalInvocationID.x,id=gl_WorkGroupID.x*128u+lane;
     uint code=id&65535u,group=code/256u;
@@ -300,9 +282,6 @@ void geometryBench() {
             localHistoryQueries++;
         }
     } else if(cfg.debug==2u) {
-        // Same loop shape as the single-hit mode, but the ray points away from the
-        // field so it cannot hit. What remains is the price of issuing a ray at all:
-        // initialisation, root traversal and rejection.
         for(uint p=0u;p<256u;p++) {
             rayQueryEXT query;
             rtLocalQueries++;
@@ -311,8 +290,6 @@ void geometryBench() {
             while(rayQueryProceedEXT(query)) {}
         }
     } else {
-        // Same flags as the enumerating mode so the two are comparable; each ray only
-        // has one plane inside its t range, so exactly one candidate is exposed.
         for(uint p=0u;p<256u;p++) {
             rayQueryEXT query;
             rtLocalQueries++;

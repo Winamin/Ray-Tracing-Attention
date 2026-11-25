@@ -10,6 +10,83 @@ from .partition import CoordinatePartition
 
 STRIDE=64
 FORMATS={0:4,1:2,30:2,12:144/256,14:210/256}
+CAST_FP16=False
+CAST_SCOPE='none'
+
+def _decode_q4k(raw):
+    """Q4_K 144-byte super-blocks -> float32, llama.cpp layout."""
+    nb=raw.nbytes//144
+    b=np.ascontiguousarray(raw).reshape(nb,144)
+    d=b[:,0:2].copy().view('<f2').astype(np.float32).reshape(nb,1)
+    dm=b[:,2:4].copy().view('<f2').astype(np.float32).reshape(nb,1)
+    sc=b[:,4:16].astype(np.int32)
+    qs=b[:,16:144].astype(np.int32)
+    out=np.empty((nb,256),np.float32)
+    for j in range(8):
+        if j<4:
+            s=sc[:,j]&63;m=sc[:,j+4]&63
+        else:
+            s=(sc[:,j+4]&0xF)|((sc[:,j-4]>>6)<<4)
+            m=(sc[:,j+4]>>4)|((sc[:,j]>>6)<<4)
+        q=qs[:,(j//2)*32:(j//2+1)*32]
+        nib=(q&0xF) if j%2==0 else (q>>4)
+        out[:,j*32:(j+1)*32]=d*s[:,None]*nib-dm*m[:,None]
+    return out
+
+def _decode_q6k(raw):
+    """Q6_K 210-byte super-blocks -> float32, llama.cpp layout."""
+    nb=raw.nbytes//210
+    b=np.ascontiguousarray(raw).reshape(nb,210)
+    ql=b[:,0:128].astype(np.int32);qh=b[:,128:192].astype(np.int32)
+    sc=b[:,192:208].astype(np.uint8).view(np.int8).astype(np.int32)
+    d=b[:,208:210].copy().view('<f2').astype(np.float32).reshape(nb)
+    out=np.empty((nb,256),np.float32)
+    for n in (0,128):
+        ql2=ql[:,n//2:];qh2=qh[:,n//4:];sc2=sc[:,n//16:]
+        for l in range(32):
+            k=l//16
+            out[:,n+l+0 ]=d*sc2[:,k+0]*(((ql2[:,l]&0xF)|(((qh2[:,l]>>0)&3)<<4))-32)
+            out[:,n+l+32]=d*sc2[:,k+2]*(((ql2[:,l+32]&0xF)|(((qh2[:,l]>>2)&3)<<4))-32)
+            out[:,n+l+64]=d*sc2[:,k+4]*(((ql2[:,l]>>4)|(((qh2[:,l]>>4)&3)<<4))-32)
+            out[:,n+l+96]=d*sc2[:,k+6]*(((ql2[:,l+32]>>4)|(((qh2[:,l]>>6)&3)<<4))-32)
+    return out
+
+def wants_fp16(kind,name):
+    """Which coefficient tensors get resolved to F16 at export time.
+
+    Only tensors the geometry path actually decodes are worth F16: every one is
+    read element by element, and a packed element costs four extra intersections
+    against the quantized block header. ``token_embd`` is an embedding lookup, not
+    a decoded coefficient, so it is left packed - casting it would spend 2.0 GiB
+    for nothing.
+    """
+    if not CAST_FP16:return False
+    if CAST_SCOPE=='all':return name!='token_embd.weight'
+    if CAST_SCOPE=='recurrent_ffn':
+        return kind!='full' and name in ('ffn_gate.weight','ffn_up.weight','ffn_down.weight')
+    if CAST_SCOPE=='ffn':
+        return name in ('ffn_gate.weight','ffn_up.weight','ffn_down.weight')
+    if CAST_SCOPE=='ffn_word':
+        return name in ('ffn_gate.weight','ffn_up.weight','ffn_down.weight','output.weight')
+    if CAST_SCOPE=='geometry':
+        # Everything the geometry path decodes element by element. Full-layer
+        # attention projections are included because the geometry backend runs them
+        # through the same coefficient decoder; recurrent SSM parameters are small
+        # enough that leaving them packed costs nothing.
+        return name in ('ffn_gate.weight','ffn_up.weight','ffn_down.weight','output.weight',
+                        'attn_q.weight','attn_k.weight','attn_v.weight','attn_gate.weight',
+                        'attn_output.weight')
+    return False
+
+def cast_coefficients(raw,code,label,elements,enable=True):
+    """Resolve a quantized block stream once at export time and emit F16."""
+    if not (CAST_FP16 and enable) or code not in (12,14):
+        return raw,code,label
+    values=_decode_q4k(raw) if code==12 else _decode_q6k(raw)
+    flat=np.ascontiguousarray(values.reshape(-1))
+    if flat.size!=elements:
+        raise ValueError(f'coefficient decode produced {flat.size} values, expected {elements}')
+    return flat.astype('<f2'),1,'F16'
 
 def tokenizer(source,destination):
     if not isinstance(source,GGUFSource):
@@ -48,7 +125,10 @@ def tokenizer(source,destination):
     generation={'eos_token_id':source.field('tokenizer.ggml.eos_token_id'),'bos_token_id':source.field('tokenizer.ggml.bos_token_id')}
     (destination/'generation_config.json').write_text(json.dumps(generation),encoding='utf8')
 
-def export(source,destination):
+def export(source,destination,cast_fp16=False,cast_scope='all'):
+    global CAST_FP16,CAST_SCOPE
+    CAST_FP16=bool(cast_fp16)
+    CAST_SCOPE=cast_scope
     src=open_source(source) if isinstance(source,(str,Path)) else source
     spec=src.spec.validate();d=spec.hidden_size;depth=spec.depth;middle=spec.middle_size
     destination=Path(destination);destination.mkdir(parents=True,exist_ok=True)
@@ -79,6 +159,7 @@ def export(source,destination):
                 nonlocal matrix_words
                 if name in written:return written[name]
                 raw,code,label=src.packed(prefix+name)
+                raw,code,label=cast_coefficients(raw,code,label,int(np.prod(src.shape(prefix+name))),wants_fp16(kind,name))
                 at=matrix_words-start;raw.tofile(stream);pad=(-raw.nbytes)%4;stream.write(bytes(pad));matrix_words+=(raw.nbytes+pad)//4
                 written[name]=(at,code)
                 sample=np.concatenate((raw[:4096],raw[-4096:]))
@@ -127,12 +208,21 @@ def export(source,destination):
     with (destination/'vocabulary.bin').open('wb') as stream:
         stream.write(b'RTBASQ01');stream.write(struct.pack('<2I',spec.vocabulary_size,d))
         for name,kind,offset in (('token_embd.weight',13,14),('output.weight',15,16)):
-            raw,code,label=src.packed(name);identity=src.actual(name)
-            header[kind]=code;header[offset]=basis_written.get(identity,basis_words)
-            if identity not in basis_written:
-                basis_written[identity]=basis_words
+            # token_embd and output usually share one basis record. Resolve the
+            # storage format once per record and reuse it: casting per name would
+            # emit the same basis twice and double the file (an F16 copy of the
+            # 248k x 4096 basis is 2.0 GiB, so the duplicate alone is 2.0 GiB).
+            identity=src.actual(name)
+            record=basis_written.get(identity)
+            if record is None:
+                raw,code,label=src.packed(name)
+                raw,code,label=cast_coefficients(raw,code,label,
+                    int(np.prod(src.shape(name))),wants_fp16('vocabulary',name))
+                at=basis_words
                 raw.tofile(stream);pad=(-raw.nbytes)%4;stream.write(bytes(pad));basis_words+=(raw.nbytes+pad)//4
-            records.append({'name':name,'type':label,'bytes':raw.nbytes,'shape':list(src.shape(name)),'basis_offset_words':int(header[offset])})
+                basis_written[identity]=record=(at,code)
+                records.append({'name':name,'type':label,'bytes':raw.nbytes,'shape':list(src.shape(name)),'basis_offset_words':int(at)})
+            header[kind]=record[1];header[offset]=record[0]
     params=np.concatenate((header,*parts));asset=destination/'optical_model.bin'
     with asset.open('wb') as stream:
         stream.write(b'RTRES004');stream.write(struct.pack('<9I',d,depth,depth,middle,spec.vocabulary_size,4,len(params),matrix_words,0));params.tofile(stream)
@@ -140,7 +230,7 @@ def export(source,destination):
     partition.write(destination)
     metadata={'source_model':str(src.path),'architecture':spec.architecture,'model_spec':spec.to_dict(),
         'depth':depth,'hidden_size':d,'middle':middle,'vocabulary':spec.vocabulary_size,
-        'precision':'original coefficient formats','quantization':' + '.join(sorted({r['type'] for r in records})),
+        'precision':'fp16 coefficients' if CAST_FP16 else 'original coefficient formats','quantization':' + '.join(sorted({r['type'] for r in records})),
         'full_contribution_layers':len(spec.full_layers),'optical_recurrent_layers':len(spec.recurrent_layers),
         'state_heads':spec.state_heads,'step':0,'parameter_bytes':int(params.nbytes+(matrix_words+basis_words)*4),
         'history_quantization':{'address':'Q4_K','content':'Q6_K','bytes_per_token':len(spec.full_layers)*spec.history_bytes},

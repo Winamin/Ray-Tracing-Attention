@@ -1,13 +1,11 @@
 #pragma once
 #include "optical_geometry.hpp"
 
-// One reusable TLAS contains scalar fields and an instanced 2D pair field. The shader sends
-// operands as ray coordinates and directions; committed t carries the result.
 class RTArithmeticSpace
 {
 public:
     static constexpr uint32_t exponentialSegments = 4096u;
-    static constexpr uint32_t pairTemplates = 64u, pairGroups = 1024u, pairPlanes = 65536u;
+    static constexpr uint32_t pairTemplates = 256u, pairGroups = 256u, pairPlanes = 65536u;
     Engine &e;
     Buffer *vertices{}, *instances{}, *topStorage{}, *topScratch{};
     std::array<Leaf, 5> fields{};
@@ -27,17 +25,8 @@ public:
             triangle(a, b, c);
             triangle(a, c, d);
         };
-        // Addition, subtraction and division share the bounded plane z=y.
-        // The x extent is deliberately asymmetric: every ray here has x=0, and a
-        // symmetric quad puts the shared triangle diagonal at (0,1,1), which is
-        // exactly where a significand of 1.0 lands. A hit on that edge is not
-        // watertight and silently drops. This skew moves the diagonal to y=2.0,
-        // outside the [1,2) significand range.
         quad({-3.f, -1.f, -1.f}, {1.f, -1.f, -1.f}, {1.f, 3.f, 3.f}, {-3.f, 3.f, 3.f});
-        // The reciprocal field is the plane z=1.
         quad({-2.f, -2.f, 1.f}, {2.f, -2.f, 1.f}, {2.f, 2.f, 1.f}, {-2.f, 2.f, 1.f});
-        // exp2 is compiled once into strips, never evaluated by a runtime
-        // shader. Triangle interpolation is an approximation, not exact exp.
         for (uint32_t segment = 0; segment < exponentialSegments; segment++)
         {
             float x0 = -1.f + 2.f * float(segment) / float(exponentialSegments);
@@ -45,16 +34,11 @@ public:
             float z0 = float(std::exp2(double(x0))), z1 = float(std::exp2(double(x1)));
             quad({x0, -1.f, z0}, {x1, -1.f, z1}, {x1, 1.f, z1}, {x0, 1.f, z0});
         }
-        // Crossing planes implement min through the native closest hit.
-        // Downward rays select the larger operand through the hit identity.
         quad({-1.f, -1.f, -1.f}, {3.f, -1.f, 3.f}, {3.f, 3.f, 3.f}, {-1.f, 3.f, -1.f});
         quad({-1.f, -1.f, -1.f}, {3.f, -1.f, -1.f}, {3.f, 3.f, 3.f}, {-1.f, 3.f, 3.f});
-        // Template p has z=8p+2+(p/256)y. Instance shears supply the other
-        // coefficient and the upper two bits of the y coefficient. Inputs
-        // travel in the direction, so instance translations never round them.
         for(uint32_t p=0;p<pairTemplates;p++)
         {
-            float center=float(p*8u)+2.f,b=float(p)/256.f;
+            float center=float(p*8u)+0.75f,b=float(p)/256.f;
             quad({-1.f,-1.f,center-b},{1.f,-1.f,center-b},
                  {1.f,1.f,center+b},{-1.f,1.f,center+b});
         }
@@ -109,8 +93,7 @@ public:
                 auto &root=roots[4u+group];
                 root.transform.matrix[0][0]=root.transform.matrix[1][1]=root.transform.matrix[2][2]=1.f;
                 root.transform.matrix[0][3]=float(group*4u);
-                root.transform.matrix[2][0]=float(group/4u)/256.f;
-                root.transform.matrix[2][1]=float(group%4u)/4.f;
+                root.transform.matrix[2][0]=float(group)/256.f;
                 root.instanceCustomIndex=(4u<<16u)|(group*pairTemplates);
                 root.mask=16u;root.accelerationStructureReference=reference;
             }
@@ -335,8 +318,6 @@ public:
     }
 };
 
-// Binary debug protocol for scalar operators and complete MLP/attention
-// compositions. Every intermediate stays in the program's GPU value buffer.
 class RTGeometryWorker
 {
 public:

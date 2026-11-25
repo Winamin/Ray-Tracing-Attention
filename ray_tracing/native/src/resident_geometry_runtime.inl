@@ -1,5 +1,3 @@
-// QK history positions per score workgroup; must equal RT_SCORE_SEGMENT in
-// shaders/resident_geometry_model.comp. The x dispatch below is derived from it.
 static constexpr uint32_t geometryScoreSegment = 8u;
 
 void geometryDispatch(VkCommandBuffer c, ResidentConfig cfg, uint32_t operation,
@@ -12,10 +10,8 @@ void geometryDispatch(VkCommandBuffer c, ResidentConfig cfg, uint32_t operation,
     else if(operation==0u||operation==1u||operation==4u){z=(x+32767u)/32768u;x=std::min(x,32768u);}
     bindCompute(c,geometryPipelines[operation],target?target:layerSets[cfg.layer]);
     vkCmdPushConstants(c,layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(cfg),&cfg);
-    // op4 is a full-layer matrix projection, so it belongs in the projection bucket.
-    // Reporting it under history made a packed-weight projection look like an
-    // attention cost and sent the last investigation down the wrong path.
-    uint32_t stamp=operation==8u?~0u:startRT(c,operation<=1u||operation==4u?2u:operation>=5u?1u:0u);
+    uint32_t bucket=operation>=5u?1u:operation==4u||operation<=1u?2u:0u;
+    uint32_t stamp=operation==8u?~0u:startRT(c,bucket);
     vkCmdDispatch(c,x,y,z);
     syncCompute(c);
     endRT(c,stamp);
@@ -38,10 +34,6 @@ void prepareGeometryAttention(uint32_t rows,uint32_t position,uint32_t origin)
     if(!geometryScoreRows)throw std::runtime_error("Geometry attention row exceeds the device storage range");
     uint64_t bytes=rowBytes*geometryScoreRows;
     if(bytes<=geometryScores->size)return;
-    // geometryScoreStride grows by one position per decoded token, so sizing the
-    // workspace to the exact requirement made every token pay a buffer release, a
-    // fresh allocation and thirty-two descriptor rebuilds in the middle of a forward
-    // pass. Reserve for a bounded ceiling instead and grow geometrically past it.
     uint64_t ceiling=std::min<uint64_t>(uint64_t(capacity),std::max<uint64_t>(uint64_t(geometryScoreStride)*4u,4096u));
     uint64_t wanted=std::max<uint64_t>(bytes,std::min<uint64_t>(ceiling,uint64_t(geometryScoreStride)*8u)*RT_ATTENTION_HEADS*4u*geometryScoreRows);
     e.release(geometryScores);
@@ -54,22 +46,14 @@ void executeGeometryMLP(VkCommandBuffer c,ResidentConfig cfg)
 {
     vkCmdFillBuffer(c,featureWork->handle,0u,featureWork->size,0u);
     sync(c);
-    if(cfg.debug==4u)vkCmdWriteTimestamp(c,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,e.timestamps,1u);
     uint32_t rows=(cfg.rows+matrixBatchRows-1u)/matrixBatchRows;
-    // gate and up run as two passes so each streams a single weight row and issues a
-    // single ray per axis pair. Sharing one loop between them meant two streams and
-    // two dependent ray chains per iteration, which measured 3.6e9 rays/s against
-    // 7.5e9 for the single-stream shape. The pass index rides in cfg.mode, which the
-    // MLP stages do not otherwise read.
     for(uint32_t pass=0u;pass<2u;pass++)
     {
         ResidentConfig part=cfg;
         part.mode=pass;
         geometryDispatch(c,part,0u,MODEL_FF,rows);
     }
-    if(cfg.debug==4u)vkCmdWriteTimestamp(c,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,e.timestamps,2u);
     geometryDispatch(c,cfg,1u,MODEL_D,rows);
-    if(cfg.debug==4u)vkCmdWriteTimestamp(c,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,e.timestamps,3u);
     geometryPublishError(c,cfg);
 }
 
@@ -84,7 +68,6 @@ void executeGeometryAttention(VkCommandBuffer c,ResidentConfig cfg,VkDeviceSize 
         geometryDispatch(c,part,3u,RT_ATTENTION_HEADS,rows);
         if(weightsOffset!=VK_WHOLE_SIZE)
         {
-            // A transfer follows, so this one has to be ordered against every stage.
             sync(c);
             copy(c,geometryScores,uint64_t(rows)*RT_ATTENTION_HEADS*geometryScoreStride*4u,
                  weightsOffset+uint64_t(first)*RT_ATTENTION_HEADS*geometryScoreStride*4u);
@@ -113,8 +96,6 @@ void geometryBench(uint32_t threads,uint32_t mode)
     if(!threads)threads=65536u;
     auto c=e.command();begin(c);
     vkCmdFillBuffer(c,geometryStatus->handle,0u,32u,0u);sync(c);
-    // cfg.mode carries the benchmark variant into the shader: 0 = single hit per
-    // template, 2 = identical loop with rays that cannot hit (prices a bare issue).
     ResidentConfig cfg{0u,1u,0u,0u,0u,2u,0u,capacity,depth,mode,2u,0u,0u};
     geometryDispatch(c,cfg,mode?10u:9u,(threads+127u)/128u);
     check(vkEndCommandBuffer(c),"end geometry benchmark");

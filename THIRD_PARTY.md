@@ -18,6 +18,19 @@ The quantized matvec input aliases and packed coefficient decoding follow its
 [Vulkan matvec](https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec.comp) and
 [Q6_K word masks](https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q6_k.comp).
 
+The ordered detector's packed history view, fixed Q6_K address calculation and
+cooperative slot staging were adapted after reading the following Vulkan
+sources at revision `9d25e0014c4b4b316873c01f4938c0e3c687287d`:
+
+- [Flash Attention packed views](https://github.com/ggml-org/llama.cpp/blob/9d25e0014c4b4b316873c01f4938c0e3c687287d/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_dequant.glsl)
+- [Q6_K decode fields](https://github.com/ggml-org/llama.cpp/blob/9d25e0014c4b4b316873c01f4938c0e3c687287d/ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs.glsl)
+- [Q6_K matvec address mapping](https://github.com/ggml-org/llama.cpp/blob/9d25e0014c4b4b316873c01f4938c0e3c687287d/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q6_k.comp)
+- [Decode tile staging](https://github.com/ggml-org/llama.cpp/blob/9d25e0014c4b4b316873c01f4938c0e3c687287d/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_decode_phase_1.comp)
+
+The project retains its RT hit list, original packed optical history and FP32
+accumulation order. The upstream FP16 cooperative matrix kernels and split-K
+reduction are not copied into this detector.
+
 MIT License
 
 Copyright (c) 2023-2026 The ggml authors
