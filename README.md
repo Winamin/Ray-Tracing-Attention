@@ -135,7 +135,7 @@ rt-chat --attention-backend rt_geometry --mlp-backend rt_geometry
 
 ## Measured results
 
-Previous commit: `d8e86c2`. Data unchanged.
+`d8e86c2`. This is the data from the previous mixed tensor setup. The performance of the current pure RT Attention is still under optimization.
 
 | Workload | Measured result |
 |---|---:|
