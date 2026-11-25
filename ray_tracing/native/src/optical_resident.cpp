@@ -17,6 +17,23 @@ static uint32_t historyInstance(uint32_t layer, uint32_t segment)
 {
     return segment * 16u;
 }
+
+// Read an exact byte count into destination. A single std::ifstream::read above
+// roughly 2 GiB reports failure with zero bytes consumed on this platform, so a
+// basis larger than that would look truncated even though the file is intact.
+static bool readExact(std::ifstream &stream, char *destination, size_t bytes)
+{
+    constexpr size_t chunk = 64u * 1024u * 1024u;
+    for (size_t offset = 0; offset < bytes;)
+    {
+        size_t count = std::min(chunk, bytes - offset);
+        stream.read(destination + offset, std::streamsize(count));
+        if (size_t(stream.gcount()) != count)
+            return false;
+        offset += count;
+    }
+    return true;
+}
 class ResidentHistory : public ShapeMesh
 {
 public:
@@ -170,7 +187,7 @@ public:
     bool rtTransmissionMLP = false, geometricMLP = false, attentionDiagnosticDirty = false, attentionStatsEnabled = false, attentionVMemberDistribution = false, attentionLocalSplit = false;
     std::unique_ptr<RTArithmeticSpace> geometrySpace;
     Buffer *geometryStatus{}, *geometryScores{};
-    VkPipeline geometryPipelines[9]{};
+    VkPipeline geometryPipelines[11]{};
     uint32_t geometryScoreStride=1u, geometryScoreRows=1u;
     Buffer *attentionReceipts{};
     VkPipeline attentionReceiptPipelines[12]{};
@@ -287,15 +304,7 @@ public:
         std::vector<uint32_t> p(header[6]), m(header[7]);
         inputFile.read(reinterpret_cast<char *>(p.data()), p.size() * 4);
         std::ifstream matrixFile(model.parent_path() / "geometry_weights.bin", std::ios::binary);
-        for (size_t offset = 0; offset < m.size() * 4;)
-        {
-            size_t bytes = std::min<size_t>(64 * 1024 * 1024, m.size() * 4 - offset);
-            matrixFile.read(reinterpret_cast<char *>(m.data()) + offset, bytes);
-            if (!matrixFile)
-                break;
-            offset += bytes;
-        }
-        if (!matrixFile)
+        if (!readExact(matrixFile, reinterpret_cast<char *>(m.data()), m.size() * 4))
             throw std::runtime_error("Truncated geometric weights");
         if (!inputFile)
             throw std::runtime_error("Truncated resident parameters");
@@ -366,8 +375,7 @@ public:
             throw std::runtime_error("Complete model vocabulary basis required");
         size_t basisBytes = std::filesystem::file_size(source) - 16u;
         std::vector<uint32_t> basisHost(basisBytes / 4u);
-        headFile.read(reinterpret_cast<char *>(basisHost.data()), basisBytes);
-        if (!headFile)
+        if (!readExact(headFile, reinterpret_cast<char *>(basisHost.data()), basisBytes))
             throw std::runtime_error("Truncated original word basis");
         basis = e.buffer(basisHost.size() * 4, usage);
         e.upload(basis, basisHost.data(), basis->size);
@@ -464,7 +472,7 @@ public:
             bind(layerSets[l], false, l);
         bind(initialSet, true);
         if (geometrySpace)
-            for (uint32_t operation=0;operation<9u;operation++)
+            for (uint32_t operation=0;operation<11u;operation++)
                 geometryPipelines[operation]=e.pipeline("resident_geometry_model",layout,operation,matrixBatchRows,0xffffffffu,wordTile,128u);
         for (uint32_t i = 0; i < 35; i++)
             if (i != 2 && i != 4 && i != 5 && i != 10)
@@ -737,6 +745,11 @@ public:
         vkUpdateDescriptorSets(e.device, writeCount, writes, 0, nullptr);
     }
     static void sync(VkCommandBuffer c) { Engine::barrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT); }
+    // Consecutive geometry dispatches only depend on each other's shader writes.
+    // The full memory barrier above waits for every stage and flushes caches, and at
+    // roughly a hundred dispatches per token that cost more than the dispatches. Ray
+    // queries execute inside the compute stage, so compute-to-compute is sufficient.
+    static void syncCompute(VkCommandBuffer c) { Engine::barrier(c, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT); }
     void begin(VkCommandBuffer c)
     {
         e.begin(c);
@@ -2535,6 +2548,8 @@ int main(int argc, char **argv)
                 model.attentionStatistics(count);
             else if (op == 19)
                 model.geometryStatistics();
+            else if (op == 20)
+                model.geometryBench(count, debug);
             else
                 throw std::runtime_error("Unknown resident operation");
         }

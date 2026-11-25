@@ -398,6 +398,18 @@ class ResidentRuntime:
         return dict(total={name:int(values[:,i].sum()) for i,name in enumerate(names)},
                     layers=[dict(layer=layer,**{name:int(value) for name,value in zip(names,row)}) for layer,row in zip(self.model_spec.full_layers,values)])
 
+    def geometry_bench(self, mode=0, threads=65536):
+        """Benchmark the template field. mode 0 = one ray enumerating every template
+        plane, mode 1 = one single-hit ray per template, mode 2 = the same loop as
+        mode 1 with rays that cannot hit, which prices a bare ray issue. Returns
+        rays, hits and wall ms."""
+        if self.metadata['attention_backend']!='rt_geometry' and self.metadata['mlp_backend']!='rt_geometry':
+            raise ValueError('Geometry benchmark requires rt_geometry')
+        data=self.request(20,int(threads),debug=int(mode))
+        queries,hits=struct.unpack_from('<2Q',data,0)
+        wall=struct.unpack_from('<d',data,16)[0]
+        return dict(rays=int(queries),hits=int(hits),wall_ms=wall,threads=int(threads))
+
     def geometry_statistics(self):
         """Actual cumulative arithmetic/history queries and resident BVH payload."""
         if self.metadata['attention_backend']!='rt_geometry' and self.metadata['mlp_backend']!='rt_geometry':

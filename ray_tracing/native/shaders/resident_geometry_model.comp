@@ -15,10 +15,10 @@ uint localHistoryQueries=0u;
 // in resident_geometry_runtime.inl: the host sizes the x dispatch from it, so a
 // mismatch silently drops tail positions instead of failing loudly.
 #define RT_SCORE_SEGMENT 8u
-// score needs RT_SCORE_SEGMENT*128, projection needs 2*tokenRows*128 (=2048 at
-// the default tokenRows of 8). Shrinking this from 4096 halves shared memory and
-// therefore doubles resident workgroups per SM.
-#define RT_GEOMETRY_WORK_FLOATS 2048u
+// score needs RT_SCORE_SEGMENT*128, projection needs tokenRows*128 (=1024 at the
+// default tokenRows of 8). gate and up no longer reduce two accumulators at once,
+// so the second half is gone and shared memory halves again.
+#define RT_GEOMETRY_WORK_FLOATS 1024u
 
 shared float geometryWork[RT_GEOMETRY_WORK_FLOATS];
 shared uint geometryIds[128], geometryQueries[128], historyQueries[128];
@@ -48,7 +48,7 @@ float geometryReduce(float value) {
     uint lane=gl_LocalInvocationID.x;
     geometryWork[lane]=value;barrier();
     for(uint stride=64u;stride!=0u;stride>>=1u) {
-        if(lane<stride)geometryWork[lane]=rtAdd(geometryWork[lane],geometryWork[lane+stride]);
+        if(lane<stride)geometryWork[lane]+=geometryWork[lane+stride];
         barrier();
     }
     return geometryWork[0];
@@ -69,9 +69,11 @@ void geometryProjection() {
     uint base=blockBase(),matrixIndex=operation==0u?3u:operation==1u?4u:cfg.index;
     bool full=parameters[base+26u]==1u;
     uint queryWidth=full?Q:RT_STATE_KEY_HEADS*128u,keyWidth=full?RT_GQA_WIDTH:RT_STATE_KEY_HEADS*128u;
-    uint currentWidth=full?Q:S,gateWidth=full?(RT_ATTENTION_GATE==1?Q:0u):S,valueWidth=full?RT_GQA_WIDTH:S;
+    uint currentWidth=full?Q:S,gateWidth=full?(RT_ATTENTION_GATE==1u?Q:0u):S,valueWidth=full?RT_GQA_WIDTH:S;
     uint outputWidth=matrixIndex==5u?queryWidth+keyWidth+gateWidth+valueWidth:matrixIndex==3u?FEATURE_WIDTH:D;
     if(channel>=outputWidth||firstRow>=cfg.rows)return;
+    // tokenRows is sized for prefill batching; during decode only one row is live.
+    uint rows=min(tokenRows,cfg.rows-firstRow);
     if(matrixIndex==5u) {
         if(channel<queryWidth)matrixIndex=0u;
         else if(channel<queryWidth+keyWidth){matrixIndex=1u;channel-=queryWidth;}
@@ -79,44 +81,45 @@ void geometryProjection() {
         else{matrixIndex=8u;channel-=queryWidth+keyWidth+gateWidth;}
     }
     uint columns=matrixIndex==4u?FEATURE_WIDTH:matrixIndex==2u?currentWidth:D;
-    uint offset=parameters[matrixIndex==8u?base+32u:base+9u+matrixIndex*2u];
-    uint format=parameters[matrixIndex==8u?base+33u:base+10u+matrixIndex*2u];
-    float partial[tokenRows],upper[tokenRows];
-    for(uint row=0u;row<tokenRows;row++){partial[row]=0.0;upper[row]=0.0;}
+    // gate and up used to share one loop, issuing two rays and streaming two weight
+    // rows per axis pair. Measured against the single-stream loops that run at
+    // 7.0e9 rays/s, that shape only reached 3.6e9. They now run as two passes over
+    // one row each, and the second pass folds the stored gate sum through SwiGLU in
+    // place, so no extra buffer and no extra pass are needed.
+    bool split=matrixIndex==3u,upPass=split&&cfg.mode!=0u;
+    uint offset=upPass?parameters[base+19u]:parameters[matrixIndex==8u?base+32u:base+9u+matrixIndex*2u];
+    uint format=upPass?parameters[base+20u]:parameters[matrixIndex==8u?base+33u:base+10u+matrixIndex*2u];
+    float partial[tokenRows];
+    for(uint row=0u;row<tokenRows;row++)partial[row]=0.0;
     for(uint axis=lane*2u;axis<columns;axis+=256u) {
-        RTPreparedPair coefficient=rtPreparePair(geometryWeight(0u,offset,format,channel,columns,axis),
-                                                geometryWeight(0u,offset,format,channel,columns,axis+1u));
-        RTPreparedPair up;
-        if(matrixIndex==3u)up=rtPreparePair(geometryWeight(0u,parameters[base+19u],parameters[base+20u],channel,columns,axis),
-                                         geometryWeight(0u,parameters[base+19u],parameters[base+20u],channel,columns,axis+1u));
-        for(uint row=0u;row<tokenRows;row++)if(firstRow+row<cfg.rows) {
+        vec2 pair=geometryWeightPair(0u,offset,format,channel,columns,axis);
+        RTPreparedPair coefficient=rtPreparePair(pair.x,pair.y);
+        for(uint row=0u;row<rows;row++) {
             float first=matrixIndex==2u?detector[(firstRow+row)*A+axis]:matrixIndex==4u?feedForward[(firstRow+row)*W+axis]:normalized[(firstRow+row)*D+axis];
             float second=matrixIndex==2u?detector[(firstRow+row)*A+axis+1u]:matrixIndex==4u?feedForward[(firstRow+row)*W+axis+1u]:normalized[(firstRow+row)*D+axis+1u];
-            partial[row]=rtAdd(partial[row],rtDotPair(first,second,coefficient));
-            if(matrixIndex==3u)upper[row]=rtAdd(upper[row],rtDotPair(first,second,up));
+            partial[row]+=rtDotPair(first,second,coefficient);
         }
     }
-    for(uint row=0u;row<tokenRows;row++) {
-        geometryWork[row*128u+lane]=partial[row];
-        geometryWork[(tokenRows+row)*128u+lane]=upper[row];
-    }
+    for(uint row=0u;row<tokenRows;row++)if(row<rows)geometryWork[row*128u+lane]=partial[row];
     barrier();
     for(uint stride=64u;stride!=0u;stride>>=1u) {
-        if(lane<stride)for(uint row=0u;row<tokenRows;row++) {
-            uint at=row*128u+lane,upAt=(tokenRows+row)*128u+lane;
-            geometryWork[at]=rtAdd(geometryWork[at],geometryWork[at+stride]);
-            if(matrixIndex==3u)geometryWork[upAt]=rtAdd(geometryWork[upAt],geometryWork[upAt+stride]);
+        if(lane<stride)for(uint row=0u;row<tokenRows;row++)if(row<rows) {
+            uint at=row*128u+lane;
+            geometryWork[at]+=geometryWork[at+stride];
         }
         barrier();
     }
-    if(lane==0u)for(uint local=0u;local<tokenRows;local++)if(firstRow+local<cfg.rows) {
+    if(lane==0u)for(uint local=0u;local<rows;local++) {
         uint row=firstRow+local;
         float signal=geometryWork[local*128u];
-        if(matrixIndex==3u) {
-            feedForward[row*W+channel]=rtSwiGLU(signal,geometryWork[(tokenRows+local)*128u]);
-            atomicAdd(featureWork[featureBase(row)],1u);
-            atomicAdd(featureWork[featureGlobal()+8u],1u);
-            atomicAdd(featureWork[featureGlobal()+9u],1u);
+        if(split) {
+            if(upPass)feedForward[row*W+channel]=rtSwiGLU(feedForward[row*W+channel],signal);
+            else {
+                feedForward[row*W+channel]=signal;
+                atomicAdd(featureWork[featureBase(row)],1u);
+                atomicAdd(featureWork[featureGlobal()+8u],1u);
+                atomicAdd(featureWork[featureGlobal()+9u],1u);
+            }
         } else if(matrixIndex==2u||matrixIndex==4u)state[row*D+channel]=rtAdd(state[row*D+channel],signal);
         else if(matrixIndex==0u) {
             for(uint copy=0u;copy<(full?1u:RT_STATE_HEADS/RT_STATE_KEY_HEADS);copy++)queries[row*A+channel+copy*queryWidth]=signal;
@@ -171,7 +174,7 @@ void geometryScore() {
             float key0=geometryHistory(global,head*RT_ATTENTION_HEAD_DIM+axis,false);
             float key1=geometryHistory(global,head*RT_ATTENTION_HEAD_DIM+axis+1u,false);
             uint at=local*128u+lane;
-            geometryWork[at]=rtAdd(geometryWork[at],rtDotPair(key0,key1,beam));
+            geometryWork[at]+=rtDotPair(key0,key1,beam);
         }
         uint expected=count==RT_SCORE_SEGMENT?(RT_SCORE_SEGMENT>=32u?0xffffffffu:(1u<<RT_SCORE_SEGMENT)-1u):(1u<<count)-1u;
         if(seen!=expected)atomicOr(arithmeticStatus[0],32u);
@@ -180,7 +183,7 @@ void geometryScore() {
     for(uint stride=64u;stride!=0u;stride>>=1u) {
         if(lane<stride)for(uint token=0u;token<count;token++) {
             uint at=token*128u+lane;
-            geometryWork[at]=rtAdd(geometryWork[at],geometryWork[at+stride]);
+            geometryWork[at]+=geometryWork[at+stride];
         }
         barrier();
     }
@@ -200,7 +203,7 @@ void geometryAttention() {
     float partial=0.0;
     for(uint index=lane;index<count;index+=128u) {
         float energy=rtExp(rtSubtract(geometryScores[base+index],maximum));
-        geometryScores[base+index]=energy;partial=rtAdd(partial,energy);
+        geometryScores[base+index]=energy;partial+=energy;
     }
     memoryBarrierBuffer();barrier();
     float denominator=geometryReduce(partial);
@@ -212,8 +215,8 @@ void geometryAttention() {
         if(lane==0u)geometryBeam=rtPrepareMultiplier(geometryScores[base+index]);
         barrier();
         uint global=parameters[blockBase()+41u]*cfg.capacity+(first+index)%cfg.capacity;
-        if(lane<RT_ATTENTION_HEAD_DIM)low=rtAdd(low,rtMultiplyPrepared(geometryHistory(global,head*RT_ATTENTION_HEAD_DIM+lane,true),geometryBeam));
-        if(lane+128u<RT_ATTENTION_HEAD_DIM)high=rtAdd(high,rtMultiplyPrepared(geometryHistory(global,head*RT_ATTENTION_HEAD_DIM+lane+128u,true),geometryBeam));
+        if(lane<RT_ATTENTION_HEAD_DIM)low+=rtMultiplyPrepared(geometryHistory(global,head*RT_ATTENTION_HEAD_DIM+lane,true),geometryBeam);
+        if(lane+128u<RT_ATTENTION_HEAD_DIM)high+=rtMultiplyPrepared(geometryHistory(global,head*RT_ATTENTION_HEAD_DIM+lane+128u,true),geometryBeam);
         barrier();
     }
     if(lane<RT_ATTENTION_HEAD_DIM) {
@@ -238,9 +241,9 @@ void geometryWord() {
     float partial=0.0;
     for(uint axis=lane*2u;axis<D;axis+=256u) {
         if(!wordBlockHit(word,axis/256u))atomicOr(arithmeticStatus[0],64u);
-        RTPreparedPair weight=rtPreparePair(geometryWeight(1u,parameters[16u],parameters[15u],word,D,axis),
-                                            geometryWeight(1u,parameters[16u],parameters[15u],word,D,axis+1u));
-        partial=rtAdd(partial,rtDotPair(state[(cfg.rows-1u)*D+axis],state[(cfg.rows-1u)*D+axis+1u],weight));
+        vec2 pair=geometryWeightPair(1u,parameters[16u],parameters[15u],word,D,axis);
+        RTPreparedPair weight=rtPreparePair(pair.x,pair.y);
+        partial+=rtDotPair(state[(cfg.rows-1u)*D+axis],state[(cfg.rows-1u)*D+axis+1u],weight);
     }
     float score=geometryReduce(partial);
     if(lane==0u)wordResult[8192u+word]=floatBitsToUint(score);
@@ -279,6 +282,49 @@ void geometryWordMaximum() {
     }
 }
 
+// Benchmark: identical coverage expressed two ways over the template field.
+// op 9 issues one ray that enumerates every template plane of its instance;
+// op 10 issues one single-hit ray per template. Hit counts land in the history
+// counter so both paths can be checked for equal coverage.
+void geometryBench() {
+    uint lane=gl_LocalInvocationID.x,id=gl_WorkGroupID.x*128u+lane;
+    uint code=id&65535u,group=code/256u;
+    float cx=float(group*4u)+0.1;
+    if(operation==9u) {
+        rayQueryEXT query;
+        rtLocalQueries++;
+        rayQueryInitializeEXT(query,arithmeticAS,gl_RayFlagsNoOpaqueEXT,16u,
+            vec3(cx,0.1,0.0),0.00001,vec3(0.0,0.0,1.0),8.0*256.0+8.0);
+        while(rayQueryProceedEXT(query)) {
+            if(rayQueryGetIntersectionTypeEXT(query,false)!=gl_RayQueryCandidateIntersectionTriangleEXT)continue;
+            localHistoryQueries++;
+        }
+    } else if(cfg.debug==2u) {
+        // Same loop shape as the single-hit mode, but the ray points away from the
+        // field so it cannot hit. What remains is the price of issuing a ray at all:
+        // initialisation, root traversal and rejection.
+        for(uint p=0u;p<256u;p++) {
+            rayQueryEXT query;
+            rtLocalQueries++;
+            rayQueryInitializeEXT(query,arithmeticAS,gl_RayFlagsOpaqueEXT,16u,
+                vec3(cx,0.1,float(p*8u)),0.00001,vec3(0.0,0.0,-1.0),8.0);
+            while(rayQueryProceedEXT(query)) {}
+        }
+    } else {
+        // Same flags as the enumerating mode so the two are comparable; each ray only
+        // has one plane inside its t range, so exactly one candidate is exposed.
+        for(uint p=0u;p<256u;p++) {
+            rayQueryEXT query;
+            rtLocalQueries++;
+            rayQueryInitializeEXT(query,arithmeticAS,gl_RayFlagsNoOpaqueEXT,16u,
+                vec3(cx,0.1,float(p*8u)),0.00001,vec3(0.0,0.0,1.0),8.0);
+            while(rayQueryProceedEXT(query)) {
+                if(rayQueryGetIntersectionTypeEXT(query,false)==gl_RayQueryCandidateIntersectionTriangleEXT)localHistoryQueries++;
+            }
+        }
+    }
+}
+
 void main() {
     if(stopped()&&operation!=8u)return;
     if(operation==0u||operation==1u||operation==4u)geometryProjection();
@@ -286,6 +332,7 @@ void main() {
     else if(operation==3u)geometryAttention();
     else if(operation==5u)geometryWord();
     else if(operation==6u||operation==7u)geometryWordMaximum();
+    else if(operation==9u||operation==10u)geometryBench();
     geometryPublishCounters();
     if(operation==8u&&gl_LocalInvocationID.x==0u) {
         if(arithmeticStatus[0]!=0u)atomicOr(control[3],8192u|arithmeticStatus[0]);

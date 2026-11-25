@@ -58,6 +58,19 @@ float geometryWeight(uint kind, uint offset, uint metadata, uint row, uint colum
     return geometryGGUF(kind, offset * 4u + (linear / 256u) * bytes, type, linear % 256u);
 }
 
+// Resolve two neighbouring coefficients for one dot pair. F16 storage keeps
+// consecutive elements adjacent, and an even axis makes the pair word aligned, so
+// both come back from a single load instead of two loads with two address
+// computations. Everything else falls back to the generic path.
+vec2 geometryWeightPair(uint kind,uint offset,uint metadata,uint row,uint columns,uint axis) {
+    if((metadata&0xffffff00u)==1u) {
+        uint at=offset*4u+(row*columns+axis)*2u;
+        return unpackHalf2x16(geometryCoefficientWord(kind,at));
+    }
+    return vec2(geometryWeight(kind,offset,metadata,row,columns,axis),
+                geometryWeight(kind,offset,metadata,row,columns,axis+1u));
+}
+
 const uint GEOMETRY_HISTORY_BYTES = ((RT_GQA_WIDTH + 255u) / 256u * 354u + 7u) / 8u * 8u;
 float geometryHistory(uint slot, uint channel, bool content) {
     uint axis = sharedAxis(channel), blocks = (RT_GQA_WIDTH + 255u) / 256u;
