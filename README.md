@@ -4,69 +4,60 @@
 
 ![rt_geometry inference workflow](docs/images/ray_tracing_attention_workflow.png)
 
-**Language-model inference whose arithmetic is returned by ray-triangle intersection: every sum, product, quotient, exponential, and maximum comes back as a hardware ray-query distance, and the shader only encodes operands, dispatches queries, gathers returns, and synchronizes.**
+**Ray-intersection arithmetic for attention, SwiGLU, and vocabulary readout, connected to complete model states and native token output.**
 
-Ray Tracing Attention (RTA) is a Vulkan inference stack for large language models. One compiler translates GGUF files and Hugging Face safetensors directories into a model spec, and the native worker runs the source weights without retraining and without expanded copies: Q4_K, Q6_K, BF16, FP16, and F32 payloads keep their original packing. With the `rt_geometry` backend, full attention, the SwiGLU MLP, and the LM Head readout run against a resident arithmetic BVH instead of evaluating floating-point instructions in the shader. Zero-training translation and native generation are verified on the public QwenFlash 9B and Qwen3.5 2B models with the default backends.
+Ray Tracing Attention (RTA) is a Vulkan inference stack for large language models. One compiler supports GGUF and Hugging Face safetensors. Export preserves source Q4_K, Q6_K, BF16, FP16, and F32 payloads by default, with optional FP16 conversion for selected tensors. Zero-training translation and native generation have been verified on QwenFlash 9B and Qwen3.5 2B using the default backends.
+
+The `rt_geometry` backend queries a reusable arithmetic BVH. Shaders encode operands, recover fragments, organize reductions, and synchronize buffers. Existing preparation interfaces provide normalization, positional processing, and history writes.
 
 ```powershell
 rt-chat --attention-backend rt_geometry --mlp-backend rt_geometry
 ```
 
-The default backend remains `standard`. Attention and MLP are selected independently, and either choice also enables the geometric LM Head.
+The default backend is `standard`. Attention and MLP can be selected independently; either geometric choice also enables the geometric LM Head.
 
 ## How the arithmetic moves into geometry
 
-A query is the entire operation. The shader picks a field with an instance mask, sets the origin and direction, and reads the committed hit:
+The ray origin, direction, and field identity encode operands. A hit returns a numerical parameter and a primitive identity:
 
 $$
-\mathcal Q_{\mathcal F}(\mathbf o,\mathbf d)=(t,\iota),\qquad \mathbf r(t)=\mathbf o+t\,\mathbf d .
+\mathcal Q_{\mathcal F}(\mathbf o,\mathbf d)=(t,\iota),\qquad
+\mathbf r(t)=\mathbf o+t\mathbf d.
 $$
 
-$t$ is the intersection distance and carries the value; $\iota$ is the instance and primitive identity and carries the operand choice. One TLAS holds five triangle fields, built once and reused by every layer, matrix row, query head, and later token:
+The parameter $t$ supports value recovery; $\iota$ verifies coefficients or selects an original operand. The direction uses its submitted parameterization. One TLAS organizes five triangle fields, reused across layers, query heads, and tokens.
 
-| Field | Geometry | What the hit returns |
+| Field | Geometry | Hit use |
 |---|---|---|
-| Sum and quotient plane | quad on $z=y$ | $t=a+b$, $t=a-b$, $t=a/b$ |
-| Unit plane | quad on $z=1$ | $t=1/b$, a reusable reciprocal |
-| Exponential strips | 4096 quads of $z=2^x$ on $[-1,1]$ | interpolated $2^x$ |
-| Comparison planes | two crossing quads | nearest-hit identity selects the winning operand |
-| Paired coefficient planes | 64 templates as 1024 instances, 65,536 coefficient planes | $t=2/(1-\alpha u-\beta v)$ |
+| Sum and quotient plane | $z=y$ | $t=a+b$, $t=a-b$, $t=a/b$ |
+| Unit plane | $z=1$ | prepare reusable reciprocal $1/b$ |
+| Exponential strips | piecewise triangles on $[-1,1]$ | interpolate $2^x$ |
+| Comparison planes | $z=x$ and $z=y$ | select an operand by nearest-hit identity |
+| Paired coefficient planes | $z=z_p+c+\alpha(x-x_g)+\beta y$ | $t=c+\alpha x+\beta y$ |
 
-The shader never evaluates these operations. It splits each FP32 operand into a sign bit, a binary exponent, and a significand, aligns the two operands by integer shifting, and puts the aligned magnitudes on the ray. The exponent is restored afterwards by bit packing, including ties-to-even rounding into the subnormal range. For the plane $z=y$:
-
-$$
-\mathbf o=(0,b,-a),\ \mathbf d=(0,0,1)\ \Rightarrow\ t=a+b,
-\qquad
-\mathbf o=(0,a,0),\ \mathbf d=(0,0,b)\ \Rightarrow\ t=a/b .
-$$
-
-A product takes two intersections: $z=1$ returns $1/b$, then $z=y$ returns $a/(1/b)$. Subtraction is an addition of the sign-flipped operand. Maximum selection is not a compare: two crossing planes put the smaller operand in front for a downward ray, and the hit identity of the committed triangle says which source operand won, so the winner is never rebuilt from $4-t$.
+For example, $\mathbf o=(0,b,-a)$ and $\mathbf d=(0,0,1)$ return $t=a+b$ on $z=y$. Starting at $(0,a,0)$ with direction $(0,0,b)$ returns $t=a/b$. Multiplication prepares $1/b$ on the unit plane, then queries the slope plane for $a/(1/b)$. Comparison uses signs and ray direction to preserve the original operand selected by the hit identity.
 
 ### Paired fragments and the full row
 
-A weight row is read two coordinates at a time. The 24-bit significand is written in radix 256, $S=c_2\,2^{16}+c_1\,2^{8}+c_0$; the top two digits are evaluated, which keeps 16 significand bits (relative $1.5\times10^{-5}$) and removes a third of the dependent ray chain per pair. That truncation stays below the Q4_K / Q6_K step of these models. Positive and negative contributions stay in separate channels until their geometric difference, so a small residual is not lost inside $1-2/t$.
-
-Template $p$ is the plane $z=8p+2+(p/256)y$; instance shears supply the other coefficient and the upper two bits of the second one. The input travels in the direction, so instance translations never round it, and the returned distance is
+Rows are read in coordinate pairs. The current `rtDotPair` retains source bit encodings but queries rounded leading 8-bit coefficients. Inputs and product signs are encoded in the origin, with direction `(0,0,1)`:
 
 $$
-t=\frac{2}{1-\alpha u-\beta v}.
+\mathbf o=(x_g+x,y,z_p),\qquad t=c+\alpha x+\beta y.
 $$
 
-Geometric division and subtraction recover $\alpha u+\beta v=1-2/t$, and binary scaling rebuilds the fragment scale. The full row is not truncated:
+The shader restores the binary scale and removes the offset with an FP32 subtraction. All fragments enter a shared reduction tree; each internal addition uses an `rtAdd()` intersection. Under ideal intersections, its root is the complete dot product of the rounded effective coefficients $\bar w$:
 
 $$
-y_r=\sum_b h_b^{\mathsf T} w_{r,b},
+y_r\approx\sum_b\phi_b=\bar w_r^{\mathsf T}h.
 $$
-
-where the shader accumulates fragments and reduces them through a 128-lane shared tree, and every reduction edge is another `rtAdd()` intersection. The BVH holds no cross-ray accumulator; the indexing, buffers, and barriers stay in the shader.
 
 ![rt_geometry paired intersections and geometric reduction](docs/images/ray_tracing_attention_compact_detail.png)
 
-Source bits select a reusable pair plane, the returned fragment becomes the next operand, and the same scalar fields serve softmax normalization and maximum selection.
+Matrix cells illustrate tensor shapes, and tree edges expose the reduction dependencies. The BVH performs intersections; device buffers store accumulation state across rays.
 
-### Source coefficients in their original format
+### Source coefficients and history packets
 
-Weights are not unpacked into a second float copy. The geometry reads the packed payload and decodes it through the same space: Q4_K block scales and affine minima go through `rtMultiply()` and `rtSubtract()`, Q6_K scales through `rtMultiply()`, and BF16, FP16 and F32 are read directly. The history packets keep the same Q4_K / Q6_K layout as the rest of the runtime.
+The default path reads packed source payloads. Q4_K scales and affine minima, and Q6_K scales, use geometric multiplication and subtraction; BF16, FP16, and F32 use their format readers. Optional FP16 export converts selected quantized tensors ahead of inference. History packets retain their layouts and are addressed through format metadata.
 
 ## One layer's path
 
@@ -76,12 +67,12 @@ For a full-attention layer with both geometry backends selected:
 
 1. **Prepared input.** Embedding, RMSNorm, RoPE, Q/K normalization, and history quantization stay on the existing source path and hand over a prepared state and prepared history packets.
 2. **QKV projection.** Paired row dots for Q, K, the output gate, and V in one dispatch; the result is split by channel range into the same buffers the other backends use.
-3. **History update.** Prepared Q/K are written into the existing causal history packets and the history BVH is updated.
-4. **Causal QK.** Each query head sends one micro-ray per coordinate pair. A score workgroup covers 8 history positions per segment, so one ray is reused across that segment. Every accepted primitive is verified against its slot and causal position, the two triangles of the same quad collapse to one receipt, and the dot pair is scaled with `rtMultiply()`.
+3. **History update.** Prepared K/V are written into the existing causal history packets and the history BVH is updated.
+4. **Causal QK.** Each query head sends one micro-ray per coordinate pair. Score workgroups process history segments and reuse each ray within its segment. Every accepted primitive is verified against its slot and causal position, the two triangles of the same quad collapse to one receipt, and the dot pair is scaled with `rtMultiply()`.
 5. **Softmax.** Maximum through comparison planes and the shared tree, shifted energy through the exponential strips, denominator through the `rtAdd()` tree, probabilities through `rtDivide()`. Future positions are written as zero weight.
 6. **Value aggregation.** Every output coordinate keeps its own accumulator; the probability is prepared once as a reciprocal and reused for both halves of the head width. An optional output gate applies `rtSigmoid()` before the result leaves the attention buffer.
 7. **Output projection and residual.** Paired row dots, then the residual add through `rtAdd()`.
-8. **MLP.** Gate and up dots share one coefficient encoding for a tile of 8 tokens, `rtSwiGLU()` forms the activation, the down projection uses the same paired path, and the residual add goes back through the geometry.
+8. **MLP.** Gate and up share their input, and each branch reuses its own coefficient encoding within a token tile, `rtSwiGLU()` forms the activation, the down projection uses the same paired path, and the residual add goes back through the geometry.
 9. **LM Head.** Vocabulary rows are verified against the covering structure, each row scores with geometric dots, and a comparison reduction across workgroups selects the token. Equal logits and signed zeros keep the original token-ID order. The token is written by the native worker and streamed to the CLI.
 
 ### What still runs on the source path
@@ -90,7 +81,7 @@ The geometry space covers projections, QK, softmax, full V aggregation, the atte
 
 ## Numerics
 
-The exponential surface is a 4096-segment piecewise-linear approximation of $2^x$ built at startup, FP32 triangle intersection adds its own error, and the two leading significand digits bound the coefficient terms. Results are close to but not bit-identical with the source path.
+The current path includes 8-bit coefficient rounding, FP32 intersection error, and exponential-strip interpolation. Complete coordinate coverage and numerical equivalence require separate validation. Fragment recovery also includes scale restoration and offset subtraction error.
 
 The tables below were measured with the default backends.
 
