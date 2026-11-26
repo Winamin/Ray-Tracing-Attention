@@ -1,7 +1,6 @@
 # Ray Tracing Attention
 
-[English](README.md) | [简体中文](README.zh-CN.md)
-
+[English](README.md) | [简体中文](README.zh-CN.md)|[BuildModel](COMPILER.md)
 ![rt_geometry inference workflow](docs/images/ray_tracing_attention_workflow.png)
 
 **Ray-intersection arithmetic for attention, SwiGLU, and vocabulary readout, connected to complete model states and native token output.**
